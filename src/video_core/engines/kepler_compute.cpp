@@ -869,8 +869,9 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (dlss_chain.output_pass) {
         return replacement && FinishDlssEvaluation();
     }
-    return dlss_chain.failure != VideoCore::GameDlssReason::None &&
-           native_key != passes->prepass &&
+    // While the replacement draws the output, the network's own passes only feed the skipped
+    // output pass: skip them too, once an evaluation has shown which programs they are.
+    return replacement && native_key != passes->prepass &&
            dlss_chain.programs.contains(native_key);
 }
 
