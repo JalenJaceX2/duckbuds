@@ -67,6 +67,7 @@ add_executable(tests
     video_core/texture_alias_ticks.cpp
     video_core/sampled_views.cpp
     video_core/texture_handles.cpp
+    video_core/phi_identity_operand.cpp
     video_core/ampere_selevet_modes.cpp
     video_core/ampere_selevet_spills.cpp
     video_core/blit_dither.cpp
