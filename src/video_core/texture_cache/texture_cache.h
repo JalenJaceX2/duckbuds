@@ -428,7 +428,22 @@ bool TextureCache<P>::OverlapHasNewerData(ImageId image_id, const ImageBase& ima
             continue;
         }
         for (const WritebackRange& range : it->second) {
-            if (range.tick <= tick || range.end <= begin || end <= range.begin) {
+            if (range.end <= begin || end <= range.begin) {
+                continue;
+            }
+            // EDEN_NX2_KEEP_SMALL_NEWER (on unless =0): a smaller image written back after this
+            // one took its contents holds bytes this one only has old copies of, unless it drew
+            // over them: a large render target written back whole put its stale snapshot over
+            // The Duskbloods' 128x128 character maps (rainbow, purple, black outfits and enemies).
+            static const bool keep_small_newer = [] {
+                const char* value = std::getenv("EDEN_NX2_KEEP_SMALL_NEWER");
+                return value == nullptr || value[0] != '0';
+            }();
+            const bool newer = range.tick > tick;
+            const bool small_after_load = keep_small_newer && !range.lost &&
+                                          range.tick > image.load_tick &&
+                                          range.end - range.begin < image.guest_size_bytes;
+            if (!newer && !small_after_load) {
                 continue;
             }
             keep.emplace_back((std::max)(range.begin, begin), (std::min)(range.end, end));
@@ -600,6 +615,12 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
                 const u64 gpu_tick = runtime.CurrentTick();
                 for (const ImageId id : ids) {
                     Image& overlap = slot_images[id];
+                    // Bytes newer write-backs own stay theirs (OverlapHasNewerData); one they
+                    // own entirely is not written back at all.
+                    KeepRanges keep;
+                    if (OverlapHasNewerData(id, overlap, keep)) {
+                        continue;
+                    }
                     auto map = runtime.DownloadStagingBuffer(overlap.unswizzled_size_bytes, true);
                     auto copies = FullDownloadCopies(overlap.info);
                     overlap.DownloadMemory(map, copies);
@@ -614,6 +635,7 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
                         .copies = std::move(copies),
                         .map = map,
                         .cancelled = false,
+                        .keep = keep,
                     });
                     NoteOverlapWriteback(overlap);
                 }
@@ -2633,6 +2655,7 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
 
     image.flags &= ~ImageFlagBits::CpuModified;
+    image.load_tick = modification_tick;
 
     // Images uploaded by layer stay tracked while some of their layers are dirty.
     if (False(image.flags & ImageFlagBits::Tracked)) {
@@ -3636,6 +3659,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
     }
     const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    slot_images[new_image_id].load_tick = modification_tick;
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
             // Left out of the cache: lookups see no image (a null view) and make it again once
