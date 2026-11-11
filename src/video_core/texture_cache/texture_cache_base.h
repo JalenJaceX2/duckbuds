@@ -679,6 +679,8 @@ private:
         decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true)) map;
         bool cancelled;
         KeepRanges keep{};
+        /// Modification tick of the written-back image's contents.
+        u64 tick{};
     };
     std::deque<AsyncOverlapDownload> async_overlap_downloads;
     void FinishAsyncOverlapDownloads(bool wait_all);

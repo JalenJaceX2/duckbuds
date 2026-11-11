@@ -354,6 +354,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                     .map = download.map,
                     .cancelled = false,
                     .keep = download.keep,
+                    .tick = download.tick,
                 });
             }
         }
@@ -517,10 +518,15 @@ void TextureCache<P>::FinishAsyncOverlapDownloads(bool wait_all) {
                 SwizzleKeeping(download.gpu_addr, download.info, download.copies,
                                download.map.mapped_span, download.keep);
                 // Images the GPU did not write loaded these pages before the data landed (made
-                // in the meantime by a join): they load them again.
+                // in the meantime by a join): they load them again. Not one whose contents are
+                // newer than the landed data: a view made over a newer target took the target's
+                // pixels by a GPU copy without becoming GPU-modified, and reloading it put the
+                // older images' bytes in their place (The Duskbloods' 698x80 message banner band
+                // came out black or with other HUD text in it).
                 ForEachImageInRegion(download.cpu_addr, download.size,
-                                     [](ImageId, ImageBase& image) {
-                                         if (False(image.flags & ImageFlagBits::GpuModified)) {
+                                     [landed_tick = download.tick](ImageId, ImageBase& image) {
+                                         if (False(image.flags & ImageFlagBits::GpuModified) &&
+                                             image.modification_tick <= landed_tick) {
                                              image.flags |= ImageFlagBits::CpuModified;
                                          }
                                      });
@@ -636,6 +642,7 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
                         .map = map,
                         .cancelled = false,
                         .keep = keep,
+                        .tick = overlap.modification_tick,
                     });
                     NoteOverlapWriteback(overlap);
                 }
