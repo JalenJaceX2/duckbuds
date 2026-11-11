@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <fstream>
+#include <iterator>
+#include <string>
+
 #include "common/alignment.h"
 #include "core/core.h"
 #include "core/file_sys/content_archive.h"
@@ -11,13 +15,65 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/romfs.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/sockets/online_friends.h"
+#include "core/hle/service/sockets/online_redirect.h"
 #include "core/hle/service/ssl/cert_store.h"
 
 namespace Service::SSL {
 
 // https://switchbrew.org/wiki/SSL_services#CertStore
 
+static std::vector<u8> LoadOnlineCa(const std::string& path) {
+    if (path.empty()) {
+        return {};
+    }
+    std::ifstream file(std::filesystem::path{Common::FS::ToU8String(path)}, std::ios::binary);
+    const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    const size_t begin = text.find("-----BEGIN CERTIFICATE-----");
+    if (begin == std::string::npos) {
+        return {text.begin(), text.end()}; // DER (or empty if the file is missing)
+    }
+    const size_t body = text.find('\n', begin);
+    const size_t end = text.find("-----END CERTIFICATE-----", begin);
+    if (body == std::string::npos || end == std::string::npos) {
+        return {};
+    }
+    std::vector<u8> der;
+    u32 acc = 0;
+    int bits = 0;
+    for (size_t i = body; i < end; i++) {
+        const char ch = text[i];
+        int v;
+        if (ch >= 'A' && ch <= 'Z') {
+            v = ch - 'A';
+        } else if (ch >= 'a' && ch <= 'z') {
+            v = ch - 'a' + 26;
+        } else if (ch >= '0' && ch <= '9') {
+            v = ch - '0' + 52;
+        } else if (ch == '+') {
+            v = 62;
+        } else if (ch == '/') {
+            v = 63;
+        } else {
+            continue; // line breaks and '=' padding
+        }
+        acc = (acc << 6) | static_cast<u32>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            der.push_back(static_cast<u8>(acc >> bits));
+        }
+    }
+    return der;
+}
+
 CertStore::CertStore(Core::System& system) {
+    // Private-server mode (sockets/online_redirect.h, from Droplet): with a server set, its CA
+    // stands in for the console's certificates once online play is on (EnsureOnlineCa, also when
+    // it is turned on mid-game). Until then, and if the CA can't be read, the console's stay.
+    m_online_ca_missing = !Sockets::OnlineRedirect::ConfiguredServer().empty() ||
+                          !Sockets::OnlineRedirect::ServerCa().empty();
+
     constexpr u64 CertStoreDataId = 0x0100000000000800ULL;
 
     auto& fsc = system.GetFileSystemController();
@@ -95,6 +151,55 @@ void CertStore::ForEachCertificate(std::span<const CaCertificateId> certificate_
     }
 }
 
+// The game is setting up a secure connection. With online play on and no certificate for the
+// server yet, get it from the server (online_friends.cpp), at most every 10 s while it can't.
+void CertStore::EnsureOnlineCa() {
+    std::scoped_lock lock{m_online_ca_mutex};
+    if (!m_online_ca_missing) {
+        return;
+    }
+    const std::string server = Sockets::OnlineRedirect::ServerAddress();
+    if (server.empty()) {
+        return;
+    }
+    // The configured or saved certificate is used as it is; only a missing one is fetched, on a
+    // thread of its own, so a slow server never holds up the SSL service.
+    std::string error;
+    auto der = LoadOnlineCa(Sockets::OnlineRedirect::ServerCa());
+    if (der.empty() && m_ca_fetch.valid()) {
+        if (m_ca_fetch.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            Sockets::OnlineRedirect::NoteMissingCaAttempt();
+            return;
+        }
+        error = m_ca_fetch.get();
+        if (error.empty()) {
+            der = LoadOnlineCa(
+                Common::FS::PathToUTF8String(Sockets::OnlineRedirect::SavedServerCa(server)));
+        }
+    } else if (der.empty()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= m_next_ca_fetch) {
+            m_next_ca_fetch = now + std::chrono::seconds(10);
+            m_ca_fetch = std::async(std::launch::async, Sockets::OnlineRedirect::FetchServerCa,
+                                    server);
+        }
+        Sockets::OnlineRedirect::NoteMissingCaAttempt();
+        return;
+    }
+    if (!der.empty()) {
+        LOG_WARNING(Service_SSL, "Using the private server's CA for {} ({} bytes)", server,
+                    der.size());
+        m_certs.clear();
+        m_certs[CaCertificateId::NintendoCAG3] =
+            Certificate{.status = TrustedCertStatus::EnabledTrusted, .der_data = std::move(der)};
+        m_online_ca_missing = false;
+        return;
+    }
+    LOG_WARNING(Service_SSL, "Could not get the private server's CA from {}: {}", server,
+                error.empty() ? "it holds no certificate" : error);
+    Sockets::OnlineRedirect::NoteMissingCaAttempt();
+}
+
 Result CertStore::GetCertificates(u32* out_num_entries, std::span<u8> out_data,
                                   std::span<const CaCertificateId> certificate_ids) {
     // Ensure the buffer is large enough to hold the output.
@@ -143,6 +248,9 @@ Result CertStore::GetCertificates(u32* out_num_entries, std::span<u8> out_data,
 
 Result CertStore::GetCertificateBufSize(u32* out_size, u32* out_num_entries,
                                         std::span<const CaCertificateId> certificate_ids) {
+    // Before the size: a certificate fetched by GetCertificates would outgrow the caller's buffer.
+    EnsureOnlineCa();
+
     // Output size is at least the size of the terminator entry.
     *out_size = sizeof(BuiltInCertificateInfo);
     *out_num_entries = 0;
