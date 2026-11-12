@@ -705,8 +705,8 @@ private:
     u64 join_writeback_reuses{};
     void WriteBackBadOverlaps(ImageId new_image_id);
     /// Collector write-backs waiting for the GPU (EDEN_NX2_GC_DOWNLOAD_ASYNC): written to guest
-    /// memory once their command buffer is done, dropped if the memory is written or unmapped
-    /// first. Their pages stay write-tracked meanwhile.
+    /// memory once their command buffer is done, except bytes the guest writes first; dropped if
+    /// the memory is unmapped first. Their pages stay write-tracked meanwhile.
     struct AsyncOverlapDownload {
         u64 gpu_tick;
         GPUVAddr gpu_addr;
@@ -723,6 +723,9 @@ private:
     std::deque<AsyncOverlapDownload> async_overlap_downloads;
     void FinishAsyncOverlapDownloads(bool wait_all);
     void CancelAsyncOverlapDownloads(DAddr cpu_addr, u64 size);
+    /// The guest wrote [cpu_addr, cpu_addr + size): waiting write-backs keep those bytes (they
+    /// are newer) and still land the rest; one written all over is cancelled.
+    void KeepGuestWrite(DAddr cpu_addr, u64 size);
     void CancelAsyncOverlapDownloadsGpu(GPUVAddr gpu_addr, u64 size);
     u64 async_overlap_cancels{};
     u64 join_writebacks{};

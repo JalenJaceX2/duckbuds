@@ -554,6 +554,44 @@ void TextureCache<P>::FinishAsyncOverlapDownloads(bool wait_all) {
 }
 
 template <class P>
+void TextureCache<P>::KeepGuestWrite(DAddr cpu_addr, u64 size) {
+    // A write-back's image is newer than what guest memory held, and the guest's write is newer
+    // still: guest memory as the console has it is the image's bytes with the write over them.
+    // Cancelling the whole write-back for a write to part of it left the rest stale.
+    constexpr size_t MaxGuestKeeps = 32;
+    for (auto& download : async_overlap_downloads) {
+        const DAddr download_end = download.cpu_addr + download.size;
+        if (download.cancelled || download_end <= cpu_addr ||
+            cpu_addr + size <= download.cpu_addr) {
+            continue;
+        }
+        const DAddr begin = (std::max)(cpu_addr, download.cpu_addr);
+        const DAddr end = (std::min)(cpu_addr + size, download_end);
+        auto& keep = download.keep;
+        bool merged = false;
+        for (auto& range : keep) {
+            if (range.first <= end && begin <= range.second) {
+                range = {(std::min)(range.first, begin), (std::max)(range.second, end)};
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) {
+            keep.emplace_back(begin, end);
+        }
+        const bool all_written = std::ranges::any_of(keep, [&](const auto& range) {
+            return range.first <= download.cpu_addr && download_end <= range.second;
+        });
+        if (all_written || keep.size() > MaxGuestKeeps) {
+            // Nothing (or too scattered a rest) to land: as before, a write-back that never lands.
+            download.cancelled = true;
+            ++async_overlap_cancels;
+            NoteWritebackLost(download.cpu_addr, download.size, download.tick);
+        }
+    }
+}
+
+template <class P>
 void TextureCache<P>::CancelAsyncOverlapDownloads(DAddr cpu_addr, u64 size) {
     for (auto& download : async_overlap_downloads) {
         if (!download.cancelled && download.cpu_addr < cpu_addr + size &&
@@ -1853,7 +1891,7 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     if (!async_overlap_downloads.empty()) {
-        CancelAsyncOverlapDownloads(cpu_addr, size);
+        KeepGuestWrite(cpu_addr, size);
     }
     ClearStale(cpu_addr, size);
     ForEachImageInRegion(cpu_addr, size, [this, cpu_addr, size](ImageId image_id, Image& image) {
