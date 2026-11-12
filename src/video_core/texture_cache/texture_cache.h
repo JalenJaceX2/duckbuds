@@ -614,6 +614,7 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
             ImageId id;
             boost::container::small_vector<BufferImageCopy, 16> copies;
             DownloadMap map;
+            KeepRanges keep;
         };
         if constexpr (requires { runtime.CurrentTick(); }) {
             if (async) {
@@ -656,10 +657,18 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
         pending.reserve(ids.size());
         for (const ImageId id : ids) {
             Image& overlap = slot_images[id];
+            // As queued ones: bytes newer write-backs own stay theirs.
+            KeepRanges keep;
+            if (OverlapHasNewerData(id, overlap, keep)) {
+                continue;
+            }
             auto map = runtime.DownloadStagingBuffer(overlap.unswizzled_size_bytes);
             auto copies = FullDownloadCopies(overlap.info);
             overlap.DownloadMemory(map, copies);
-            pending.push_back(Pending{id, std::move(copies), map});
+            pending.push_back(Pending{id, std::move(copies), map, std::move(keep)});
+        }
+        if (pending.empty()) {
+            return;
         }
         const auto wait_start = std::chrono::steady_clock::now();
         runtime.Finish();
@@ -669,8 +678,8 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
                 .count());
         for (auto& item : pending) {
             const Image& overlap = slot_images[item.id];
-            SwizzleImage(*gpu_memory, overlap.gpu_addr, overlap.info, item.copies,
-                         item.map.mapped_span, swizzle_data_buffer);
+            SwizzleKeeping(overlap.gpu_addr, overlap.info, item.copies, item.map.mapped_span,
+                           item.keep);
             NoteOverlapWriteback(overlap);
         }
         ++join_writebacks;
