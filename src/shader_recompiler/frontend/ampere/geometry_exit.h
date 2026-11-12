@@ -164,8 +164,13 @@ GeometryExitEnvelope AnalyzeGeometryExit(const Code& code) {
             // three or four channels, to the second destination in c.
             const u32 dimension = bits(index, 61, 3), source_a = bits(index, 24, 8),
                       source_b = bits(index, 32, 8);
-            if (bits(index, 87, 3) != 3 && !bits(index, 76, 1) && !bits(index, 78, 1) &&
-                dimension <= 1) {
+            if (bits(index, 78, 1) && dimension == 1) {
+                // .MS (2D): x and y in Ra, Ra+1 and the sample in Rb, as lower_to_maxwell reads.
+                read_register(source_a);
+                if (source_a != 255) read_register(source_a + 1);
+                read_register(source_b);
+            } else if (bits(index, 87, 3) != 3 && !bits(index, 76, 1) && !bits(index, 78, 1) &&
+                       dimension <= 1) {
                 read_register(source_a);
                 if (dimension == 1) read_register(source_b);
             } else {

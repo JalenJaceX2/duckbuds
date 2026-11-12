@@ -114,6 +114,25 @@ TEST_CASE("Ampere geometry exit reads uniform guards as uniform predicates", "[v
     REQUIRE(ordinary_envelope.error_offset == 8 * 16);
 }
 
+TEST_CASE("Ampere geometry exit reads a multisample fetch's coordinates and sample only",
+          "[video_core][ampere]") {
+    // CS2R.64 R0; TLD.MS.LZ 2D from (R4, R5), sample R2; S2R R3; ISETP P0. The fetch reads R2 and
+    // not R3 (still setup state), which a coordinate group from Rb would include.
+    const auto code = GeometryProgram({{
+        {{0x00007805, 0, 0x0001ff00, 0x001fcc00}},
+        {{0x04007b66, 0x31c01002, 0x009e4d02, 0x000f4200}},
+        {{0x00037919, 0, 0x00001d00, 0x000e2400}},
+        {{0x0400720c, 0xff, 0x03f03070, 0x000fc600}},
+        Nop,
+        Nop,
+        Nop,
+        {{0x0000794d, 0, 0x03800000, 0x000fea00}},
+    }});
+    const auto envelope = AnalyzeGeometryExit(code);
+    INFO(envelope.error << " at " << envelope.error_offset);
+    REQUIRE(static_cast<bool>(envelope));
+}
+
 TEST_CASE("Ampere task programs read back their payload", "[video_core][ampere]") {
     // GXFlver_Common_MeshletAS: ISBERD.O.ATTR.32 R0, [RZ + 0x14].
     const auto lowered = LowerToMaxwell(
