@@ -674,16 +674,19 @@ private:
         return False(image.flags & ImageFlagBits::Sparse) && image.cpu_addr < ~(1ULL << 40);
     }
     [[nodiscard]] bool WrittenBackAlready(const ImageBase& image) const;
-    /// A write-back still waiting keeps the bytes an image with newer contents wrote to guest
-    /// memory meanwhile (it lands later, over them otherwise).
+    /// Calls func(begin, end) for each range of guest memory the image's data is written to: the
+    /// one range at cpu_addr, a sparse image's mapped segments, none for a stand-in address.
+    template <typename Func>
+    void ForEachWrittenRange(const ImageBase& image, Func&& func);
+    /// A write-back still waiting keeps the bytes [begin, end) that an image with newer
+    /// contents (`tick`) wrote to guest memory meanwhile (it lands later, over them otherwise).
     template <typename Download>
-    static void KeepNewerBytes(Download& download, const ImageBase& image) {
-        if (download.tick >= image.modification_tick) {
+    static void KeepNewerBytes(Download& download, DAddr begin, DAddr end, u64 tick) {
+        if (download.tick >= tick) {
             return;
         }
-        const DAddr begin = (std::max)(image.cpu_addr, download.cpu_addr);
-        const DAddr end = (std::min)(image.cpu_addr + image.guest_size_bytes,
-                                     download.cpu_addr + download.size);
+        begin = (std::max)(begin, download.cpu_addr);
+        end = (std::min)(end, download.cpu_addr + download.size);
         if (begin >= end || std::ranges::any_of(download.keep, [&](const auto& range) {
                 return range.first <= begin && end <= range.second;
             })) {
@@ -691,8 +694,8 @@ private:
         }
         download.keep.emplace_back(begin, end);
     }
-    /// KeepNewerBytes for every write-back waiting for the GPU, after `image` was written to
-    /// guest memory.
+    /// KeepNewerBytes for every write-back waiting for the GPU and every range `image` was
+    /// written to, after it was written to guest memory.
     void KeepInWaitingWritebacks(const ImageBase& image);
     u64 join_writeback_reuses{};
     void WriteBackBadOverlaps(ImageId new_image_id);

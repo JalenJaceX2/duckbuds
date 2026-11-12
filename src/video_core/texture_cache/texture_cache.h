@@ -224,14 +224,18 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             image.DownloadMemory(map, copies);
             runtime.Finish();
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
-            if (download_overlaps && HasGuestRange(image)) {
+            if (download_overlaps) {
                 // Older write-backs still queued keep what this one wrote, and later ones see it
                 // as newer data.
-                for (auto& download : overlap_downloads) {
-                    KeepNewerBytes(download, image);
-                }
+                ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
+                    for (auto& download : overlap_downloads) {
+                        KeepNewerBytes(download, begin, end, image.modification_tick);
+                    }
+                });
                 KeepInWaitingWritebacks(image);
-                NoteOverlapWriteback(image);
+                if (HasGuestRange(image)) {
+                    NoteOverlapWriteback(image);
+                }
             }
             ++gc_download_deletes;
             ClearStaleImage(image);
@@ -769,12 +773,32 @@ void TextureCache<P>::NoteOverlapWriteback(const ImageBase& image, bool lost) {
 
 template <class P>
 void TextureCache<P>::KeepInWaitingWritebacks(const ImageBase& image) {
-    if (async_overlap_downloads.empty() || !HasGuestRange(image)) {
+    if (async_overlap_downloads.empty()) {
         return;
     }
-    for (AsyncOverlapDownload& download : async_overlap_downloads) {
-        if (!download.cancelled) {
-            KeepNewerBytes(download, image);
+    ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
+        for (AsyncOverlapDownload& download : async_overlap_downloads) {
+            if (!download.cancelled) {
+                KeepNewerBytes(download, begin, end, image.modification_tick);
+            }
+        }
+    });
+}
+
+template <class P>
+template <typename Func>
+void TextureCache<P>::ForEachWrittenRange(const ImageBase& image, Func&& func) {
+    if (False(image.flags & ImageFlagBits::Sparse)) {
+        if (HasGuestRange(image)) {
+            func(image.cpu_addr, image.cpu_addr + image.guest_size_bytes);
+        }
+        return;
+    }
+    // As ForEachSparseSegment: each mapped segment is one range of guest memory.
+    for (const auto& [gpu_addr, size] :
+         gpu_memory->GetSubmappedRange(image.gpu_addr, image.guest_size_bytes)) {
+        if (const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr)) {
+            func(*cpu_addr, *cpu_addr + size);
         }
     }
 }
