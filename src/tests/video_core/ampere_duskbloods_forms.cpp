@@ -133,6 +133,22 @@ TEST_CASE("Ampere geometry exit reads a multisample fetch's coordinates and samp
     REQUIRE(static_cast<bool>(envelope));
 }
 
+TEST_CASE("Ampere IMAD.WIDE with a uniform addend shadows its high registers",
+          "[video_core][ampere]") {
+    // IMAD.WIDE.U32 R204, R10, R11, UR12 with registers from R200 up shadowed.
+    const Instruction wide{{0x0acc7e25, 0x0000000c, 0x0f8e000b, 0x000fca00}};
+    const auto pressure = Shader::Ampere::PrepareRegisterPressure(wide, 200);
+    REQUIRE(pressure.valid);
+    // The destination pair moves to a borrowed low quartet; Ra, Rb and the uniform pair stay.
+    REQUIRE(pressure.instruction.Bits(16, 8) < 200);
+    REQUIRE(pressure.instruction.Bits(16, 8) % 4 == 0);
+    REQUIRE(pressure.instruction.Bits(24, 8) == 10);
+    REQUIRE(pressure.instruction.Bits(64, 8) == 11);
+    REQUIRE(pressure.instruction.Bits(32, 6) == 12);
+    REQUIRE(pressure.prefix.size() == 8);
+    REQUIRE(pressure.suffix.size() == 8);
+}
+
 TEST_CASE("Ampere task programs read back their payload", "[video_core][ampere]") {
     // GXFlver_Common_MeshletAS: ISBERD.O.ATTR.32 R0, [RZ + 0x14].
     const auto lowered = LowerToMaxwell(
