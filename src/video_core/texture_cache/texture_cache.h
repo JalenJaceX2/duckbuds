@@ -224,19 +224,16 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             image.DownloadMemory(map, copies);
             runtime.Finish();
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
-            if (download_overlaps) {
-                // Older write-backs still queued keep what this one wrote, and later ones see it
-                // as newer data.
+            // Older write-backs still queued keep what this one wrote, and later ones see it as
+            // newer data: also joins' when the collector's are off (NoteFlushed).
+            if (!overlap_downloads.empty()) {
                 ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
                     for (auto& download : overlap_downloads) {
                         KeepNewerBytes(download, begin, end, image.modification_tick);
                     }
                 });
-                KeepInWaitingWritebacks(image);
-                if (HasGuestRange(image)) {
-                    NoteOverlapWriteback(image);
-                }
             }
+            NoteFlushed(image);
             ++gc_download_deletes;
             ClearStaleImage(image);
         } else if (overlap_writeback && !covered) {
@@ -260,7 +257,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             ++gc_download_deletes;
             ClearStaleImage(image);
         } else {
-            if (download_overlaps && True(image.flags & ImageFlagBits::GpuModified) &&
+            if (OverlapWritebacksEnabled() && True(image.flags & ImageFlagBits::GpuModified) &&
                 HasGuestRange(image)) {
                 // Its data is lost, but it is newer than what older images would write back.
                 // Under newer write-backs it is not lost: they hold what supersedes it.
@@ -802,11 +799,7 @@ bool TextureCache<P>::OverlapWritebacksEnabled() {
     // (OpenGL) cannot wait, so neither writes back there.
     using DownloadMap = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}));
     if constexpr (std::is_trivially_destructible_v<DownloadMap>) {
-        static const int collector =
-            WritebackSwitches::SwitchSetting("EDEN_NX2_GC_DOWNLOAD_OVERLAPS");
-        static const int joins = WritebackSwitches::SwitchSetting("EDEN_NX2_JOIN_WRITEBACK");
-        return WritebackSwitches::DuskbloodsDefault(collector) ||
-               WritebackSwitches::DuskbloodsDefault(joins);
+        return WritebackSwitches::AnyWritebackOn();
     }
     return false;
 }
