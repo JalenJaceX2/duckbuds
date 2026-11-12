@@ -89,6 +89,31 @@ TEST_CASE("Ampere geometry exit still rejects reads of the setup state", "[video
     REQUIRE(envelope.error_offset == 6 * 16);
 }
 
+TEST_CASE("Ampere geometry exit reads uniform guards as uniform predicates", "[video_core][ampere]") {
+    // @UP0 UIADD3 before the ISETP that writes P0: UP0 is not the setup state's P0.
+    const auto uniform = GeometryProgram({{
+        {{0x00047ab9, 0x01000c00, 0x00000a00, 0x000fe400}},
+        {{0x04040890, 0x00000050, 0x0ff1e03f, 0x000fe400}},
+        {{0x00007919, 0, 0x00001d00, 0x001e2200}},
+        {{0x00017816, 0x7772, 0x000000ff, 0x001fc400}},
+        {{0x0100720c, 0xff, 0x03f03070, 0x000fc600}},
+        {{0xff027321, 0x0000b001, 0x00000400, 0x000e2400}},
+        Nop,
+        {{0x0000794d, 0, 0x03800000, 0x000fea00}},
+    }});
+    const auto uniform_envelope = AnalyzeGeometryExit(uniform);
+    INFO(uniform_envelope.error << " at " << uniform_envelope.error_offset);
+    REQUIRE(static_cast<bool>(uniform_envelope));
+
+    // @P0 PRMT there still reads the setup state's P0.
+    auto ordinary = uniform;
+    ordinary[5 + 1] = {{0x04047890, 0x00000050, 0x0ff1e03f, 0x000fe400}};
+    ordinary[5 + 3] = {{0x00010816, 0x7772, 0x000000ff, 0x001fc400}};
+    const auto ordinary_envelope = AnalyzeGeometryExit(ordinary);
+    REQUIRE(ordinary_envelope.error == "native body reads exit setup state");
+    REQUIRE(ordinary_envelope.error_offset == 8 * 16);
+}
+
 TEST_CASE("Ampere task programs read back their payload", "[video_core][ampere]") {
     // GXFlver_Common_MeshletAS: ISBERD.O.ATTR.32 R0, [RZ + 0x14].
     const auto lowered = LowerToMaxwell(

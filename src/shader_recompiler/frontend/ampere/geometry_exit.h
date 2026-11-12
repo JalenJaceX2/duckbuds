@@ -124,7 +124,13 @@ GeometryExitEnvelope AnalyzeGeometryExit(const Code& code) {
             if (form == 2 || form == 3 || form == 7) read_register(bits(index, 64, 8));
             if (has_c && (form == 1 || form == 4 || form == 5 || form == 6)) read_register(bits(index, 64, 8));
         };
-        read_predicate(guard & 7);
+        // The uniform datapath instructions below (ULDC, UIADD3, ULEA, UIMAD, UPRMT, UMOV) are
+        // guarded by a uniform predicate UPn, not Pn (lower_to_maxwell swaps it in from R239).
+        const bool uniform_guard = opcode == 0xab9 || opcode == 0x290 || opcode == 0x890 ||
+                                   opcode == 0x291 || opcode == 0x891 || opcode == 0x2a4 ||
+                                   opcode == 0x8a4 || opcode == 0x896 || opcode == 0x882 ||
+                                   opcode == 0xc82;
+        if (!uniform_guard) read_predicate(guard & 7);
         if (is_exit(index)) {
             if (guard != 7)
                 return fail(index, "native instruction before exit setup state is dead");
