@@ -697,6 +697,11 @@ private:
     /// KeepNewerBytes for every write-back waiting for the GPU and every range `image` was
     /// written to, after it was written to guest memory.
     void KeepInWaitingWritebacks(const ImageBase& image);
+    /// After a flush wrote `image` to guest memory: write-backs still waiting keep its bytes, and
+    /// later ones see it as newer data (NoteOverlapWriteback), while write-backs are on.
+    void NoteFlushed(const ImageBase& image);
+    /// Whether the collector's or joins' write-backs are on (writeback_switches.h).
+    [[nodiscard]] static bool OverlapWritebacksEnabled();
     u64 join_writeback_reuses{};
     void WriteBackBadOverlaps(ImageId new_image_id);
     /// Collector write-backs waiting for the GPU (EDEN_NX2_GC_DOWNLOAD_ASYNC): written to guest

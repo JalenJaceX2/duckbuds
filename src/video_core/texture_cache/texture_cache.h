@@ -786,6 +786,32 @@ void TextureCache<P>::KeepInWaitingWritebacks(const ImageBase& image) {
 }
 
 template <class P>
+void TextureCache<P>::NoteFlushed(const ImageBase& image) {
+    if (!OverlapWritebacksEnabled()) {
+        return;
+    }
+    KeepInWaitingWritebacks(image);
+    if (HasGuestRange(image)) {
+        NoteOverlapWriteback(image);
+    }
+}
+
+template <class P>
+bool TextureCache<P>::OverlapWritebacksEnabled() {
+    // As RunGarbageCollector and WriteBackBadOverlaps: staging maps that release themselves
+    // (OpenGL) cannot wait, so neither writes back there.
+    using DownloadMap = decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}));
+    if constexpr (std::is_trivially_destructible_v<DownloadMap>) {
+        static const int collector =
+            WritebackSwitches::SwitchSetting("EDEN_NX2_GC_DOWNLOAD_OVERLAPS");
+        static const int joins = WritebackSwitches::SwitchSetting("EDEN_NX2_JOIN_WRITEBACK");
+        return WritebackSwitches::DuskbloodsDefault(collector) ||
+               WritebackSwitches::DuskbloodsDefault(joins);
+    }
+    return false;
+}
+
+template <class P>
 template <typename Func>
 void TextureCache<P>::ForEachWrittenRange(const ImageBase& image, Func&& func) {
     if (False(image.flags & ImageFlagBits::Sparse)) {
@@ -1917,7 +1943,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
             Image& image = slot_images[entry.image_id];
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
                          entry.map.mapped_span, swizzle_data_buffer);
-            KeepInWaitingWritebacks(image);
+            NoteFlushed(image);
             ClearStaleImage(image);
         }
         pending.clear();
@@ -2563,7 +2589,7 @@ void TextureCache<P>::PopAsyncFlushes() {
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
-                KeepInWaitingWritebacks(image);
+                NoteFlushed(image);
                 ClearStaleImage(image);
             } else {
                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
@@ -2614,7 +2640,7 @@ void TextureCache<P>::PopAsyncFlushes() {
             const ImageBase& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
-            KeepInWaitingWritebacks(image);
+            NoteFlushed(image);
             ClearStaleImage(image);
             download_map.offset += image.unswizzled_size_bytes;
             download_span = download_span.subspan(image.unswizzled_size_bytes);
