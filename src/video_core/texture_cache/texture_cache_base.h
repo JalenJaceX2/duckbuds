@@ -664,6 +664,9 @@ private:
                         std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                         const KeepRanges& keep);
     void NoteOverlapWriteback(const ImageBase& image, bool lost = false);
+    /// A noted write-back that was cancelled before it landed: its range stays newer than older
+    /// images, but its data is gone (like an image dropped without one).
+    void NoteWritebackLost(DAddr cpu_addr, u64 size, u64 tick);
     /// Whether the image's guest memory is the one range at its cpu_addr, which write-backs
     /// track, keep and note: not sparse, and not a stand-in address for GPU memory without CPU
     /// backing (ImageCpuAddress; TrackImage skips those the same way).

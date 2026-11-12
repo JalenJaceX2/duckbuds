@@ -559,6 +559,7 @@ void TextureCache<P>::CancelAsyncOverlapDownloads(DAddr cpu_addr, u64 size) {
             cpu_addr < download.cpu_addr + download.size) {
             download.cancelled = true;
             ++async_overlap_cancels;
+            NoteWritebackLost(download.cpu_addr, download.size, download.tick);
         }
     }
 }
@@ -570,6 +571,7 @@ void TextureCache<P>::CancelAsyncOverlapDownloadsGpu(GPUVAddr gpu_addr, u64 size
             gpu_addr < download.gpu_addr + download.size) {
             download.cancelled = true;
             ++async_overlap_cancels;
+            NoteWritebackLost(download.cpu_addr, download.size, download.tick);
         }
     }
 }
@@ -713,7 +715,31 @@ bool TextureCache<P>::WrittenBackAlready(const ImageBase& image) const {
             return false;
         }
     }
-    return true;
+    // ...and that write-back landed (it was not cancelled).
+    const auto ranges = overlap_writeback_ranges.find(first_page);
+    return ranges != overlap_writeback_ranges.end() &&
+           std::ranges::any_of(ranges->second, [&](const WritebackRange& range) {
+               return range.begin == image.cpu_addr &&
+                      range.end == image.cpu_addr + image.guest_size_bytes &&
+                      range.tick == image.modification_tick && !range.lost;
+           });
+}
+
+template <class P>
+void TextureCache<P>::NoteWritebackLost(DAddr cpu_addr, u64 size, u64 tick) {
+    const DAddr first_page = cpu_addr >> OverlapPageBits;
+    const DAddr last_page = (cpu_addr + size - 1) >> OverlapPageBits;
+    for (DAddr page = first_page; page <= last_page; ++page) {
+        const auto it = overlap_writeback_ranges.find(page);
+        if (it == overlap_writeback_ranges.end()) {
+            continue;
+        }
+        for (WritebackRange& range : it->second) {
+            if (range.begin == cpu_addr && range.end == cpu_addr + size && range.tick == tick) {
+                range.lost = true;
+            }
+        }
+    }
 }
 
 template <class P>
