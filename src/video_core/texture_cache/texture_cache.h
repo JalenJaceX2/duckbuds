@@ -567,21 +567,22 @@ void TextureCache<P>::KeepGuestWrite(DAddr cpu_addr, u64 size) {
         }
         const DAddr begin = (std::max)(cpu_addr, download.cpu_addr);
         const DAddr end = (std::min)(cpu_addr + size, download_end);
+        // Coalesce every overlapping or touching range (a write can bridge two), so the checks
+        // below see the distinct ranges.
         auto& keep = download.keep;
-        bool merged = false;
-        for (auto& range : keep) {
-            if (range.first <= end && begin <= range.second) {
-                range = {(std::min)(range.first, begin), (std::max)(range.second, end)};
-                merged = true;
-                break;
+        keep.emplace_back(begin, end);
+        std::ranges::sort(keep);
+        KeepRanges merged;
+        for (const auto& range : keep) {
+            if (!merged.empty() && range.first <= merged.back().second) {
+                merged.back().second = (std::max)(merged.back().second, range.second);
+            } else {
+                merged.push_back(range);
             }
         }
-        if (!merged) {
-            keep.emplace_back(begin, end);
-        }
-        const bool all_written = std::ranges::any_of(keep, [&](const auto& range) {
-            return range.first <= download.cpu_addr && download_end <= range.second;
-        });
+        keep = std::move(merged);
+        const bool all_written = keep.size() == 1 && keep.front().first <= download.cpu_addr &&
+                                 download_end <= keep.front().second;
         if (all_written || keep.size() > MaxGuestKeeps) {
             // Nothing (or too scattered a rest) to land: as before, a write-back that never lands.
             download.cancelled = true;
