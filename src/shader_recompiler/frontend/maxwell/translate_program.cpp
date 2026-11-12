@@ -374,7 +374,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     program.blocks = GenerateBlocks(program.syntax_list);
     program.post_order_blocks = PostOrder(program.syntax_list.front());
     program.stage = env.ShaderStage();
-    program.local_memory_size = env.LocalMemorySize();
+    program.local_memory_size = env.LocalArraySize();
     switch (program.stage) {
     case Stage::TessellationControl: {
         const ProgramHeader& sph{env.SPH()};
@@ -476,6 +476,10 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         Optimization::VerificationPass(program);
     }
     Optimization::CollectShaderInfoPass(env, program);
+    if (!program.info.uses_local_memory) {
+        // The stack region (Environment::LocalArraySize) only for programs that use local memory.
+        program.local_memory_size = env.LocalMemorySize();
+    }
     program.info.is_task = program.stage == Stage::Task;
     program.info.is_mesh = program.stage == Stage::Mesh;
     if (program.stage == Stage::Mesh) {
