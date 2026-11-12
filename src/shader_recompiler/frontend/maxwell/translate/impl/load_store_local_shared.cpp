@@ -45,8 +45,8 @@ std::pair<IR::U32, IR::U32> WordOffset(TranslatorVisitor& v, u64 insn) {
 }
 
 /// Where a native program's local access at `offset` (bytes in the 16 MiB window) lands in its
-/// local array (Environment::LocalArraySize): the declared memory as it is, the upper half of
-/// the window (the stack, which grows down from its top) onto the stack region after it.
+/// local array (Environment::LocalArraySize): the declared memory after the stack region, the
+/// upper half of the window (the stack, which grows down from its top) onto the stack region.
 /// Accesses outside the declared memory and the stack region are out of bounds, also a stack
 /// deeper than the region: mapping it onto the region would alias the declared memory.
 struct NativeLocal {
@@ -58,16 +58,17 @@ struct NativeLocal {
 NativeLocal MapNativeLocal(TranslatorVisitor& v, const IR::U32& window_offset) {
     constexpr u32 stack_half = Environment::LOCAL_WINDOW_BYTES / 2;
     constexpr u32 stack_bottom = Environment::LOCAL_WINDOW_BYTES - Environment::NATIVE_STACK_BYTES;
+    constexpr u32 stack_base = Environment::NATIVE_STACK_BASE;
+    constexpr u32 declared_base = Environment::NATIVE_DECLARED_BASE;
+    constexpr u32 spare_word = 0;
     const u32 declared = v.env.LocalMemorySize();
-    const u32 stack_base = (declared + 3U) & ~3U;
-    const u32 spare_word = (stack_base + Environment::NATIVE_STACK_BYTES) / 4;
     if (window_offset.IsImmediate()) {
         const u32 value = window_offset.U32();
         const bool stack = value >= stack_half;
         const bool in_bounds =
             stack ? value >= stack_bottom && value < Environment::LOCAL_WINDOW_BYTES
                   : value < declared;
-        const u32 offset = stack ? value - stack_bottom + stack_base : value;
+        const u32 offset = stack ? value - stack_bottom + stack_base : value + declared_base;
         return {v.ir.Imm32(in_bounds ? offset / 4 : spare_word), v.ir.Imm32(offset),
                 v.ir.Imm1(in_bounds)};
     }
@@ -77,8 +78,9 @@ NativeLocal MapNativeLocal(TranslatorVisitor& v, const IR::U32& window_offset) {
         v.ir.ILessThan(window_offset, v.ir.Imm32(Environment::LOCAL_WINDOW_BYTES), false))};
     const IR::U1 in_declared{v.ir.ILessThan(window_offset, v.ir.Imm32(declared), false)};
     const IR::U1 in_bounds{v.ir.Select(stack, in_stack, in_declared)};
-    const IR::U32 offset{v.ir.Select(
-        stack, v.ir.IAdd(window_offset, v.ir.Imm32(stack_base - stack_bottom)), window_offset)};
+    const IR::U32 offset{v.ir.Select(stack,
+                                     v.ir.IAdd(window_offset, v.ir.Imm32(stack_base - stack_bottom)),
+                                     v.ir.IAdd(window_offset, v.ir.Imm32(declared_base)))};
     const IR::U32 word{v.ir.Select(in_bounds, v.ir.ShiftRightLogical(offset, v.ir.Imm32(2)),
                                    v.ir.Imm32(spare_word))};
     return {word, offset, in_bounds};
