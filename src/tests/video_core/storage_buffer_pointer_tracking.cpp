@@ -714,6 +714,38 @@ TEST_CASE("Native reads through one loaded pointer read its binding directly",
     }));
 }
 
+TEST_CASE("Native reads whose high word is another pointer's do not read the loaded binding",
+          "[shader][storage_buffer]") {
+    LoadedPointerRecords records;
+    IR::IREmitter ir{records.fixture.entry};
+    IR::U32 high;
+    const IR::U32 low{records.LoadedLow(ir, high)};
+    // The high word of a second pointer, read from another slot of the same buffer.
+    const IR::Value other{ir.LoadGlobal64(Address(ir, Word(ir, 0x40), Word(ir, 0x44)))};
+    const IR::U32 other_high{ir.CompositeExtract(other, 1)};
+    ir.SetReg(IR::Reg::R0,
+              ir.LoadGlobal32(Address(ir, ir.IAdd(low, LoadedPointerRecords::RecordOffset(ir)),
+                                      other_high)));
+    records.fixture.TrackedOffsets();
+
+    // The address is not in the loaded pointer's buffer: no read based on that pointer.
+    for (const IR::Block* const block : records.fixture.program.blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::LoadStorage32) {
+                continue;
+            }
+            const IR::Inst* const offset{inst.Arg(1).InstRecursive()};
+            if (offset->GetOpcode() != IR::Opcode::ISub32) {
+                continue;
+            }
+            const IR::Value base{offset->Arg(1)};
+            CHECK((base.IsImmediate() || base.InstRecursive()->GetOpcode() != IR::Opcode::BitwiseAnd32 ||
+                   base.InstRecursive()->Arg(0).IsImmediate() ||
+                   base.InstRecursive()->Arg(0).InstRecursive() != low.InstRecursive()));
+        }
+    }
+}
+
 TEST_CASE("Native reads through a pointer a loop carries read its binding directly",
           "[shader][storage_buffer]") {
     LoadedPointerRecords records;

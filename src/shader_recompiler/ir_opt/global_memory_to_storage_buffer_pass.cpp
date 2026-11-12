@@ -1453,16 +1453,86 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
     return true;
 }
 
-/// The one pointer loaded from memory that a low address is built from: the address is that
+/// Whether an address's high word is the high word of the pointer its low word was built from
+/// (pointer.low), plus carries and other terms that read no other loaded pointer.
+bool HighFromLoadedPointer(const IR::Value& high, const LoadedPointer& pointer) {
+    const IR::Inst* const load{pointer.low.InstRecursive()->Arg(0).InstRecursive()};
+    bool found{};
+    small_vector<IR::Value, 8> pending{high};
+    while (!pending.empty()) {
+        const IR::Value value{pending.back()};
+        pending.pop_back();
+        if (value.IsImmediate()) {
+            continue;
+        }
+        IR::Inst* const inst{value.InstRecursive()};
+        switch (inst->GetOpcode()) {
+        case IR::Opcode::IAdd32:
+            if (pending.size() + 2 > 8) {
+                return false;
+            }
+            pending.push_back(inst->Arg(0));
+            pending.push_back(inst->Arg(1));
+            break;
+        case IR::Opcode::CompositeExtractU32x2: {
+            const IR::Value vector{inst->Arg(0)};
+            if (vector.IsImmediate()) {
+                break;
+            }
+            const IR::Opcode source{vector.InstRecursive()->GetOpcode()};
+            if (source != IR::Opcode::LoadGlobal64 && source != IR::Opcode::LoadStorage64) {
+                break;
+            }
+            // A loaded pointer's word: only the same pointer's high word, once.
+            if (vector.InstRecursive() != load || !inst->Arg(1).IsImmediate() ||
+                inst->Arg(1).U32() != 1 || found) {
+                return false;
+            }
+            found = true;
+            break;
+        }
+        case IR::Opcode::Phi: {
+            // A loop carries the high word unchanged: Phi(high, itself). A phi of it and zero is
+            // the high half of a null address.
+            std::optional<IR::Value> nonzero;
+            for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+                const IR::Value operand{inst->Arg(arg).Resolve()};
+                if (!operand.IsImmediate() && operand.InstRecursive() == inst) {
+                    continue;
+                }
+                if (operand.IsImmediate() && operand.Type() == IR::Type::U32 &&
+                    operand.U32() == 0) {
+                    continue;
+                }
+                if (nonzero && *nonzero != operand) {
+                    return false;
+                }
+                nonzero = operand;
+            }
+            if (nonzero) {
+                pending.push_back(*nonzero);
+            }
+            break;
+        }
+        default:
+            // A carry (Select of immediates) or a sign extension of an offset
+            break;
+        }
+    }
+    return found;
+}
+
+/// The one pointer loaded from memory that an address is built from: its low word is that
 /// pointer's low word plus offsets (IAdd32 of values that read no other pointer), or null where a
-/// phi merges it with zero. Returns nothing when the address adds up more than one loaded
-/// pointer, or none.
-std::optional<LoadedPointer> LoadedPointerLow(const IR::U32& low_addr) {
-    if (low_addr.IsImmediate()) {
+/// phi merges it with zero, and its high word that pointer's high word plus carries. Returns
+/// nothing otherwise.
+std::optional<LoadedPointer> LoadedPointerLow(const LowAddrInfo& address) {
+    if (address.value.IsImmediate()) {
         return std::nullopt;
     }
     LoadedPointer result;
-    if (!WalkLoadedPointer(IR::Value{low_addr}, result, 0) || result.low.IsEmpty()) {
+    if (!WalkLoadedPointer(IR::Value{address.value}, result, 0) || result.low.IsEmpty() ||
+        !HighFromLoadedPointer(IR::Value{address.high}, result)) {
         return std::nullopt;
     }
     return result;
@@ -1521,7 +1591,7 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
             !IsGlobalMemoryWrite(inst) &&
             std::ranges::find(info.table_candidates, candidates.front()) ==
                 info.table_candidates.end()) {
-            single_loaded = LoadedPointerLow(low_addr);
+            single_loaded = LoadedPointerLow(*low_addr_info);
             // A pointer or null: only the reads whose null path is given its zero below.
             // Not in compute shaders: The Duskbloods' tiled compute pass 6148b6ff87c55d4f
             // (120x68 groups) took ~100 ms a frame instead of 0.6 ms during area transitions with
