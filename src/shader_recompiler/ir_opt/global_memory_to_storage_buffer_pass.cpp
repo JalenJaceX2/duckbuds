@@ -2257,9 +2257,14 @@ void Replace(IR::Block& block, IR::Inst& inst, const IR::U32& storage_index,
         throw InvalidArgument("Invalid global memory opcode {}", inst.GetOpcode());
     }
 }
-/// For a phi that merges an address built from a loaded pointer with null, a phi beside it that
-/// carries that pointer's low word on the address's paths and zero on the null paths.
-IR::Value PointerOrNull(IR::Program& program, IR::Inst& null_phi, const IR::Value& pointer) {
+/// The paths a phi that merges an address built from a loaded pointer with null takes, carried by
+/// phis beside it: that pointer's low word on the address's paths and zero on the null paths, and
+/// whether the address's path was taken. A pointer whose low word is zero is not null.
+struct PointerPaths {
+    IR::Value pointer;
+    IR::Value on_pointer;
+};
+PointerPaths PointerOrNull(IR::Program& program, IR::Inst& null_phi, const IR::Value& pointer) {
     for (IR::Block* const block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             if (inst.GetOpcode() != IR::Opcode::Phi) {
@@ -2270,17 +2275,23 @@ IR::Value PointerOrNull(IR::Program& program, IR::Inst& null_phi, const IR::Valu
             }
             IR::Inst& mirror{*block->PrependNewInst(block->begin(), IR::Opcode::Phi)};
             mirror.SetFlags(IR::Type::U32);
+            IR::Inst& taken{*block->PrependNewInst(block->begin(), IR::Opcode::Phi)};
+            taken.SetFlags(IR::Type::U1);
             for (size_t arg = 0; arg < null_phi.NumArgs(); ++arg) {
                 const IR::Value operand{null_phi.Arg(arg).Resolve()};
                 IR::Value carried{pointer};
+                IR::Value carried_taken{true};
                 if (operand.IsImmediate()) {
                     carried = IR::Value{0U};
+                    carried_taken = IR::Value{false};
                 } else if (operand.InstRecursive() == &null_phi) {
                     carried = IR::Value{&mirror};
+                    carried_taken = IR::Value{&taken};
                 }
                 mirror.AddPhiOperand(null_phi.PhiBlock(arg), carried);
+                taken.AddPhiOperand(null_phi.PhiBlock(arg), carried_taken);
             }
-            return IR::Value{&mirror};
+            return PointerPaths{IR::Value{&mirror}, IR::Value{&taken}};
         }
     }
     throw LogicError("Phi {} is in no block", fmt::ptr(&null_phi));
@@ -2385,7 +2396,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                                                                   : StorageWriteExtent{},
         });
     }
-    std::map<IR::Inst*, IR::Value> null_mirrors;
+    std::map<IR::Inst*, PointerPaths> null_mirrors;
     for (const StorageInst& storage_inst : info.to_replace) {
         const StorageBufferAddr storage_buffer{storage_inst.storage_buffer};
         const auto it{info.set.find(storage_inst.storage_buffer)};
@@ -2404,7 +2415,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                                                     storage_inst.loaded_pointer))
                              .first;
             }
-            const IR::U32 pointer{mirror->second};
+            const IR::U32 pointer{mirror->second.pointer};
             const IR::U32 offset{StorageOffset(*block, *inst, storage_buffer,
                                                u32(host_info.min_ssbo_alignment), pointer)};
             const auto it_inst{IR::Block::InstructionList::s_iterator_to(*inst)};
@@ -2412,7 +2423,7 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
                 it_inst, GlobalToStorage(inst->GetOpcode()), {index, offset}, inst->Flags<u32>())};
             IR::IREmitter ir{*block, it_inst};
             inst->ReplaceUsesWith(
-                ir.Select(ir.IEqual(pointer, ir.Imm32(0)), ir.Imm32(0), IR::U32{read}));
+                ir.Select(IR::U1{mirror->second.on_pointer}, IR::U32{read}, ir.Imm32(0)));
             continue;
         }
         const IR::U32 offset{
