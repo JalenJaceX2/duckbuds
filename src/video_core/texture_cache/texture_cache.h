@@ -211,6 +211,13 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             (!high_priority_mode && must_download)) {
             return false;
         }
+        // A GPU-written overlap the collector may write back, and whether newer write-backs
+        // already hold all of it (then its data is not lost with it).
+        const bool overlap_writeback =
+            download_overlaps && True(image.flags & ImageFlagBits::BadOverlap) &&
+            (async_downloads || image.guest_size_bytes <= OverlapDownloadMaxBytes()) &&
+            IsDownloadable(image);
+        const bool covered = overlap_writeback && OverlapHasNewerData(image_id, image, keep);
         if (must_download) {
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
@@ -219,10 +226,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
             ++gc_download_deletes;
             ClearStaleImage(image);
-        } else if (download_overlaps && True(image.flags & ImageFlagBits::BadOverlap) &&
-                   (async_downloads || image.guest_size_bytes <= OverlapDownloadMaxBytes()) &&
-                   IsDownloadable(image) &&
-                   !OverlapHasNewerData(image_id, image, keep)) {
+        } else if (overlap_writeback && !covered) {
             download_queued = true;
             NoteOverlapWriteback(image);
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, async_downloads);
@@ -241,9 +245,6 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             ++gc_download_deletes;
             ClearStaleImage(image);
         } else {
-            const bool covered = download_overlaps &&
-                                 True(image.flags & ImageFlagBits::BadOverlap) &&
-                                 IsDownloadable(image);
             if (download_overlaps && True(image.flags & ImageFlagBits::GpuModified)) {
                 // Its data is lost, but it is newer than what older images would write back.
                 // Under newer write-backs it is not lost: they hold what supersedes it.
