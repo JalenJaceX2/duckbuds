@@ -229,7 +229,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         } else if (overlap_writeback && !covered) {
             download_queued = true;
             NoteOverlapWriteback(image);
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, async_downloads);
+            // Deferred also when waiting: a later image's synchronous download in this pass
+            // finishes the GPU work, after which the pool would hand this buffer out again.
+            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
             auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
             overlap_downloads.push_back(OverlapDownload{
@@ -380,6 +382,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             SwizzleKeeping(download.gpu_addr, download.info, download.copies,
                            download.map.mapped_span, download.keep);
             bytes += download.map.mapped_span.size();
+            runtime.FreeDeferredStagingBuffer(download.map);
         }
         overlap_download_bytes += bytes;
         if (Common::DkbFrameTrace::Enabled()) {
