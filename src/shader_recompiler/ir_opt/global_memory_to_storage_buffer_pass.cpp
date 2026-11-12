@@ -1339,6 +1339,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
 struct LoadedPointer {
     IR::Value low;        ///< The pointer's low word
     IR::Inst* null_phi{}; ///< The phi merging the address built from it with null, if any
+    bool offsets{};       ///< Terms are added beside the pointer (or its null phi), at this level
 };
 
 /// LoadedPointerLow's walk. Returns false when the address adds up more than one loaded pointer
@@ -1349,6 +1350,7 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
         const IR::Value value{pending.back()};
         pending.pop_back();
         if (value.IsImmediate()) {
+            result.offsets |= value.Type() != IR::Type::U32 || value.U32() != 0;
             continue;
         }
         IR::Inst* const inst{value.InstRecursive()};
@@ -1363,10 +1365,12 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
         case IR::Opcode::CompositeExtractU32x2: {
             const IR::Value vector{inst->Arg(0)};
             if (vector.IsImmediate()) {
+                result.offsets = true;
                 break;
             }
             const IR::Opcode source{vector.InstRecursive()->GetOpcode()};
             if (source != IR::Opcode::LoadGlobal64 && source != IR::Opcode::LoadStorage64) {
+                result.offsets = true;
                 break;
             }
             if (!inst->Arg(1).IsImmediate() || inst->Arg(1).U32() != 0 || !result.low.IsEmpty()) {
@@ -1438,15 +1442,18 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
                     result.null_phi = inst;
                 }
                 // Without a pointer below it, a phi of offsets
+                result.offsets |= merged.low.IsEmpty();
                 break;
             }
             if (merges_pointer) {
                 return false;
             }
+            result.offsets = true;
             break;
         }
         default:
             // An offset term (shifts, multiplies, conversions of indices)
+            result.offsets = true;
             break;
         }
     }
@@ -1457,7 +1464,18 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
 /// (pointer.low), plus carries and other terms that read no other loaded pointer.
 bool HighFromLoadedPointer(const IR::Value& high, const LoadedPointer& pointer) {
     const IR::Inst* const load{pointer.low.InstRecursive()->Arg(0).InstRecursive()};
+    // Whether the low word's null phi takes zero from a predecessor.
+    const auto null_from = [&](const IR::Block* predecessor) -> std::optional<bool> {
+        for (size_t arg = 0; arg < pointer.null_phi->NumArgs(); ++arg) {
+            if (pointer.null_phi->PhiBlock(arg) == predecessor) {
+                const IR::Value operand{pointer.null_phi->Arg(arg).Resolve()};
+                return operand.IsImmediate();
+            }
+        }
+        return std::nullopt;
+    };
     bool found{};
+    bool high_null{};
     small_vector<IR::Value, 8> pending{high};
     while (!pending.empty()) {
         const IR::Value value{pending.back()};
@@ -1493,8 +1511,9 @@ bool HighFromLoadedPointer(const IR::Value& high, const LoadedPointer& pointer) 
         }
         case IR::Opcode::Phi: {
             // A loop carries the high word unchanged: Phi(high, itself). A phi of it and zero is
-            // the high half of a null address.
+            // the high half of a null address: zero on exactly the paths the low word is null on.
             std::optional<IR::Value> nonzero;
+            bool has_zero{};
             for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
                 const IR::Value operand{inst->Arg(arg).Resolve()};
                 if (!operand.IsImmediate() && operand.InstRecursive() == inst) {
@@ -1502,12 +1521,34 @@ bool HighFromLoadedPointer(const IR::Value& high, const LoadedPointer& pointer) 
                 }
                 if (operand.IsImmediate() && operand.Type() == IR::Type::U32 &&
                     operand.U32() == 0) {
+                    has_zero = true;
                     continue;
                 }
                 if (nonzero && *nonzero != operand) {
                     return false;
                 }
                 nonzero = operand;
+            }
+            if (has_zero && pointer.null_phi != nullptr) {
+                for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+                    const IR::Value operand{inst->Arg(arg).Resolve()};
+                    if (!operand.IsImmediate() && operand.InstRecursive() == inst) {
+                        continue;
+                    }
+                    const bool zero{operand.IsImmediate() && operand.Type() == IR::Type::U32 &&
+                                    operand.U32() == 0};
+                    if (null_from(inst->PhiBlock(arg)) != std::optional<bool>{zero}) {
+                        // Not zero on exactly the low word's null paths
+                        return false;
+                    }
+                }
+            }
+            if (has_zero) {
+                if (pointer.null_phi == nullptr || high_null) {
+                    // Null where the low word isn't, or a second null merge
+                    return false;
+                }
+                high_null = true;
             }
             if (nonzero) {
                 pending.push_back(*nonzero);
@@ -1519,7 +1560,9 @@ bool HighFromLoadedPointer(const IR::Value& high, const LoadedPointer& pointer) 
             break;
         }
     }
-    return found;
+    // A pointer or null: the high word has to be null on the same paths, for the whole address
+    // to be null there.
+    return found && (pointer.null_phi == nullptr || high_null);
 }
 
 /// The one pointer loaded from memory that an address is built from: its low word is that
@@ -1533,6 +1576,11 @@ std::optional<LoadedPointer> LoadedPointerLow(const LowAddrInfo& address) {
     LoadedPointer result;
     if (!WalkLoadedPointer(IR::Value{address.value}, result, 0) || result.low.IsEmpty() ||
         !HighFromLoadedPointer(IR::Value{address.high}, result)) {
+        return std::nullopt;
+    }
+    // On the null paths the address is only null when nothing is added after the merge (the
+    // offsets the pointer's path adds are inside it).
+    if (result.null_phi != nullptr && (result.offsets || address.imm_offset != 0)) {
         return std::nullopt;
     }
     return result;

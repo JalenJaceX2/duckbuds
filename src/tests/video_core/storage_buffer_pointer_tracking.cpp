@@ -796,27 +796,64 @@ TEST_CASE("Native reads through a pointer or null stay global", "[shader][storag
     CHECK(records.Count(IR::Opcode::LoadStorage32) == 0);
 }
 
+namespace {
+/// A fragment program that reads through a pointer or null: the pointer's path adds the record
+/// offset in `body`, `exit` merges the address with null from `entry`.
+struct PointerOrNullRead {
+    LoadedPointerRecords records;
+    IR::U32 low;
+
+    /// high_null: the high word is merged with zero on the same path; offset_after: an offset is
+    /// added after the merge; other_null_block: the high word's zero comes from the body instead.
+    void Build(bool high_null, bool offset_after, bool other_null_block = false) {
+        records.fixture.env.SetStage(Shader::Stage::Fragment);
+        records.fixture.entry.AddBranch(&records.body);
+        records.fixture.entry.AddBranch(&records.exit);
+        records.body.AddBranch(&records.exit);
+        records.SetBlocks({&records.fixture.entry, &records.body, &records.exit});
+        IR::IREmitter ir{records.fixture.entry};
+        IR::U32 high;
+        low = records.LoadedLow(ir, high);
+        IR::IREmitter body{records.body};
+        const IR::U32 record_low{body.IAdd(low, LoadedPointerRecords::RecordOffset(body))};
+        records.exit.AppendNewInst(IR::Opcode::Phi, {});
+        IR::Inst* const either{&records.exit.back()};
+        either->SetFlags(IR::Type::U32);
+        either->AddPhiOperand(&records.body, record_low);
+        either->AddPhiOperand(&records.fixture.entry, IR::Value{0U});
+        IR::U32 address_high{high};
+        if (high_null) {
+            records.exit.AppendNewInst(IR::Opcode::Phi, {});
+            IR::Inst* const high_or_null{&records.exit.back()};
+            high_or_null->SetFlags(IR::Type::U32);
+            high_or_null->AddPhiOperand(&records.body,
+                                        other_null_block ? IR::Value{0U} : IR::Value{high});
+            high_or_null->AddPhiOperand(&records.fixture.entry,
+                                        other_null_block ? IR::Value{high} : IR::Value{0U});
+            address_high = IR::U32{IR::Value{high_or_null}};
+        }
+        IR::IREmitter exit{records.exit};
+        IR::U32 address_low{IR::Value{either}};
+        if (offset_after) {
+            address_low = exit.IAdd(address_low, exit.Imm32(16));
+        }
+        exit.SetReg(IR::Reg::R0, exit.LoadGlobal32(Address(exit, address_low, address_high)));
+        records.fixture.TrackedOffsets();
+    }
+
+    /// Whether the read became the pointer-or-null read (a select of the binding's read and 0).
+    bool ReadsPointerOrNull() const {
+        return records.Count(IR::Opcode::LoadGlobal32) == 0 &&
+               records.Find(IR::Opcode::SelectU32) != nullptr;
+    }
+};
+} // Anonymous namespace
+
 TEST_CASE("Native reads through a pointer or null outside compute read zero on the null path",
           "[shader][storage_buffer]") {
-    LoadedPointerRecords records;
-    records.fixture.env.SetStage(Shader::Stage::Fragment);
-    records.fixture.entry.AddBranch(&records.body);
-    records.fixture.entry.AddBranch(&records.exit);
-    records.body.AddBranch(&records.exit);
-    records.SetBlocks({&records.fixture.entry, &records.body, &records.exit});
-    IR::IREmitter ir{records.fixture.entry};
-    IR::U32 high;
-    const IR::U32 low{records.LoadedLow(ir, high)};
-    IR::IREmitter body{records.body};
-    const IR::U32 record_low{body.IAdd(low, LoadedPointerRecords::RecordOffset(body))};
-    records.exit.AppendNewInst(IR::Opcode::Phi, {});
-    IR::Inst* const either{&records.exit.back()};
-    either->SetFlags(IR::Type::U32);
-    either->AddPhiOperand(&records.body, record_low);
-    either->AddPhiOperand(&records.fixture.entry, IR::Value{0U});
-    IR::IREmitter exit{records.exit};
-    exit.SetReg(IR::Reg::R0, exit.LoadGlobal32(Address(exit, IR::U32{IR::Value{either}}, high)));
-    records.fixture.TrackedOffsets();
+    PointerOrNullRead read;
+    read.Build(true, false);
+    const auto& records{read.records};
 
     // Read from the pointer's binding, and zero where the null path was taken.
     CHECK(records.Count(IR::Opcode::LoadGlobal32) == 0);
@@ -835,4 +872,20 @@ TEST_CASE("Native reads through a pointer or null outside compute read zero on t
         REQUIRE(taken->Arg(arg).IsImmediate());
         CHECK(taken->Arg(arg).U1() == (taken->PhiBlock(arg) == &records.body));
     }
+}
+
+TEST_CASE("A pointer or null whose address is not null on the null path is not read as zero",
+          "[shader][storage_buffer]") {
+    // The high word stays the pointer's on the null path: the address is the pointer's high half.
+    PointerOrNullRead high_kept;
+    high_kept.Build(false, false);
+    CHECK_FALSE(high_kept.ReadsPointerOrNull());
+    // An offset added after the merge: the null path's address is that offset.
+    PointerOrNullRead offset_after;
+    offset_after.Build(true, true);
+    CHECK_FALSE(offset_after.ReadsPointerOrNull());
+    // The high word is null on the other path.
+    PointerOrNullRead other_path;
+    other_path.Build(true, false, true);
+    CHECK_FALSE(other_path.ReadsPointerOrNull());
 }
