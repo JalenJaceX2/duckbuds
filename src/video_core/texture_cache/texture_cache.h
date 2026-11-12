@@ -743,9 +743,16 @@ u64 TextureCache<P>::OverlapDownloadMaxBytes() {
     // dropped as before. The Duskbloods' character maps are 16x42 to 256x256; the large ones are
     // full-screen and shadow targets it draws again before reading.
     static const u64 bytes = [] {
-        const char* value = std::getenv("EDEN_NX2_GC_DOWNLOAD_MAX_KIB");
-        const u64 kib = value != nullptr ? std::strtoull(value, nullptr, 10) : 1024ULL;
-        return kib == 0 ? ~0ULL : kib << 10;
+        constexpr u64 default_kib = 1024;
+        const char* const value = std::getenv("EDEN_NX2_GC_DOWNLOAD_MAX_KIB");
+        u64 kib = default_kib;
+        if (value != nullptr) {
+            // Not a number: the default (not 0, which lifts the limit).
+            char* end = nullptr;
+            const u64 parsed = std::strtoull(value, &end, 10);
+            kib = end != value && *end == '\0' ? parsed : default_kib;
+        }
+        return kib == 0 || kib > (~0ULL >> 10) ? ~0ULL : kib << 10;
     }();
     return bytes;
 }
