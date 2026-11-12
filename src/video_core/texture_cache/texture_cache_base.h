@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -670,6 +671,26 @@ private:
         return False(image.flags & ImageFlagBits::Sparse) && image.cpu_addr < ~(1ULL << 40);
     }
     [[nodiscard]] bool WrittenBackAlready(const ImageBase& image) const;
+    /// A write-back still waiting keeps the bytes an image with newer contents wrote to guest
+    /// memory meanwhile (it lands later, over them otherwise).
+    template <typename Download>
+    static void KeepNewerBytes(Download& download, const ImageBase& image) {
+        if (download.tick >= image.modification_tick) {
+            return;
+        }
+        const DAddr begin = (std::max)(image.cpu_addr, download.cpu_addr);
+        const DAddr end = (std::min)(image.cpu_addr + image.guest_size_bytes,
+                                     download.cpu_addr + download.size);
+        if (begin >= end || std::ranges::any_of(download.keep, [&](const auto& range) {
+                return range.first <= begin && end <= range.second;
+            })) {
+            return;
+        }
+        download.keep.emplace_back(begin, end);
+    }
+    /// KeepNewerBytes for every write-back waiting for the GPU, after `image` was written to
+    /// guest memory.
+    void KeepInWaitingWritebacks(const ImageBase& image);
     u64 join_writeback_reuses{};
     void WriteBackBadOverlaps(ImageId new_image_id);
     /// Collector write-backs waiting for the GPU (EDEN_NX2_GC_DOWNLOAD_ASYNC): written to guest
