@@ -375,6 +375,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     program.post_order_blocks = PostOrder(program.syntax_list.front());
     program.stage = env.ShaderStage();
     program.local_memory_size = env.LocalArraySize();
+    program.is_native = env.IsNativeProgram();
     switch (program.stage) {
     case Stage::TessellationControl: {
         const ProgramHeader& sph{env.SPH()};
@@ -519,6 +520,7 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
         result.post_order_blocks.push_back(block);
     }
     result.stage = Stage::VertexB;
+    result.is_native = vertex_b.is_native;
     result.info = vertex_a.info;
     result.local_memory_size = (std::max)(vertex_a.local_memory_size, vertex_b.local_memory_size);
     result.info.loads.mask |= vertex_b.info.loads.mask;
