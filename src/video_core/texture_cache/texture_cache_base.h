@@ -663,6 +663,12 @@ private:
                         std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                         const KeepRanges& keep);
     void NoteOverlapWriteback(const ImageBase& image, bool lost = false);
+    /// Whether the image's guest memory is the one range at its cpu_addr, which write-backs
+    /// track, keep and note: not sparse, and not a stand-in address for GPU memory without CPU
+    /// backing (ImageCpuAddress; TrackImage skips those the same way).
+    [[nodiscard]] static bool HasGuestRange(const ImageBase& image) noexcept {
+        return False(image.flags & ImageFlagBits::Sparse) && image.cpu_addr < ~(1ULL << 40);
+    }
     [[nodiscard]] bool WrittenBackAlready(const ImageBase& image) const;
     u64 join_writeback_reuses{};
     void WriteBackBadOverlaps(ImageId new_image_id);

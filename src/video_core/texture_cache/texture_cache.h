@@ -216,7 +216,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         const bool overlap_writeback =
             download_overlaps && True(image.flags & ImageFlagBits::BadOverlap) &&
             (async_downloads || image.guest_size_bytes <= OverlapDownloadMaxBytes()) &&
-            IsDownloadable(image);
+            IsDownloadable(image) && HasGuestRange(image);
         const bool covered = overlap_writeback && OverlapHasNewerData(image_id, image, keep);
         if (must_download) {
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
@@ -245,7 +245,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             ++gc_download_deletes;
             ClearStaleImage(image);
         } else {
-            if (download_overlaps && True(image.flags & ImageFlagBits::GpuModified)) {
+            if (download_overlaps && True(image.flags & ImageFlagBits::GpuModified) &&
+                HasGuestRange(image)) {
                 // Its data is lost, but it is newer than what older images would write back.
                 // Under newer write-backs it is not lost: they hold what supersedes it.
                 NoteOverlapWriteback(image, !covered || last_cover_lost);
@@ -596,7 +597,7 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
             const ImageBase& overlap = slot_images[overlap_id];
             if (IsDownloadable(overlap) &&
                 (async || overlap.guest_size_bytes <= OverlapDownloadMaxBytes()) &&
-                False(overlap.flags & (ImageFlagBits::Sparse | ImageFlagBits::IsDecoding))) {
+                False(overlap.flags & ImageFlagBits::IsDecoding) && HasGuestRange(overlap)) {
                 if (WrittenBackAlready(overlap)) {
                     ++join_writeback_reuses;
                     continue;
