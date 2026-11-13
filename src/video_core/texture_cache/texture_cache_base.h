@@ -616,6 +616,13 @@ private:
     /// Returns true if the current clear's render area and scissor cover a width x height image
     [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;
 
+    /// Whether the current clear writes every byte of a single-level, single-layer 2D image with
+    /// this info at gpu_addr (every channel, the whole image, a target bound at that address)
+    [[nodiscard]] bool ClearWritesWhole(const ImageInfo& info, GPUVAddr gpu_addr) const;
+
+    /// Notes the bound targets the current clear writes whole as loaded at their clear's tick
+    void NoteClearedWhole();
+
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);
 

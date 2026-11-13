@@ -454,9 +454,11 @@ bool TextureCache<P>::OverlapHasNewerData(ImageId image_id, const ImageBase& ima
                 continue;
             }
             // EDEN_NX2_KEEP_SMALL_NEWER (on unless =0): a smaller image written back after this
-            // one took its contents holds bytes this one only has old copies of, unless it drew
-            // over them: a large render target written back whole put its stale snapshot over
-            // The Duskbloods' 128x128 character maps (rainbow, purple, black outfits and enemies).
+            // one took its contents (or a clear replaced all of them) holds bytes this one only
+            // has old copies of: a large render target written back whole put its stale snapshot
+            // over The Duskbloods' 128x128 character maps (rainbow, purple, black outfits and
+            // enemies). Its draws since don't count: the cache can't tell a draw over those
+            // bytes from one elsewhere in the image.
             static const bool keep_small_newer = [] {
                 const char* value = std::getenv("EDEN_NX2_KEEP_SMALL_NEWER");
                 return value == nullptr || value[0] != '0';
@@ -1777,6 +1779,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
         const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
         PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+        if (is_clear) {
+            NoteClearedWhole();
+        }
         return;
     }
 
@@ -1795,6 +1800,9 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
     const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
 
     PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+    if (is_clear) {
+        NoteClearedWhole();
+    }
 
     rt_active_mask = 0;
     rt_image_id = {};
@@ -3899,52 +3907,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     // image) needs no upload from guest memory first: Ocarina of Time creates ~4 such targets a
     // frame outdoors, and uploading them was ~15% of the GPU back thread.
     const auto overwritten_by_clear = [&] {
-        if (!clearing_render_targets || !join_copies_to_do.empty() ||
-            new_info.type != ImageType::e2D || new_info.resources.levels != 1 ||
-            new_info.resources.layers != 1 || new_info.num_samples != 1) {
-            return false;
-        }
-        const auto& regs = maxwell3d->regs;
-        const auto& surface = regs.clear_surface;
-        if (surface.layer != 0) {
-            return false;
-        }
-        const u32 width = new_info.size.width;
-        const u32 height = new_info.size.height;
-        if (!ClearCovers(width, height)) {
-            return false;
-        }
-        // The clear covers the framebuffer's render area, the smallest bound target.
-        for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
-            const auto& rt = regs.rt[index];
-            if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
-                (rt.width < width || rt.height < height)) {
-                return false;
-            }
-        }
-        if (regs.zeta_enable && regs.zeta.Address() != 0 &&
-            (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
-            return false;
-        }
-        const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
-        const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
-        switch (VideoCore::Surface::GetFormatType(new_info.format)) {
-        case VideoCore::Surface::SurfaceType::ColorTexture: {
-            // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
-            const u32 index = surface.RT;
-            return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
-                   index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
-                   regs.rt[index].Address() == gpu_addr;
-        }
-        case VideoCore::Surface::SurfaceType::Depth:
-            return is_depth_target && surface.Z;
-        case VideoCore::Surface::SurfaceType::Stencil:
-            return is_depth_target && full_stencil;
-        case VideoCore::Surface::SurfaceType::DepthStencil:
-            return is_depth_target && surface.Z && full_stencil;
-        default:
-            return false;
-        }
+        return clearing_render_targets && join_copies_to_do.empty() &&
+               ClearWritesWhole(new_info, gpu_addr);
     };
     std::ranges::sort(join_copies_to_do, [this](const JoinCopy& lhs, const JoinCopy& rhs) {
         const ImageBase& lhs_image = slot_images[lhs.id];
@@ -5207,6 +5171,74 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     }
     // Make sure the clear covers all texels in the subresource
     return ClearCovers(size.width, size.height);
+}
+
+template <class P>
+bool TextureCache<P>::ClearWritesWhole(const ImageInfo& info, GPUVAddr gpu_addr) const {
+    if (info.type != ImageType::e2D || info.resources.levels != 1 ||
+        info.resources.layers != 1 || info.num_samples != 1) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& surface = regs.clear_surface;
+    if (surface.layer != 0) {
+        return false;
+    }
+    const u32 width = info.size.width;
+    const u32 height = info.size.height;
+    if (!ClearCovers(width, height)) {
+        return false;
+    }
+    // The clear covers the framebuffer's render area, the smallest bound target.
+    for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
+        const auto& rt = regs.rt[index];
+        if (rt.Address() != 0 && rt.format != Tegra::RenderTargetFormat::NONE &&
+            (rt.width < width || rt.height < height)) {
+            return false;
+        }
+    }
+    if (regs.zeta_enable && regs.zeta.Address() != 0 &&
+        (regs.zeta_size.width < width || regs.zeta_size.height < height)) {
+        return false;
+    }
+    const bool is_depth_target = regs.zeta_enable && regs.zeta.Address() == gpu_addr;
+    const bool full_stencil = surface.S && regs.stencil_front_mask == 0xFF;
+    switch (VideoCore::Surface::GetFormatType(info.format)) {
+    case VideoCore::Surface::SurfaceType::ColorTexture: {
+        // OpenGL clears draw buffer RT, which writes target rt_control.Map(RT).
+        const u32 index = surface.RT;
+        return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
+               index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
+               regs.rt[index].Address() == gpu_addr;
+    }
+    case VideoCore::Surface::SurfaceType::Depth:
+        return is_depth_target && surface.Z;
+    case VideoCore::Surface::SurfaceType::Stencil:
+        return is_depth_target && full_stencil;
+    case VideoCore::Surface::SurfaceType::DepthStencil:
+        return is_depth_target && surface.Z && full_stencil;
+    default:
+        return false;
+    }
+}
+
+template <class P>
+void TextureCache<P>::NoteClearedWhole() {
+    // A clear that writes all of a target replaces its contents: write-backs noted before it are
+    // no newer than what it holds (OverlapHasNewerData's smaller newer write-backs).
+    const auto note = [&](ImageViewId id) {
+        if (!PreparesImage(slot_image_views, id)) {
+            return;
+        }
+        ImageBase& image = slot_images[slot_image_views[id].image_id];
+        if (ClearWritesWhole(image.info, image.gpu_addr)) {
+            image.load_tick = image.modification_tick;
+        }
+    };
+    for (const ImageViewId id : render_targets.color_buffer_ids) {
+        note(id);
+    }
+    note(render_targets.depth_buffer_id);
 }
 
 template <class P>
