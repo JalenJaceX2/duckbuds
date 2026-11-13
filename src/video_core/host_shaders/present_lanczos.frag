@@ -13,36 +13,26 @@ layout (binding = 0) uniform sampler2D color_texture;
 float sinc(float x) {
     return x == 0.0f ? 1.0f : sin(PI * x) / (PI * x);
 }
-float lanczos(vec2 v, float a) {
-    float d = length(v);
-    return sinc(d) / sinc(d / a);
+// Separable Lanczos-3 weight for a distance in source texels.
+float lanczos(float x) {
+    return abs(x) < 3.0f ? sinc(x) * sinc(x / 3.0f) : 0.0f;
 }
 vec4 textureLanczos(sampler2D textureSampler, vec2 p) {
+    vec2 res = vec2(textureSize(textureSampler, 0));
+    vec2 pos = p * res - 0.5f;
+    vec2 base = floor(pos);
+    vec2 f = pos - base;
     vec3 c_sum = vec3(0.0f);
     float w_sum = 0.0f;
-    vec2 res = vec2(textureSize(textureSampler, 0));
-    vec2 cc = floor(p * res) / res;
-    // kernel size = (2r + 1)^2
-    const int r = 3; //radius (1 = 3 steps)
-#define LANCZOS_LOOP_STEP(x, y) \
-    { \
-        vec2 kp = 0.5f * (vec2(x, y) / res); /* 0.5 = half-pixel level resampling */ \
-        vec2 uv = cc + kp; \
-        float w = lanczos(kp, float(r)); \
-        c_sum += w * texture(textureSampler, p + kp).rgb; \
-        w_sum += w; \
+    for (int y = -2; y <= 3; ++y) {
+        float wy = lanczos(float(y) - f.y);
+        for (int x = -2; x <= 3; ++x) {
+            float w = wy * lanczos(float(x) - f.x);
+            c_sum += w * texture(textureSampler, (base + vec2(x, y) + 0.5f) / res).rgb;
+            w_sum += w;
+        }
     }
-
-    for (int y = -r; y <= r; ++y) {
-        LANCZOS_LOOP_STEP(-3, y);
-        LANCZOS_LOOP_STEP(-2, y);
-        LANCZOS_LOOP_STEP(-1, y);
-        LANCZOS_LOOP_STEP(-0, y);
-        LANCZOS_LOOP_STEP(+1, y);
-        LANCZOS_LOOP_STEP(+2, y);
-        LANCZOS_LOOP_STEP(+3, y);
-    }
-    return vec4(c_sum / w_sum, 1.0f);
+    return vec4(max(c_sum / w_sum, 0.0f), 1.0f);
 }
 
 void main() {
