@@ -2173,6 +2173,71 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     if (ClearVolumeSlices(framebuffer, base_array_layer, layer_count)) {
         return;
     }
+    // The Duskbloods (as dusk-v2.5): colour layers the framebuffer can't reach that
+    // ClearVolumeSlices left alone (a non-zero or partial-channel clear of a 3D target, or a 2D
+    // array past another attachment's layers) are cleared on the image directly. The game clears
+    // its 24-slice fog volumes one layer at a time; dropped layers accumulated to Inf (white fog).
+    // ClearColorImage can't pick slices of a 3D image, so a volume is cleared whole: the game
+    // clears every slice to the same value. Other titles as build 177.
+    if (program_id == VideoCommon::FireEmblemUpscale::DuskbloodsProgramId &&
+        clear_layers.count < layer_count && use_color && !use_depth && !use_stencil) {
+        const u32 rt = regs.clear_surface.RT;
+        const auto& color_ids = texture_cache.GetRenderTargets().color_buffer_ids;
+        const ImageView* const view =
+            rt < color_ids.size() && color_ids[rt] ? &texture_cache.GetImageView(color_ids[rt])
+                                                   : nullptr;
+        const Image* const image = view ? view->BackingImage() : nullptr;
+        if (image != nullptr) {
+            const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[rt].format);
+            const size_t int_size = PixelComponentSizeBitsInteger(format);
+            VkClearColorValue value{};
+            if (!IsPixelFormatInteger(format)) {
+                std::memcpy(value.float32, regs.clear_color.data(), sizeof(value.float32));
+            } else if (!IsPixelFormatSignedInteger(format)) {
+                for (size_t i = 0; i < 4; i++)
+                    value.uint32[i] = u32(f32(u64(int_size) << 1U) * regs.clear_color[i]);
+            } else {
+                for (size_t i = 0; i < 4; i++)
+                    value.int32[i] = s32(f32(s64(int_size - 1) << 1) * (regs.clear_color[i] - 0.5f));
+            }
+            const bool volume = image->info.type == VideoCommon::ImageType::e3D;
+            const u32 first =
+                static_cast<u32>(view->range.base.layer) + base_array_layer + clear_layers.count;
+            const u32 image_layers = volume ? 1U : static_cast<u32>(image->info.resources.layers);
+            if (volume || first < image_layers) {
+                const VkImageSubresourceRange range{
+                    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel = static_cast<u32>(view->range.base.level),
+                    .levelCount = 1,
+                    .baseArrayLayer = volume ? 0U : first,
+                    .layerCount = volume ? 1U
+                                         : (std::min)(layer_count - clear_layers.count,
+                                                      image_layers - first),
+                };
+                scheduler.RequestOutsideRenderPassOperationContext();
+                scheduler.Record([handle = view->ImageHandle(), range,
+                                  value](vk::CommandBuffer cmdbuf) {
+                    constexpr VkMemoryBarrier clear_waits{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .pNext = nullptr,
+                        .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    };
+                    constexpr VkMemoryBarrier clear_finished{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .pNext = nullptr,
+                        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                    };
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, clear_waits);
+                    cmdbuf.ClearColorImage(handle, VK_IMAGE_LAYOUT_GENERAL, value, range);
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, clear_finished);
+                });
+            }
+        }
+    }
     if (clear_layers.count == 0) {
         return;
     }
