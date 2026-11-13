@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -119,8 +120,29 @@ std::string AddressToString(const SockAddrIn& address) {
 
 void Configure() {
     auto config = std::make_shared<Config>();
-    if (Settings::values.online_service_redirect.GetValue()) {
-        std::string_view rest{Settings::values.online_redirect_hosts.GetValue()};
+    // The playDB-CNT launcher sets the redirect through the environment instead of the settings:
+    // EDEN_NX2_ONLINE_HOSTS, EDEN_NX2_ONLINE_SERVER, EDEN_NX2_LOOPBACK_ONLY, EDEN_NX2_ONLINE_CA.
+    const auto env = [](const char* name) {
+        const char* value = std::getenv(name);
+        return std::string{value != nullptr ? value : ""};
+    };
+    const bool from_env = !Settings::values.online_service_redirect.GetValue() &&
+                          (!env("EDEN_NX2_ONLINE_HOSTS").empty() ||
+                           !env("EDEN_NX2_ONLINE_SERVER").empty() ||
+                           !env("EDEN_NX2_LOOPBACK_ONLY").empty() ||
+                           !env("EDEN_NX2_ONLINE_CA").empty());
+    const auto hosts_value = from_env ? env("EDEN_NX2_ONLINE_HOSTS")
+                                      : Settings::values.online_redirect_hosts.GetValue();
+    const auto server_value = from_env ? env("EDEN_NX2_ONLINE_SERVER")
+                                       : Settings::values.online_redirect_server.GetValue();
+    const auto ca_value =
+        from_env ? env("EDEN_NX2_ONLINE_CA") : Settings::values.online_redirect_ca.GetValue();
+    const auto loopback_value = env("EDEN_NX2_LOOPBACK_ONLY");
+    const bool loopback_only =
+        from_env ? !loopback_value.empty() && loopback_value[0] != '0'
+                 : Settings::values.online_redirect_loopback_only.GetValue();
+    if (Settings::values.online_service_redirect.GetValue() || from_env) {
+        std::string_view rest{hosts_value};
         while (!rest.empty()) {
             const size_t comma = rest.find(',');
             std::string host = Normalize(rest.substr(0, comma));
@@ -129,15 +151,15 @@ void Configure() {
             }
             rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
         }
-        if (const auto& text = Settings::values.online_redirect_server.GetValue(); !text.empty()) {
+        if (const auto& text = server_value; !text.empty()) {
             config->server = ParseServer(text);
             if (!config->server) {
                 LOG_WARNING(Network, "Host redirect: server address {} is not <ip>:<port>; ignored",
                             text);
             }
         }
-        config->loopback_only = Settings::values.online_redirect_loopback_only.GetValue();
-        if (const auto& path = Settings::values.online_redirect_ca.GetValue(); !path.empty()) {
+        config->loopback_only = loopback_only;
+        if (const auto& path = ca_value; !path.empty()) {
             config->test_ca = ReadCa(path);
         }
         LOG_INFO(Network,
