@@ -306,9 +306,30 @@ public:
         const Tegra::Engines::Fermi2D::Surface& motion_vectors,
         const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
         std::array<f32, 2> motion_scale, bool use_history = true,
-        std::optional<std::array<u32, 2>> render_region = std::nullopt) {
+        std::optional<std::array<u32, 2>> render_region = std::nullopt,
+        bool depth_from_draws = false) {
         return false;
     }
+
+    /// The Duskbloods: its velocity render target (R16G16 float, at least 1280 wide) and the depth
+    /// target bound with it, as its draws left them (siko's v31 upscale inputs).
+    struct DuskDrawTargets {
+        Tegra::Engines::Fermi2D::Surface velocity{};
+        GPUVAddr depth{}; ///< 0: no depth target was bound
+        u32 depth_width{};
+        u32 depth_height{};
+        u32 depth_format{}; ///< Tegra::DepthFormat
+    };
+
+    /// The tracked targets when a draw recorded them since the last call or a call took them
+    /// within 250 ms; a stale record is dropped. AccelerateTemporalUpscale with
+    /// depth_from_draws uses the depth target taken.
+    [[nodiscard]] virtual std::optional<DuskDrawTargets> TakeDuskDrawTargets() {
+        return std::nullopt;
+    }
+
+    /// Forgets the tracked targets (the upscale declined them).
+    virtual void DropDuskDrawTargets() {}
 
     /// Whether a game's own DLSS network can run here: its matrix multiplies are emulated with
     /// 32-wide shuffles, and its output must be checkable (ProbeGameDlssOutput).

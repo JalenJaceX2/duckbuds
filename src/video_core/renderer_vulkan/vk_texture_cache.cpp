@@ -2113,8 +2113,13 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                         !same_size(motion_vectors))) {
         return false;
     }
+    // Only a tracked depth target (The Duskbloods) reaches here in a format other than D32_FLOAT.
+    const auto depth_format_ok = [](PixelFormat format) {
+        return format == PixelFormat::D32_FLOAT || format == PixelFormat::D24_UNORM_S8_UINT ||
+               format == PixelFormat::X8_D24_UNORM || format == PixelFormat::D32_FLOAT_S8_UINT;
+    };
     if (use_history && depth && (!plain(*depth) || !fits(*depth, render_size) ||
-                                depth->format != PixelFormat::D32_FLOAT || !same_size(*depth))) {
+                                !depth_format_ok(depth->format) || !same_size(*depth))) {
         return false;
     }
     // A region of the input (The Duskbloods' dynamic resolution) is at most the input's size.

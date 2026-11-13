@@ -1498,6 +1498,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     if (TryNx2IndirectReset(is_indexed, instance_count)) {
         return;
     }
+    if (program_id == VideoCommon::FireEmblemUpscale::DuskbloodsProgramId) {
+        TrackDuskDrawTargets();
+    }
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);
@@ -1718,6 +1721,9 @@ void RasterizerVulkan::DrawIndirect() {
     const auto& params = maxwell3d->draw_manager.indirect_state;
     if (Common::DkbFrameTrace::Enabled()) {
         ++trace_indirect;
+    }
+    if (program_id == VideoCommon::FireEmblemUpscale::DuskbloodsProgramId) {
+        TrackDuskDrawTargets();
     }
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {
@@ -3898,10 +3904,79 @@ bool RasterizerVulkan::AccelerateTemporalUpscale(
     const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
     const Tegra::Engines::Fermi2D::Surface& motion_vectors, const Tegra::Texture::TICEntry* depth,
     std::array<f32, 2> jitter, std::array<f32, 2> motion_scale, bool use_history,
-    std::optional<std::array<u32, 2>> render_region) {
+    std::optional<std::array<u32, 2>> render_region, bool depth_from_draws) {
+    std::optional<std::pair<VideoCommon::ImageInfo, GPUVAddr>> depth_target;
+    if (depth_from_draws) {
+        if (!dusk_targets.has_depth) {
+            return false;
+        }
+        depth_target.emplace(VideoCommon::ImageInfo(dusk_targets.zeta, dusk_targets.zeta_size,
+                                                    dusk_targets.msaa),
+                             dusk_targets.zeta.Address());
+        depth = nullptr;
+    }
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.TemporalUpscale(dst, src, motion_vectors, depth, jitter, motion_scale,
-                                          use_history, render_region);
+                                          use_history, render_region,
+                                          depth_target ? &*depth_target : nullptr);
+}
+
+void RasterizerVulkan::TrackDuskDrawTargets() {
+    // As siko's v31: the full-size two-channel half-float target is the velocity buffer.
+    const auto& regs = maxwell3d->regs;
+    for (u32 i = 0; i < regs.rt_control.count.Value(); ++i) {
+        const auto& rt = regs.rt[regs.rt_control.Map(i)];
+        if (rt.format != Tegra::RenderTargetFormat::R16G16_FLOAT || rt.width < 1280 ||
+            rt.Address() == 0) {
+            continue;
+        }
+        auto& velocity = dusk_targets.velocity;
+        velocity.format = Tegra::RenderTargetFormat::R16G16_FLOAT;
+        velocity.linear = Tegra::Engines::Fermi2D::MemoryLayout::BlockLinear;
+        velocity.block_width.Assign(rt.tile_mode.block_width.Value());
+        velocity.block_height.Assign(rt.tile_mode.block_height.Value());
+        velocity.block_depth.Assign(rt.tile_mode.block_depth.Value());
+        velocity.depth = 1;
+        velocity.width = rt.width;
+        velocity.height = rt.height;
+        velocity.addr_upper = static_cast<u32>(rt.Address() >> 32);
+        velocity.addr_lower = static_cast<u32>(rt.Address());
+        dusk_targets.has_depth = regs.zeta_enable != 0 && regs.zeta.Address() != 0;
+        if (dusk_targets.has_depth) {
+            dusk_targets.zeta = regs.zeta;
+            dusk_targets.zeta_size = regs.zeta_size;
+            dusk_targets.msaa = regs.anti_alias_samples_mode;
+        }
+        dusk_targets.fresh = true;
+        return;
+    }
+}
+
+std::optional<VideoCore::RasterizerInterface::DuskDrawTargets>
+RasterizerVulkan::TakeDuskDrawTargets() {
+    auto& tracked = dusk_targets;
+    if (tracked.velocity.Address() == 0) {
+        return std::nullopt;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!tracked.fresh &&
+        (!tracked.last_taken || now - *tracked.last_taken > std::chrono::milliseconds{250})) {
+        DropDuskDrawTargets();
+        return std::nullopt;
+    }
+    tracked.fresh = false;
+    tracked.last_taken = now;
+    return DuskDrawTargets{
+        .velocity = tracked.velocity,
+        .depth = tracked.has_depth ? tracked.zeta.Address() : GPUVAddr{},
+        .depth_width = tracked.has_depth ? tracked.zeta_size.width : 0U,
+        .depth_height = tracked.has_depth ? tracked.zeta_size.height : 0U,
+        .depth_format = tracked.has_depth ? static_cast<u32>(tracked.zeta.format) : 0U,
+    };
+}
+
+void RasterizerVulkan::DropDuskDrawTargets() {
+    dusk_targets = {};
 }
 
 Tegra::Engines::AccelerateDMAInterface& RasterizerVulkan::AccessAccelerateDMA() {

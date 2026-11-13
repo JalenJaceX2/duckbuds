@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -174,7 +175,10 @@ public:
                                    const Tegra::Texture::TICEntry* depth,
                                    std::array<f32, 2> jitter,
                                    std::array<f32, 2> motion_scale, bool use_history,
-                                   std::optional<std::array<u32, 2>> render_region) override;
+                                   std::optional<std::array<u32, 2>> render_region,
+                                   bool depth_from_draws) override;
+    std::optional<DuskDrawTargets> TakeDuskDrawTargets() override;
+    void DropDuskDrawTargets() override;
     VideoCommon::OotNetwork::BypassState* OotNetworkBypass() override;
     Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() override;
     void AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
@@ -212,6 +216,8 @@ private:
     /// Remembers render target 0 of a draw with one of Ocarina of Time's tonemap shaders.
     void TrackOotTonemappedImage(const GraphicsPipeline& pipeline);
     bool TryNx2IndirectReset(bool is_indexed, u32 instance_count);
+    /// The Duskbloods: remembers the draw's velocity target and its depth (TakeDuskDrawTargets).
+    void TrackDuskDrawTargets();
 
     void FlushWork();
 
@@ -331,6 +337,15 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    struct DuskTrackedTargets {
+        Tegra::Engines::Fermi2D::Surface velocity{}; ///< address 0: nothing tracked
+        bool has_depth{};
+        Tegra::Engines::Maxwell3D::Regs::Zeta zeta{};
+        Tegra::Engines::Maxwell3D::Regs::ZetaSize zeta_size{};
+        Tegra::Texture::MsaaMode msaa{};
+        bool fresh{}; ///< drawn since the last take
+        std::optional<std::chrono::steady_clock::time_point> last_taken;
+    } dusk_targets;
     std::optional<u64> oot_camera_sample_frame;
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
     /// The game started at the DLSS Performance render scale (1920x1080).
