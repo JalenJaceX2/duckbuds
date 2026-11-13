@@ -377,12 +377,14 @@ std::optional<s64> CoreTiming::Advance() {
                 basic_lock.unlock();
 
                 // Time spent paused is not lateness: a callback that makes up for being late (the
-                // sysmix pump) would otherwise wait out the pause again after it.
-                const std::chrono::nanoseconds late_since_pause{
+                // sysmix pump) would otherwise wait out the pause again after it. Clamped, as
+                // SyncPause can move pause_end_time past now meanwhile.
+                const std::chrono::nanoseconds late_since_pause{(std::max)(
+                    s64{0},
                     evt_time < pause_end_time
                         ? (std::min)(late.count(),
                                      GetGlobalTimeNs().count() - static_cast<s64>(pause_end_time))
-                        : late.count()};
+                        : late.count())};
                 const auto new_schedule_time{event_type->callback(evt_time, late_since_pause)};
 
                 basic_lock.lock();
