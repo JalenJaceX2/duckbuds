@@ -2022,7 +2022,22 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
 template <class P>
 void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureCache};
+    // Write-backs landed for this read: an older image downloaded below leaves their ranges as
+    // they are, newest data winning as between write-backs (bytes a write-back left to newer
+    // data included).
+    struct Landed {
+        DAddr begin;
+        DAddr end;
+        u64 tick;
+    };
+    boost::container::small_vector<Landed, 4> landed;
     if (WritebackPendingOver(cpu_addr, size)) {
+        for (const AsyncOverlapDownload& download : async_overlap_downloads) {
+            if (!download.cancelled) {
+                landed.push_back({download.cpu_addr, download.cpu_addr + download.size,
+                                  download.tick});
+            }
+        }
         // A write-back still on the GPU holds this memory's data: land it before the guest reads
         // (waiting as the downloads below do, on the flushing thread with the cache's lock).
         FinishAsyncOverlapDownloads(true);
@@ -2062,8 +2077,20 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         runtime.Finish();
         for (Pending& entry : pending) {
             Image& image = slot_images[entry.image_id];
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
-                         entry.map.mapped_span, swizzle_data_buffer);
+            KeepRanges keep;
+            if (!landed.empty()) {
+                ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
+                    for (const Landed& range : landed) {
+                        if (range.tick > image.modification_tick && range.begin < end &&
+                            begin < range.end) {
+                            keep.emplace_back((std::max)(range.begin, begin),
+                                              (std::min)(range.end, end));
+                        }
+                    }
+                });
+            }
+            SwizzleKeeping(*gpu_memory, image.gpu_addr, image.info, entry.copies,
+                           entry.map.mapped_span, keep);
             NoteFlushed(image);
             ClearStaleImage(image);
         }
