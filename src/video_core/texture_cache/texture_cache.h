@@ -830,14 +830,19 @@ void TextureCache<P>::NoteWritebackLost(DAddr cpu_addr, u64 size, u64 tick) {
 
 template <class P>
 void TextureCache<P>::NoteOverlapWriteback(const ImageBase& image, bool lost) {
+    NoteOverlapWriteback(image, lost, image.modification_tick);
+}
+
+template <class P>
+void TextureCache<P>::NoteOverlapWriteback(const ImageBase& image, bool lost, u64 tick) {
     const DAddr first_page = image.cpu_addr >> OverlapPageBits;
     const DAddr last_page = (image.cpu_addr + image.guest_size_bytes - 1) >> OverlapPageBits;
     const DAddr begin = image.cpu_addr;
     const DAddr end = image.cpu_addr + image.guest_size_bytes;
-    const u64 image_tick = image.modification_tick;
+    const u64 image_tick = tick;
     for (DAddr page = first_page; page <= last_page; ++page) {
-        u64& tick = overlap_writeback_ticks[page];
-        tick = (std::max)(tick, image_tick);
+        u64& page_tick = overlap_writeback_ticks[page];
+        page_tick = (std::max)(page_tick, image_tick);
         auto& ranges = overlap_writeback_ranges[page];
         ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
                                     [&](const WritebackRange& range) {
@@ -854,14 +859,14 @@ void TextureCache<P>::NoteOverlapWriteback(const ImageBase& image, bool lost) {
 }
 
 template <class P>
-void TextureCache<P>::KeepInWaitingWritebacks(const ImageBase& image) {
+void TextureCache<P>::KeepInWaitingWritebacks(const ImageBase& image, u64 tick) {
     if (async_overlap_downloads.empty()) {
         return;
     }
     ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
         for (AsyncOverlapDownload& download : async_overlap_downloads) {
             if (!download.cancelled) {
-                KeepNewerBytes(download, begin, end, image.modification_tick);
+                KeepNewerBytes(download, begin, end, tick);
             }
         }
     });
@@ -869,12 +874,17 @@ void TextureCache<P>::KeepInWaitingWritebacks(const ImageBase& image) {
 
 template <class P>
 void TextureCache<P>::NoteFlushed(const ImageBase& image) {
+    NoteFlushed(image, image.modification_tick);
+}
+
+template <class P>
+void TextureCache<P>::NoteFlushed(const ImageBase& image, u64 tick) {
     if (!OverlapWritebacksEnabled()) {
         return;
     }
-    KeepInWaitingWritebacks(image);
+    KeepInWaitingWritebacks(image, tick);
     if (HasGuestRange(image)) {
-        NoteOverlapWriteback(image);
+        NoteOverlapWriteback(image, false, tick);
     }
 }
 
@@ -2621,10 +2631,12 @@ void TextureCache<P>::CommitAsyncFlushes() {
         bool any_none_dma = false;
         for (PendingDownload& download_info : download_ids) {
             if (download_info.is_swizzle) {
-                total_size_bytes +=
-                    Common::AlignUp(download_info.GetImage(slot_images).unswizzled_size_bytes, 64);
+                const ImageBase& image = download_info.GetImage(slot_images);
+                total_size_bytes += Common::AlignUp(image.unswizzled_size_bytes, 64);
                 any_none_dma = true;
                 download_info.async_buffer_id = last_async_buffer_id;
+                // Staged below: the flush writes these contents, however the image changes.
+                download_info.tick = image.modification_tick;
             }
         }
 
@@ -2687,7 +2699,7 @@ void TextureCache<P>::PopAsyncFlushes() {
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
                 SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span, swizzle_data_buffer);
-                NoteFlushed(image);
+                NoteFlushed(image, download_info.tick);
                 ClearStaleImage(image);
             } else {
                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];

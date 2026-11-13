@@ -691,6 +691,8 @@ private:
                         std::span<const BufferImageCopy> copies, std::span<const u8> data,
                         const KeepRanges& keep);
     void NoteOverlapWriteback(const ImageBase& image, bool lost = false);
+    /// The same for the image's contents at modification tick `tick`.
+    void NoteOverlapWriteback(const ImageBase& image, bool lost, u64 tick);
     /// A noted write-back that was cancelled before it landed: its range stays newer than older
     /// images, but its data is gone (like an image dropped without one).
     void NoteWritebackLost(DAddr cpu_addr, u64 size, u64 tick);
@@ -723,10 +725,13 @@ private:
     }
     /// KeepNewerBytes for every write-back waiting for the GPU and every range `image` was
     /// written to, after it was written to guest memory.
-    void KeepInWaitingWritebacks(const ImageBase& image);
+    void KeepInWaitingWritebacks(const ImageBase& image, u64 tick);
     /// After a flush wrote `image` to guest memory: write-backs still waiting keep its bytes, and
     /// later ones see it as newer data (NoteOverlapWriteback), while write-backs are on.
     void NoteFlushed(const ImageBase& image);
+    /// NoteFlushed for contents staged at modification tick `tick` (asynchronous flushes: the
+    /// image may have been written again since).
+    void NoteFlushed(const ImageBase& image, u64 tick);
     /// Whether the collector's or joins' write-backs are on (writeback_switches.h).
     [[nodiscard]] static bool OverlapWritebacksEnabled();
     u64 join_writeback_reuses{};
