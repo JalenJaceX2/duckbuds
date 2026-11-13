@@ -1856,7 +1856,8 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView& motion_vectors, ImageView& depth,
                                           std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale) {
+                                          std::array<f32, 2> motion_scale,
+                                          std::array<u32, 2> max_render_size) {
     if (!WantsTemporalUpscaleDepth()) {
         return false;
     }
@@ -1914,6 +1915,7 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
             .motion_vectors = motion_vectors.Handle(Shader::TextureType::Color2D),
             .render_size = {render_size[0], render_size[1]},
             .upscale_size = extent,
+            .max_render_size = {max_render_size[0], max_render_size[1]},
             .jitter = jitter,
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
@@ -2115,8 +2117,11 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                 depth->format != PixelFormat::D32_FLOAT || !same_size(*depth))) {
         return false;
     }
+    // A region of the input (The Duskbloods' dynamic resolution) is at most the input's size.
+    const std::array<u32, 2> max_render_size =
+        whole_input ? render_size : host_extent(input_color).value_or(render_size);
     if (use_history && depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
-                                 jitter, motion_scale)) {
+                                 jitter, motion_scale, max_render_size)) {
         return true;
     }
     const VkFormat format =
