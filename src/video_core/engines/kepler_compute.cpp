@@ -869,8 +869,10 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     if (dlss_chain.output_pass) {
         return replacement && FinishDlssEvaluation();
     }
-    const bool replacement_will_draw =
-        replacement && dlss_chain.replacement_drew && fe_upscale_jitter.Has();
+    // Only The Duskbloods skips the network while the replacement draws; Fire Emblem keeps
+    // running it until the network fails its checks.
+    const bool replacement_will_draw = dlss_chain.render_region && replacement &&
+                                       dlss_chain.replacement_drew && fe_upscale_jitter.Has();
     return (dlss_chain.failure != VideoCore::GameDlssReason::None || replacement_will_draw) &&
            native_key != passes->prepass && dlss_chain.programs.contains(native_key);
 }
