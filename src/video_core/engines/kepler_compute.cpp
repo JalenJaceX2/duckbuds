@@ -1525,7 +1525,8 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
         for (const u32 offset : {0x350U, 0x330U}) {
             const auto history = ConstBuffer0Image(offset);
             if (!history || history->format != Texture::TextureFormat::R16G16B16A16 ||
-                history->Address() == 0 || !history->IsBlockLinear() ||
+                history->r_type != Texture::ComponentType::FLOAT || history->Address() == 0 ||
+                !history->IsBlockLinear() ||
                 history->Address() == output->Address() ||
                 history->Address() == input->Address() || history->Width() != output->Width() ||
                 history->Height() != output->Height()) {
