@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_executable(tests
@@ -15,6 +14,7 @@ add_executable(tests
     video_core/nx2_stutter_trace.cpp
     video_core/back_idle_trace.cpp
     video_core/list_macro_trace.cpp
+    video_core/nx2_list_grid.cpp
     video_core/host_mip_limits.cpp
     video_core/writeback_switches.cpp
     video_core/gpu_timestamp.cpp
@@ -246,7 +246,7 @@ target_link_libraries(tests PRIVATE common core audio_core input_common video_co
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 if (TARGET dynarmic::dynarmic)
-    target_sources(tests PRIVATE core/jit_ordered_loads.cpp core/window_trace.cpp)
+    target_sources(tests PRIVATE core/jit_codegen_options.cpp core/jit_ordered_loads.cpp core/window_trace.cpp)
     target_link_libraries(tests PRIVATE dynarmic::dynarmic)
 endif()
 
@@ -261,7 +261,7 @@ target_link_libraries(profile_migration_tests PRIVATE common Catch2::Catch2WithM
 add_test(NAME profile_migration_tests COMMAND profile_migration_tests)
 
 if (TARGET SDL3::SDL3)
-    add_executable(sdl_window_state_tests yuzu_cmd/sdl_window_state.cpp)
+    add_executable(sdl_window_state_tests lichii_cmd/sdl_window_state.cpp)
     target_link_libraries(sdl_window_state_tests PRIVATE SDL3::SDL3 Catch2::Catch2WithMain)
     add_test(NAME sdl_window_state_tests COMMAND sdl_window_state_tests)
 endif()
