@@ -854,6 +854,7 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
         dlss_chain.dispatches = 0;
+        dlss_chain.skipped_this_eval = false;
         dlss_chain.pending.clear();
     }
     if (!dlss_chain.active) {
@@ -867,14 +868,23 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
                              GameDlssBlocker() != VideoCore::GameDlssReason::None;
     if (dlss_chain.output_pass) {
-        return replacement && FinishDlssEvaluation();
+        // When this evaluation skipped passes for a replacement that then failed, the game's
+        // output pass would read inputs not written this frame; it is skipped too, so the last
+        // output stays one more frame. replacement_drew is now false, so the next evaluation
+        // runs the whole network.
+        return (replacement && FinishDlssEvaluation()) || dlss_chain.skipped_this_eval;
     }
     // Only The Duskbloods skips the network while the replacement draws; Fire Emblem keeps
     // running it until the network fails its checks.
     const bool replacement_will_draw = dlss_chain.render_region && replacement &&
                                        dlss_chain.replacement_drew && fe_upscale_jitter.Has();
-    return (dlss_chain.failure != VideoCore::GameDlssReason::None || replacement_will_draw) &&
-           native_key != passes->prepass && dlss_chain.programs.contains(native_key);
+    const bool failed = dlss_chain.failure != VideoCore::GameDlssReason::None;
+    const bool skip = (failed || replacement_will_draw) && native_key != passes->prepass &&
+                      dlss_chain.programs.contains(native_key);
+    if (skip && !failed) {
+        dlss_chain.skipped_this_eval = true;
+    }
+    return skip;
 }
 
 // The game's own DLSS network (its translated programs) is shown once every pass of an

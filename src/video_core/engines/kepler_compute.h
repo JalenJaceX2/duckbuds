@@ -362,6 +362,8 @@ private:
         /// this evaluation's jitter was captured, the network's other passes are skipped: their
         /// results only feed the output pass the replacement draws over.
         bool replacement_drew{};
+        /// Whether this evaluation skipped a pass only because the replacement was drawing.
+        bool skipped_this_eval{};
         /// What the Graphics tab was last told.
         VideoCore::GameDlssStatus status{};
     } dlss_chain;
