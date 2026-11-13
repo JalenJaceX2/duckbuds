@@ -761,6 +761,9 @@ private:
     /// Whether a write-back still waiting covers the image and would reload it when it lands
     /// (the image has not been GPU-written since that write-back's contents).
     [[nodiscard]] bool WritebackWouldReload(const ImageBase& image) const;
+    /// Whether a write-back still waiting writes to [cpu_addr, cpu_addr + size): its GPU data
+    /// is not in guest memory yet.
+    [[nodiscard]] bool WritebackPendingOver(DAddr cpu_addr, u64 size) const;
     void CancelAsyncOverlapDownloads(DAddr cpu_addr, u64 size);
     /// The guest wrote [cpu_addr, cpu_addr + size): waiting write-backs keep those bytes (they
     /// are newer) and still land the rest; one written all over is cancelled.

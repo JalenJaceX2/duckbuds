@@ -598,6 +598,14 @@ bool TextureCache<P>::WritebackWouldReload(const ImageBase& image) const {
 }
 
 template <class P>
+bool TextureCache<P>::WritebackPendingOver(DAddr cpu_addr, u64 size) const {
+    return std::ranges::any_of(async_overlap_downloads, [&](const AsyncOverlapDownload& download) {
+        return !download.cancelled && download.cpu_addr < cpu_addr + size &&
+               cpu_addr < download.cpu_addr + download.size;
+    });
+}
+
+template <class P>
 void TextureCache<P>::KeepGuestWrite(DAddr cpu_addr, u64 size) {
     // A write-back's image is newer than what guest memory held, and the guest's write is newer
     // still: guest memory as the console has it is the image's bytes with the write over them.
@@ -2014,6 +2022,11 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
 template <class P>
 void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureCache};
+    if (WritebackPendingOver(cpu_addr, size)) {
+        // A write-back still on the GPU holds this memory's data: land it before the guest reads
+        // (waiting as the downloads below do, on the flushing thread with the cache's lock).
+        FinishAsyncOverlapDownloads(true);
+    }
     boost::container::small_vector<ImageId, 16> images;
     ForEachImageInRegion(cpu_addr, size, [this, &images](ImageId image_id, ImageBase& image) {
         if (!IsDownloadable(image)) {
@@ -2094,6 +2107,21 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
         area->preemtive &= image.info.forced_flushed;
         image.info.forced_flushed = true;
     });
+    // Write-backs still on the GPU: DownloadMemory lands them.
+    for (const AsyncOverlapDownload& download : async_overlap_downloads) {
+        if (download.cancelled || download.cpu_addr + download.size <= cpu_addr ||
+            cpu_addr + size <= download.cpu_addr) {
+            continue;
+        }
+        if (!area) {
+            area.emplace();
+            area->start_address = cpu_addr;
+            area->end_address = cpu_addr + size;
+            area->preemtive = true;
+        }
+        area->start_address = (std::min)(area->start_address, download.cpu_addr);
+        area->end_address = (std::max)(area->end_address, download.cpu_addr + download.size);
+    }
     return area;
 }
 
@@ -2811,7 +2839,7 @@ bool TextureCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
         is_modified = true;
         return true;
     });
-    return is_modified;
+    return is_modified || WritebackPendingOver(addr, size);
 }
 
 template <class P>
