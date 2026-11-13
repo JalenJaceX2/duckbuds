@@ -753,6 +753,9 @@ private:
     /// The GPU memory of an address space the cache has seen, or null.
     [[nodiscard]] Tegra::MemoryManager* AddressSpaceMemory(size_t as_id);
     void FinishAsyncOverlapDownloads(bool wait_all);
+    /// Whether a write-back still waiting covers the image and would reload it when it lands
+    /// (the image has not been GPU-written since that write-back's contents).
+    [[nodiscard]] bool WritebackWouldReload(const ImageBase& image) const;
     void CancelAsyncOverlapDownloads(DAddr cpu_addr, u64 size);
     /// The guest wrote [cpu_addr, cpu_addr + size): waiting write-backs keep those bytes (they
     /// are newer) and still land the rest; one written all over is cancelled.

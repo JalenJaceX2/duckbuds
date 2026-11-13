@@ -584,6 +584,20 @@ void TextureCache<P>::FinishAsyncOverlapDownloads(bool wait_all) {
 }
 
 template <class P>
+bool TextureCache<P>::WritebackWouldReload(const ImageBase& image) const {
+    // As FinishAsyncOverlapDownloads' reload: not GPU-written, contents no newer than the data.
+    if (True(image.flags & ImageFlagBits::GpuModified)) {
+        return false;
+    }
+    const DAddr end = image.cpu_addr + image.guest_size_bytes;
+    return std::ranges::any_of(async_overlap_downloads, [&](const AsyncOverlapDownload& download) {
+        return !download.cancelled && download.cpu_addr < end &&
+               image.cpu_addr < download.cpu_addr + download.size &&
+               image.modification_tick <= download.tick;
+    });
+}
+
+template <class P>
 void TextureCache<P>::KeepGuestWrite(DAddr cpu_addr, u64 size) {
     // A write-back's image is newer than what guest memory held, and the guest's write is newer
     // still: guest memory as the console has it is the image's bytes with the write over them.
@@ -4977,6 +4991,13 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         }
     }
     Image& image = slot_images[image_id];
+    if (is_modification && !invalidate && !async_overlap_downloads.empty() &&
+        WritebackWouldReload(image)) {
+        // Its write-back landing would reload it, but not once the GPU has written to it: a
+        // partial render now would keep guest memory's stale bytes where it doesn't draw. Land
+        // the write-backs first (they mark it for the upload below).
+        FinishAsyncOverlapDownloads(true);
+    }
     if (invalidate) {
         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
         if (False(image.flags & ImageFlagBits::Tracked)) {
