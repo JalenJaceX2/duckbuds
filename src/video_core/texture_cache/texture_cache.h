@@ -584,17 +584,21 @@ void TextureCache<P>::FinishAsyncOverlapDownloads(bool wait_all) {
 }
 
 template <class P>
-bool TextureCache<P>::WritebackWouldReload(const ImageBase& image) const {
-    // As FinishAsyncOverlapDownloads' reload: not GPU-written, contents no newer than the data.
+bool TextureCache<P>::WritebackWouldReload(const ImageBase& image) {
+    // As FinishAsyncOverlapDownloads' reload: not GPU-written, contents no newer than the data,
+    // over any of the image's guest memory (a sparse image's mapped segments).
     if (True(image.flags & ImageFlagBits::GpuModified)) {
         return false;
     }
-    const DAddr end = image.cpu_addr + image.guest_size_bytes;
-    return std::ranges::any_of(async_overlap_downloads, [&](const AsyncOverlapDownload& download) {
-        return !download.cancelled && download.cpu_addr < end &&
-               image.cpu_addr < download.cpu_addr + download.size &&
-               image.modification_tick <= download.tick;
+    bool reload = false;
+    ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
+        for (const AsyncOverlapDownload& download : async_overlap_downloads) {
+            reload |= !download.cancelled && download.cpu_addr < end &&
+                      begin < download.cpu_addr + download.size &&
+                      image.modification_tick <= download.tick;
+        }
     });
+    return reload;
 }
 
 template <class P>
