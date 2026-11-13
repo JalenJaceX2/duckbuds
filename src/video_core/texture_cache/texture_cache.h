@@ -184,6 +184,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         boost::container::small_vector<BufferImageCopy, 16> copies;
         DownloadMap map;
         KeepRanges keep;
+        size_t address_space;
     };
     std::vector<OverlapDownload> overlap_downloads;
     static const int download_overlaps_setting =
@@ -255,6 +256,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 .copies = std::move(copies),
                 .map = std::move(map),
                 .keep = keep,
+                .address_space = image.address_space,
             });
             ++gc_download_deletes;
             ClearStaleImage(image);
@@ -375,6 +377,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                     .cancelled = false,
                     .keep = download.keep,
                     .tick = download.tick,
+                    .address_space = download.address_space,
                 });
             }
         }
@@ -395,8 +398,12 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                          [](const auto& a, const auto& b) { return a.tick < b.tick; });
         u64 bytes = 0;
         for (auto& download : overlap_downloads) {
-            SwizzleKeeping(download.gpu_addr, download.info, download.copies,
-                           download.map.mapped_span, download.keep);
+            if (Tegra::MemoryManager* const memory = AddressSpaceMemory(download.address_space)) {
+                SwizzleKeeping(*memory, download.gpu_addr, download.info, download.copies,
+                               download.map.mapped_span, download.keep);
+            } else {
+                NoteWritebackLost(download.cpu_addr, download.size, download.tick);
+            }
             bytes += download.map.mapped_span.size();
             runtime.FreeDeferredStagingBuffer(download.map);
         }
@@ -500,11 +507,12 @@ bool TextureCache<P>::OverlapHasNewerData(ImageId image_id, const ImageBase& ima
 }
 
 template <class P>
-void TextureCache<P>::SwizzleKeeping(GPUVAddr gpu_addr, const ImageInfo& info,
+void TextureCache<P>::SwizzleKeeping(Tegra::MemoryManager& memory, GPUVAddr gpu_addr,
+                                     const ImageInfo& info,
                                      std::span<const BufferImageCopy> copies,
-                                     std::span<const u8> memory, const KeepRanges& keep) {
+                                     std::span<const u8> data, const KeepRanges& keep) {
     if (keep.empty()) {
-        SwizzleImage(*gpu_memory, gpu_addr, info, copies, memory, swizzle_data_buffer);
+        SwizzleImage(memory, gpu_addr, info, copies, data, swizzle_data_buffer);
         return;
     }
     size_t total = 0;
@@ -517,12 +525,19 @@ void TextureCache<P>::SwizzleKeeping(GPUVAddr gpu_addr, const ImageInfo& info,
         device_memory.ReadBlockUnsafe(begin, saved.data() + offset, end - begin);
         offset += end - begin;
     }
-    SwizzleImage(*gpu_memory, gpu_addr, info, copies, memory, swizzle_data_buffer);
+    SwizzleImage(memory, gpu_addr, info, copies, data, swizzle_data_buffer);
     offset = 0;
     for (const auto& [begin, end] : keep) {
         device_memory.WriteBlockUnsafe(begin, saved.data() + offset, end - begin);
         offset += end - begin;
     }
+}
+
+template <class P>
+Tegra::MemoryManager* TextureCache<P>::AddressSpaceMemory(size_t as_id) {
+    std::scoped_lock lock{config_mutex};
+    const auto it = address_spaces.find(as_id);
+    return it != address_spaces.end() ? it->second.gpu_memory : nullptr;
 }
 
 template <class P>
@@ -537,8 +552,15 @@ void TextureCache<P>::FinishAsyncOverlapDownloads(bool wait_all) {
         while (!async_overlap_downloads.empty() &&
                runtime.IsFree(async_overlap_downloads.front().gpu_tick)) {
             auto& download = async_overlap_downloads.front();
+            // Its address space, not the bound channel's: another one may be bound by now.
+            Tegra::MemoryManager* const memory = AddressSpaceMemory(download.address_space);
+            if (!download.cancelled && memory == nullptr) {
+                download.cancelled = true;
+                ++async_overlap_cancels;
+                NoteWritebackLost(download.cpu_addr, download.size, download.tick);
+            }
             if (!download.cancelled) {
-                SwizzleKeeping(download.gpu_addr, download.info, download.copies,
+                SwizzleKeeping(*memory, download.gpu_addr, download.info, download.copies,
                                download.map.mapped_span, download.keep);
                 // Images the GPU did not write loaded these pages before the data landed (made
                 // in the meantime by a join): they load them again. Not one whose contents are
@@ -613,9 +635,10 @@ void TextureCache<P>::CancelAsyncOverlapDownloads(DAddr cpu_addr, u64 size) {
 }
 
 template <class P>
-void TextureCache<P>::CancelAsyncOverlapDownloadsGpu(GPUVAddr gpu_addr, u64 size) {
+void TextureCache<P>::CancelAsyncOverlapDownloadsGpu(size_t as_id, GPUVAddr gpu_addr, u64 size) {
     for (auto& download : async_overlap_downloads) {
-        if (!download.cancelled && download.gpu_addr < gpu_addr + size &&
+        if (!download.cancelled && download.address_space == as_id &&
+            download.gpu_addr < gpu_addr + size &&
             gpu_addr < download.gpu_addr + download.size) {
             download.cancelled = true;
             ++async_overlap_cancels;
@@ -708,6 +731,7 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
                         .cancelled = false,
                         .keep = keep,
                         .tick = overlap.modification_tick,
+                        .address_space = overlap.address_space,
                     });
                     NoteOverlapWriteback(overlap);
                 }
@@ -741,8 +765,8 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
                 .count());
         for (auto& item : pending) {
             const Image& overlap = slot_images[item.id];
-            SwizzleKeeping(overlap.gpu_addr, overlap.info, item.copies, item.map.mapped_span,
-                           item.keep);
+            SwizzleKeeping(*gpu_memory, overlap.gpu_addr, overlap.info, item.copies,
+                           item.map.mapped_span, item.keep);
             NoteOverlapWriteback(overlap);
         }
         ++join_writebacks;
@@ -2070,7 +2094,7 @@ void TextureCache<P>::UnmapMemory(DAddr cpu_addr, size_t size) {
 template <class P>
 void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size) {
     if (!async_overlap_downloads.empty()) {
-        CancelAsyncOverlapDownloadsGpu(gpu_addr, size);
+        CancelAsyncOverlapDownloadsGpu(as_id, gpu_addr, size);
     }
     boost::container::small_vector<ImageId, 16> deleted_images;
     ForEachImageInRegionGPU(as_id, gpu_addr, size,

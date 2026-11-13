@@ -686,9 +686,9 @@ private:
     /// without one) cover; true when they cover all of it.
     [[nodiscard]] bool OverlapHasNewerData(ImageId image_id, const ImageBase& image,
                                            KeepRanges& keep);
-    /// SwizzleImage that leaves the `keep` ranges of guest memory as they were.
-    void SwizzleKeeping(GPUVAddr gpu_addr, const ImageInfo& info,
-                        std::span<const BufferImageCopy> copies, std::span<const u8> memory,
+    /// SwizzleImage through `memory` that leaves the `keep` ranges of guest memory as they were.
+    void SwizzleKeeping(Tegra::MemoryManager& memory, GPUVAddr gpu_addr, const ImageInfo& info,
+                        std::span<const BufferImageCopy> copies, std::span<const u8> data,
                         const KeepRanges& keep);
     void NoteOverlapWriteback(const ImageBase& image, bool lost = false);
     /// A noted write-back that was cancelled before it landed: its range stays newer than older
@@ -746,14 +746,18 @@ private:
         KeepRanges keep{};
         /// Modification tick of the written-back image's contents.
         u64 tick{};
+        /// The image's address space: gpu_addr is in it, whichever channel is bound on landing.
+        size_t address_space{};
     };
     std::deque<AsyncOverlapDownload> async_overlap_downloads;
+    /// The GPU memory of an address space the cache has seen, or null.
+    [[nodiscard]] Tegra::MemoryManager* AddressSpaceMemory(size_t as_id);
     void FinishAsyncOverlapDownloads(bool wait_all);
     void CancelAsyncOverlapDownloads(DAddr cpu_addr, u64 size);
     /// The guest wrote [cpu_addr, cpu_addr + size): waiting write-backs keep those bytes (they
     /// are newer) and still land the rest; one written all over is cancelled.
     void KeepGuestWrite(DAddr cpu_addr, u64 size);
-    void CancelAsyncOverlapDownloadsGpu(GPUVAddr gpu_addr, u64 size);
+    void CancelAsyncOverlapDownloadsGpu(size_t as_id, GPUVAddr gpu_addr, u64 size);
     u64 async_overlap_cancels{};
     u64 join_writebacks{};
     u64 join_writeback_images{};
