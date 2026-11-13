@@ -1559,12 +1559,17 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
             (void)rasterizer->AccelerateSurfaceCopy(surface(*output), destination, copy);
         }
     }
+    // Dynamic resolution changes the width often; only the first changes are logged.
+    constexpr u32 max_width_logs = 8;
     static u32 last_width{};
-    if (width != last_width) {
+    static u32 width_logs{};
+    if (width != last_width && width_logs < max_width_logs) {
         last_width = width;
-        LOG_INFO(HW_GPU, "DLSS replacement: {} region {}x{} of {}x{} to {}x{}",
+        ++width_logs;
+        LOG_INFO(HW_GPU, "DLSS replacement: {} region {}x{} of {}x{} to {}x{}{}",
                  done ? "scaled" : "could not scale", width, height, input->Width(),
-                 input->Height(), output->Width(), output->Height());
+                 input->Height(), output->Width(), output->Height(),
+                 width_logs == max_width_logs ? " (further region changes are not logged)" : "");
     }
     return done;
 }
