@@ -746,6 +746,65 @@ TEST_CASE("Native reads whose high word is another pointer's do not read the loa
     }
 }
 
+namespace {
+/// Whether the program's read takes the loaded pointer (low) as its offset base.
+bool ReadsFromLoadedPointer(const LoadedPointerRecords& records, const IR::U32& low) {
+    const IR::Inst* const read{records.Find(IR::Opcode::LoadStorage32)};
+    if (read == nullptr || read->Arg(1).IsImmediate()) {
+        return false;
+    }
+    const IR::Inst* const offset{read->Arg(1).InstRecursive()};
+    if (offset->GetOpcode() != IR::Opcode::ISub32 || offset->Arg(1).IsImmediate()) {
+        return false;
+    }
+    const IR::Inst* const base{offset->Arg(1).InstRecursive()};
+    return base->GetOpcode() == IR::Opcode::BitwiseAnd32 && !base->Arg(0).IsImmediate() &&
+           base->Arg(0).InstRecursive() == low.InstRecursive();
+}
+} // Anonymous namespace
+
+TEST_CASE("Native reads through a loaded pointer take carries only from the low word's additions",
+          "[shader][storage_buffer]") {
+    // The 64-bit address split as IADD3 / IADD3.X: high = pointer.high + carry(low addition).
+    LoadedPointerRecords carried;
+    {
+        IR::IREmitter ir{carried.fixture.entry};
+        IR::U32 high;
+        const IR::U32 low{carried.LoadedLow(ir, high)};
+        const IR::U32 address_low{ir.IAdd(low, LoadedPointerRecords::RecordOffset(ir))};
+        const IR::U32 carry{ir.Select(ir.GetCarryFromOp(address_low), ir.Imm32(1), ir.Imm32(0))};
+        ir.SetReg(IR::Reg::R0, ir.LoadGlobal32(Address(ir, address_low, ir.IAdd(high, carry))));
+        carried.fixture.TrackedOffsets();
+        CHECK(ReadsFromLoadedPointer(carried, low));
+    }
+    // A constant added to the high word moves the address by 4 GiB: not the pointer's buffer.
+    LoadedPointerRecords constant;
+    {
+        IR::IREmitter ir{constant.fixture.entry};
+        IR::U32 high;
+        const IR::U32 low{constant.LoadedLow(ir, high)};
+        const IR::U32 address_low{ir.IAdd(low, LoadedPointerRecords::RecordOffset(ir))};
+        ir.SetReg(IR::Reg::R0,
+                  ir.LoadGlobal32(Address(ir, address_low, ir.IAdd(high, ir.Imm32(1)))));
+        constant.fixture.TrackedOffsets();
+        CHECK_FALSE(ReadsFromLoadedPointer(constant, low));
+    }
+    // The carry of an addition the low word doesn't make.
+    LoadedPointerRecords unrelated;
+    {
+        IR::IREmitter ir{unrelated.fixture.entry};
+        IR::U32 high;
+        const IR::U32 low{unrelated.LoadedLow(ir, high)};
+        const IR::U32 address_low{ir.IAdd(low, LoadedPointerRecords::RecordOffset(ir))};
+        const IR::U32 other{ir.IAdd(Word(ir, 0x50), Word(ir, 0x54))};
+        const IR::U32 carry{ir.Select(ir.GetCarryFromOp(other), ir.Imm32(1), ir.Imm32(0))};
+        ir.SetReg(IR::Reg::R1, other);
+        ir.SetReg(IR::Reg::R0, ir.LoadGlobal32(Address(ir, address_low, ir.IAdd(high, carry))));
+        unrelated.fixture.TrackedOffsets();
+        CHECK_FALSE(ReadsFromLoadedPointer(unrelated, low));
+    }
+}
+
 TEST_CASE("Native reads through a pointer a loop carries read its binding directly",
           "[shader][storage_buffer]") {
     LoadedPointerRecords records;

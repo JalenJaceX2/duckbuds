@@ -11,6 +11,7 @@
 #include <deque>
 #include <map>
 #include <optional>
+#include <span>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -1340,6 +1341,8 @@ struct LoadedPointer {
     IR::Value low;        ///< The pointer's low word
     IR::Inst* null_phi{}; ///< The phi merging the address built from it with null, if any
     bool offsets{};       ///< Terms are added beside the pointer (or its null phi), at this level
+    /// The low word's additions: the high word may add their carries
+    small_vector<const IR::Inst*, 8> adds;
 };
 
 /// LoadedPointerLow's walk. Returns false when the address adds up more than one loaded pointer
@@ -1359,6 +1362,7 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
             if (pending.size() + 2 > 8) {
                 return false;
             }
+            result.adds.push_back(inst);
             pending.push_back(inst->Arg(0));
             pending.push_back(inst->Arg(1));
             break;
@@ -1432,6 +1436,7 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
                 if (!WalkLoadedPointer(*unique_nonzero, merged, depth + 1)) {
                     return false;
                 }
+                result.adds.insert(result.adds.end(), merged.adds.begin(), merged.adds.end());
                 if (!merged.low.IsEmpty()) {
                     if (!result.low.IsEmpty() || merged.null_phi != nullptr ||
                         result.null_phi != nullptr) {
@@ -1460,8 +1465,23 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
     return true;
 }
 
+/// Whether a value is the carry out of one of these additions, as 64-bit additions are split:
+/// Select(GetCarryFromOp(add), 1, 0).
+bool IsCarryOf(const IR::Inst& select, std::span<const IR::Inst* const> adds) {
+    const IR::Value condition{select.Arg(0)};
+    if (condition.IsImmediate() || !select.Arg(1).IsImmediate() || select.Arg(1).U32() != 1 ||
+        !select.Arg(2).IsImmediate() || select.Arg(2).U32() != 0) {
+        return false;
+    }
+    const IR::Inst* const carry{condition.InstRecursive()};
+    if (carry->GetOpcode() != IR::Opcode::GetCarryFromOp || carry->Arg(0).IsImmediate()) {
+        return false;
+    }
+    return std::ranges::find(adds, carry->Arg(0).InstRecursive()) != adds.end();
+}
+
 /// Whether an address's high word is the high word of the pointer its low word was built from
-/// (pointer.low), plus carries and other terms that read no other loaded pointer.
+/// (pointer.low), plus carries out of the low word's additions and nothing else.
 bool HighFromLoadedPointer(const IR::Value& high, const LoadedPointer& pointer) {
     const IR::Inst* const load{pointer.low.InstRecursive()->Arg(0).InstRecursive()};
     // Whether the low word's null phi takes zero from a predecessor.
@@ -1481,6 +1501,10 @@ bool HighFromLoadedPointer(const IR::Value& high, const LoadedPointer& pointer) 
         const IR::Value value{pending.back()};
         pending.pop_back();
         if (value.IsImmediate()) {
+            // A nonzero constant moves the address by multiples of 4 GiB: not a carry
+            if (value.Type() != IR::Type::U32 || value.U32() != 0) {
+                return false;
+            }
             continue;
         }
         IR::Inst* const inst{value.InstRecursive()};
@@ -1495,11 +1519,11 @@ bool HighFromLoadedPointer(const IR::Value& high, const LoadedPointer& pointer) 
         case IR::Opcode::CompositeExtractU32x2: {
             const IR::Value vector{inst->Arg(0)};
             if (vector.IsImmediate()) {
-                break;
+                return false;
             }
             const IR::Opcode source{vector.InstRecursive()->GetOpcode()};
             if (source != IR::Opcode::LoadGlobal64 && source != IR::Opcode::LoadStorage64) {
-                break;
+                return false;
             }
             // A loaded pointer's word: only the same pointer's high word, once.
             if (vector.InstRecursive() != load || !inst->Arg(1).IsImmediate() ||
@@ -1555,9 +1579,15 @@ bool HighFromLoadedPointer(const IR::Value& high, const LoadedPointer& pointer) 
             }
             break;
         }
-        default:
-            // A carry (Select of immediates) or a sign extension of an offset
+        case IR::Opcode::SelectU32:
+            // The carry out of one of the low word's additions: Select(GetCarryFromOp(add), 1, 0)
+            if (!IsCarryOf(*inst, pointer.adds)) {
+                return false;
+            }
             break;
+        default:
+            // Anything else added to the high word isn't proven to be a carry
+            return false;
         }
     }
     // A pointer or null: the high word has to be null on the same paths, for the whole address
