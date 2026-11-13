@@ -173,7 +173,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (True(image.flags & ImageFlagBits::IsDecoding)) {
             return false;
         }
-        const bool must_download = IsDownloadable(image);
+        // Badly overlapping images are written back only in The Duskbloods (#1542 is unmerged):
+        // other titles drop them without a write-back, as build 177 does.
+        const bool must_download =
+            IsDownloadable(image) && (False(image.flags & ImageFlagBits::BadOverlap) ||
+                                      Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL);
         if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
             (!high_priority_mode && must_download)) {
             return false;
