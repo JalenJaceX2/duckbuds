@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-# SPDX-FileCopyrightText: 2018 yuzu Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 add_subdirectory(host_shaders)
@@ -18,6 +17,7 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
+    buffer_cache/indirect_buffer.h
     buffer_cache/memory_tracker_base.h
     buffer_cache/usage_tracker.h
     buffer_cache/virtual_range_cache.h
@@ -120,6 +120,8 @@ add_library(video_core STATIC
     nx2.h
     nx2_back_idle_trace.cpp
     nx2_back_idle_trace.h
+    nx2_list_grid.cpp
+    nx2_list_grid.h
     nx2_list_macro_trace.cpp
     nx2_list_macro_trace.h
     nx2_cmdpage_diag.h
@@ -550,7 +552,7 @@ if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)
 endif()
 
-if (YUZU_USE_EXTERNAL_FFMPEG)
+if (LICHII_USE_EXTERNAL_FFMPEG)
     add_dependencies(video_core ffmpeg-build)
 endif()
 
