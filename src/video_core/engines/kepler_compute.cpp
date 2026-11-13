@@ -1501,6 +1501,19 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
         siko_motion ? -static_cast<f32>(height) / static_cast<f32>(width) : -1.0f;
     const std::array<f32, 2> motion_scale =
         use_history ? std::array{motion_x, -1.0f} : std::array{0.0f, 0.0f};
+    static bool inputs_logged{};
+    if (!std::exchange(inputs_logged, true)) {
+        const auto describe = [](const std::optional<Texture::TICEntry>& tic) {
+            return tic ? fmt::format("{:#x} {}x{} format {:#x}", tic->Address(), tic->Width(),
+                                     tic->Height(), static_cast<u32>(tic->format.Value()))
+                       : std::string{"none"};
+        };
+        LOG_INFO(HW_GPU,
+                 "Duskbloods inputs: motion (+0x290) {}, depth (+0x288) {}, render {}x{}, "
+                 "output {}x{}, motion scale {:.4f},{:.4f}",
+                 describe(motion), describe(depth), width, height, output->Width(),
+                 output->Height(), motion_scale[0], motion_scale[1]);
+    }
     const bool done = rasterizer->AccelerateTemporalUpscale(
         surface(*input), surface(*output), motion_surface,
         use_history && depth ? &*depth : nullptr,
