@@ -20,6 +20,7 @@
 #include "common/windows/timer_resolution.h"
 #endif
 
+#include "common/logging.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
 #include "core/hardware_properties.h"
@@ -203,12 +204,24 @@ void CoreTiming::ClearPendingEvents() {
     event.Set();
 }
 
+namespace {
+/// When the current pause began, for the long-pause log (0 while running).
+std::atomic<s64> g_pause_start_time{};
+} // Anonymous namespace
+
 void CoreTiming::Pause(bool is_paused) {
+    if (is_paused && !paused) {
+        g_pause_start_time = GetGlobalTimeNs().count();
+    }
     paused = is_paused;
     pause_event.Set();
 
     if (!is_paused) {
         pause_end_time = GetGlobalTimeNs().count();
+        const s64 start = g_pause_start_time.exchange(0);
+        if (start != 0 && pause_end_time - start >= 50'000'000) {
+            LOG_INFO(Core_Timing, "timing paused for {} ms", (pause_end_time - start) / 1'000'000);
+        }
     }
 }
 
