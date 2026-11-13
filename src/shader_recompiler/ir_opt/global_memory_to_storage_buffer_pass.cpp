@@ -15,6 +15,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include <boost/container/flat_set.hpp>
 #include <boost/container/small_vector.hpp>
@@ -1341,16 +1342,22 @@ struct LoadedPointer {
     IR::Value low;        ///< The pointer's low word
     IR::Inst* null_phi{}; ///< The phi merging the address built from it with null, if any
     bool offsets{};       ///< Terms are added beside the pointer (or its null phi), at this level
-    /// The low word's additions: the high word may add their carries
+    /// The additions from the low address down to the pointer (not those inside offset terms):
+    /// the high word may add their carries
     small_vector<const IR::Inst*, 8> adds;
 };
 
 /// LoadedPointerLow's walk. Returns false when the address adds up more than one loaded pointer
 /// (or the walk gives up); otherwise result.low is the pointer found, empty if there is none.
 bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 depth) {
-    small_vector<IR::Value, 8> pending{low_addr};
+    // Each addition reached, with the addition it is an operand of (-1 for the low address
+    // itself), so the path down to the pointer can be told from additions inside offset terms.
+    small_vector<std::pair<const IR::Inst*, s32>, 16> additions;
+    s32 pointer_parent{-1};
+    small_vector<const IR::Inst*, 8> nested_path;
+    small_vector<std::pair<IR::Value, s32>, 8> pending{{low_addr, -1}};
     while (!pending.empty()) {
-        const IR::Value value{pending.back()};
+        const auto [value, parent]{pending.back()};
         pending.pop_back();
         if (value.IsImmediate()) {
             result.offsets |= value.Type() != IR::Type::U32 || value.U32() != 0;
@@ -1362,9 +1369,9 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
             if (pending.size() + 2 > 8) {
                 return false;
             }
-            result.adds.push_back(inst);
-            pending.push_back(inst->Arg(0));
-            pending.push_back(inst->Arg(1));
+            additions.emplace_back(inst, parent);
+            pending.emplace_back(inst->Arg(0), static_cast<s32>(additions.size() - 1));
+            pending.emplace_back(inst->Arg(1), static_cast<s32>(additions.size() - 1));
             break;
         case IR::Opcode::CompositeExtractU32x2: {
             const IR::Value vector{inst->Arg(0)};
@@ -1382,6 +1389,7 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
                 return false;
             }
             result.low = IR::Value{inst};
+            pointer_parent = parent;
             break;
         }
         case IR::Opcode::Phi: {
@@ -1423,7 +1431,7 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
                 }
             }
             if (trivial && unique) {
-                pending.push_back(*unique);
+                pending.emplace_back(*unique, parent);
                 break;
             }
             // EDEN_NX2_NULL_PHI_POINTERS=0 treats such a phi as before (the generic path).
@@ -1436,7 +1444,6 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
                 if (!WalkLoadedPointer(*unique_nonzero, merged, depth + 1)) {
                     return false;
                 }
-                result.adds.insert(result.adds.end(), merged.adds.begin(), merged.adds.end());
                 if (!merged.low.IsEmpty()) {
                     if (!result.low.IsEmpty() || merged.null_phi != nullptr ||
                         result.null_phi != nullptr) {
@@ -1445,6 +1452,8 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
                     }
                     result.low = merged.low;
                     result.null_phi = inst;
+                    pointer_parent = parent;
+                    nested_path.assign(merged.adds.begin(), merged.adds.end());
                 }
                 // Without a pointer below it, a phi of offsets
                 result.offsets |= merged.low.IsEmpty();
@@ -1461,6 +1470,15 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
             result.offsets = true;
             break;
         }
+    }
+    if (!result.low.IsEmpty()) {
+        // The additions above the pointer, then those inside the null phi down to it.
+        for (s32 index = pointer_parent; index >= 0;) {
+            const auto& [addition, above]{additions[static_cast<size_t>(index)]};
+            result.adds.push_back(addition);
+            index = above;
+        }
+        result.adds.insert(result.adds.end(), nested_path.begin(), nested_path.end());
     }
     return true;
 }
@@ -1481,7 +1499,8 @@ bool IsCarryOf(const IR::Inst& select, std::span<const IR::Inst* const> adds) {
 }
 
 /// Whether an address's high word is the high word of the pointer its low word was built from
-/// (pointer.low), plus carries out of the low word's additions and nothing else.
+/// (pointer.low), plus carries out of the additions that add up the low word from it, and nothing
+/// else.
 bool HighFromLoadedPointer(const IR::Value& high, const LoadedPointer& pointer) {
     const IR::Inst* const load{pointer.low.InstRecursive()->Arg(0).InstRecursive()};
     // Whether the low word's null phi takes zero from a predecessor.

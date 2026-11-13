@@ -803,6 +803,38 @@ TEST_CASE("Native reads through a loaded pointer take carries only from the low 
         unrelated.fixture.TrackedOffsets();
         CHECK_FALSE(ReadsFromLoadedPointer(unrelated, low));
     }
+    // The carry of an addition inside the offset (shift + 60), not of one adding the offset to
+    // the pointer: the high word is 4 GiB past the pointer's when that addition overflows.
+    LoadedPointerRecords inner;
+    {
+        IR::IREmitter ir{inner.fixture.entry};
+        IR::U32 high;
+        const IR::U32 low{inner.LoadedLow(ir, high)};
+        const IR::U32 offset{LoadedPointerRecords::RecordOffset(ir)};
+        const IR::U32 address_low{ir.IAdd(low, offset)};
+        const IR::U32 carry{ir.Select(ir.GetCarryFromOp(offset), ir.Imm32(1), ir.Imm32(0))};
+        ir.SetReg(IR::Reg::R0, ir.LoadGlobal32(Address(ir, address_low, ir.IAdd(high, carry))));
+        inner.fixture.TrackedOffsets();
+        CHECK_FALSE(ReadsFromLoadedPointer(inner, low));
+    }
+    // Two additions down to the pointer, each carrying into the high word.
+    LoadedPointerRecords chained;
+    {
+        IR::IREmitter ir{chained.fixture.entry};
+        IR::U32 high;
+        const IR::U32 low{chained.LoadedLow(ir, high)};
+        const IR::U32 first{ir.IAdd(low, LoadedPointerRecords::RecordOffset(ir))};
+        const IR::U32 second{ir.IAdd(first, ir.Imm32(4))};
+        const IR::U32 first_carry{
+            ir.Select(ir.GetCarryFromOp(first), ir.Imm32(1), ir.Imm32(0))};
+        const IR::U32 second_carry{
+            ir.Select(ir.GetCarryFromOp(second), ir.Imm32(1), ir.Imm32(0))};
+        ir.SetReg(IR::Reg::R0,
+                  ir.LoadGlobal32(Address(ir, second,
+                                          ir.IAdd(ir.IAdd(high, first_carry), second_carry))));
+        chained.fixture.TrackedOffsets();
+        CHECK(ReadsFromLoadedPointer(chained, low));
+    }
 }
 
 TEST_CASE("Native reads through a pointer a loop carries read its binding directly",
@@ -862,9 +894,13 @@ struct PointerOrNullRead {
     LoadedPointerRecords records;
     IR::U32 low;
 
+    enum class Carry { None, Address, Offset };
+
     /// high_null: the high word is merged with zero on the same path; offset_after: an offset is
-    /// added after the merge; other_null_block: the high word's zero comes from the body instead.
-    void Build(bool high_null, bool offset_after, bool other_null_block = false) {
+    /// added after the merge; other_null_block: the high word's zero comes from the body instead;
+    /// carry: the body's high word adds the carry of the address addition, or of one in its offset.
+    void Build(bool high_null, bool offset_after, bool other_null_block = false,
+               Carry carry = Carry::None) {
         records.fixture.env.SetStage(Shader::Stage::Fragment);
         records.fixture.entry.AddBranch(&records.body);
         records.fixture.entry.AddBranch(&records.exit);
@@ -874,7 +910,15 @@ struct PointerOrNullRead {
         IR::U32 high;
         low = records.LoadedLow(ir, high);
         IR::IREmitter body{records.body};
-        const IR::U32 record_low{body.IAdd(low, LoadedPointerRecords::RecordOffset(body))};
+        const IR::U32 offset{LoadedPointerRecords::RecordOffset(body)};
+        const IR::U32 record_low{body.IAdd(low, offset)};
+        IR::U32 body_high{high};
+        if (carry != Carry::None) {
+            const IR::U32 from{carry == Carry::Address ? record_low : offset};
+            const IR::U32 carried{
+                body.Select(body.GetCarryFromOp(from), body.Imm32(1), body.Imm32(0))};
+            body_high = body.IAdd(high, carried);
+        }
         records.exit.AppendNewInst(IR::Opcode::Phi, {});
         IR::Inst* const either{&records.exit.back()};
         either->SetFlags(IR::Type::U32);
@@ -886,7 +930,7 @@ struct PointerOrNullRead {
             IR::Inst* const high_or_null{&records.exit.back()};
             high_or_null->SetFlags(IR::Type::U32);
             high_or_null->AddPhiOperand(&records.body,
-                                        other_null_block ? IR::Value{0U} : IR::Value{high});
+                                        other_null_block ? IR::Value{0U} : IR::Value{body_high});
             high_or_null->AddPhiOperand(&records.fixture.entry,
                                         other_null_block ? IR::Value{high} : IR::Value{0U});
             address_high = IR::U32{IR::Value{high_or_null}};
@@ -902,8 +946,18 @@ struct PointerOrNullRead {
 
     /// Whether the read became the pointer-or-null read (a select of the binding's read and 0).
     bool ReadsPointerOrNull() const {
-        return records.Count(IR::Opcode::LoadGlobal32) == 0 &&
-               records.Find(IR::Opcode::SelectU32) != nullptr;
+        if (records.Count(IR::Opcode::LoadGlobal32) != 0) {
+            return false;
+        }
+        for (const IR::Block* const block : records.fixture.program.blocks) {
+            for (const IR::Inst& inst : block->Instructions()) {
+                if (inst.GetOpcode() == IR::Opcode::SelectU32 && !inst.Arg(1).IsImmediate() &&
+                    inst.Arg(1).InstRecursive()->GetOpcode() == IR::Opcode::LoadStorage32) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 };
 } // Anonymous namespace
@@ -947,4 +1001,16 @@ TEST_CASE("A pointer or null whose address is not null on the null path is not r
     PointerOrNullRead other_path;
     other_path.Build(true, false, true);
     CHECK_FALSE(other_path.ReadsPointerOrNull());
+}
+
+TEST_CASE("A pointer or null takes carries only from the additions down to the pointer",
+          "[shader][storage_buffer]") {
+    // The high word adds the carry of the addition that adds the offset to the pointer.
+    PointerOrNullRead address;
+    address.Build(true, false, false, PointerOrNullRead::Carry::Address);
+    CHECK(address.ReadsPointerOrNull());
+    // The carry of an addition inside the offset: not the pointer-or-null read.
+    PointerOrNullRead offset;
+    offset.Build(true, false, false, PointerOrNullRead::Carry::Offset);
+    CHECK_FALSE(offset.ReadsPointerOrNull());
 }
