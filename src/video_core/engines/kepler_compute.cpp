@@ -1434,9 +1434,47 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
         result.addr_lower = static_cast<u32>(tic.Address());
         return result;
     };
+    // Only The Duskbloods renders a region (CapturedPasses), so what follows is its own.
+    // EDEN_NX2_DUSK_JITTER=output (default) takes the jitter from this pass's constants, x at
+    // +0x38c and y at +0x388 in render pixels; =prepass keeps the first pass's +0x1b0.
+    static const bool output_jitter = [] {
+        const char* const value = std::getenv("EDEN_NX2_DUSK_JITTER");
+        return !(value && std::string_view{value} == "prepass");
+    }();
+    // EDEN_NX2_DUSK_MV=siko (default): the velocity is in render heights on both axes, so x is
+    // scaled by the height too; =upstream scales each axis by its own render size.
+    static const bool siko_motion = [] {
+        const char* const value = std::getenv("EDEN_NX2_DUSK_MV");
+        return !(value && std::string_view{value} == "upstream");
+    }();
+    const std::array<f32, 2> pass_jitter{
+        std::bit_cast<f32>(memory_manager.Read<u32>(constants + 0x38c)),
+        std::bit_cast<f32>(memory_manager.Read<u32>(constants + 0x388))};
+    // Not range checked as tightly as the first pass's (siko's resolve takes it as is); only
+    // values no jitter can have are dropped.
+    const bool pass_jitter_valid = std::isfinite(pass_jitter[0]) && std::isfinite(pass_jitter[1]) &&
+                                   std::abs(pass_jitter[0]) <= 1.0f &&
+                                   std::abs(pass_jitter[1]) <= 1.0f;
+    std::optional<std::array<f32, 2>> used_jitter;
+    if (output_jitter && pass_jitter_valid) {
+        used_jitter = pass_jitter;
+    } else if (jitter) {
+        used_jitter = jitter->offset;
+    }
+    static u32 jitter_logged{};
+    if (jitter_logged < 4) {
+        ++jitter_logged;
+        LOG_INFO(HW_GPU, "Duskbloods jitter: prepass {} output {:.4f},{:.4f}{} using {}",
+                 jitter ? fmt::format("{:.4f},{:.4f}", jitter->offset[0], jitter->offset[1])
+                        : std::string{"none"},
+                 pass_jitter[0], pass_jitter[1], pass_jitter_valid ? "" : " (invalid)",
+                 !used_jitter                                ? "none"
+                 : output_jitter && pass_jitter_valid        ? "output"
+                                                             : "prepass");
+    }
     // Without this evaluation's jitter or usable motion vectors (a rejected pass clears them), the
     // region is still scaled, without history, rather than leaving the network's output.
-    const bool use_history = jitter && motion && width <= motion->Width() &&
+    const bool use_history = used_jitter && motion && width <= motion->Width() &&
                              height <= motion->Height() &&
                              (!depth || (width <= depth->Width() && height <= depth->Height()));
     Fermi2D::Surface motion_surface{};
@@ -1446,13 +1484,55 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
     }
     // The game's motion vectors point from the previous position to the current one (a rightward
     // pan gives negative x while the scene moves left), the reverse of what the upscale expects.
+    // The runtime multiplies the scale by the render size.
+    const f32 motion_x =
+        siko_motion ? -static_cast<f32>(height) / static_cast<f32>(width) : -1.0f;
     const std::array<f32, 2> motion_scale =
-        use_history ? std::array{-1.0f, -1.0f} : std::array{0.0f, 0.0f};
+        use_history ? std::array{motion_x, -1.0f} : std::array{0.0f, 0.0f};
     const bool done = rasterizer->AccelerateTemporalUpscale(
         surface(*input), surface(*output), motion_surface,
         use_history && depth ? &*depth : nullptr,
-        jitter ? jitter->offset : std::array{0.0f, 0.0f}, motion_scale, use_history,
+        used_jitter.value_or(std::array{0.0f, 0.0f}), motion_scale, use_history,
         std::array{width, height});
+    if (done) {
+        // The output pass also fills the RGBA16F images at +0x350 and +0x330 (read by the
+        // reflections and the next frame); it is skipped, so fill them with the result.
+        const Fermi2D::Config copy{
+            .operation = Fermi2D::Operation::SrcCopy,
+            .filter = Fermi2D::Filter::Point,
+            .must_accelerate = true,
+            .dst_x0 = 0,
+            .dst_y0 = 0,
+            .dst_x1 = static_cast<s32>(output->Width()),
+            .dst_y1 = static_cast<s32>(output->Height()),
+            .src_x0 = 0,
+            .src_y0 = 0,
+            .src_x1 = static_cast<s32>(output->Width()),
+            .src_y1 = static_cast<s32>(output->Height()),
+        };
+        for (const u32 offset : {0x350U, 0x330U}) {
+            const auto history = ConstBuffer0Image(offset);
+            if (!history || history->format != Texture::TextureFormat::R16G16B16A16 ||
+                history->Address() == 0 || !history->IsBlockLinear() ||
+                history->Address() == output->Address() ||
+                history->Address() == input->Address() || history->Width() != output->Width() ||
+                history->Height() != output->Height()) {
+                static bool warned{};
+                if (!std::exchange(warned, true)) {
+                    LOG_WARNING(HW_GPU, "Duskbloods: history image at +{:#x} unexpected ({}); "
+                                        "not filled", offset,
+                                history ? fmt::format("format {:#x} {}x{}",
+                                                      static_cast<u32>(history->format.Value()),
+                                                      history->Width(), history->Height())
+                                        : std::string{"unreadable"});
+                }
+                continue;
+            }
+            auto destination = surface(*history);
+            destination.format = Tegra::RenderTargetFormat::R16G16B16A16_FLOAT;
+            (void)rasterizer->AccelerateSurfaceCopy(surface(*output), destination, copy);
+        }
+    }
     static u32 last_width{};
     if (width != last_width) {
         last_width = width;
