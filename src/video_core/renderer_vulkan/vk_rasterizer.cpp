@@ -2325,7 +2325,9 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         // the network's padding rows from it as a buffer; their stale values kept NaN alive at
         // the bottom of the image.
         static constexpr VkClearColorValue zero_color{};
-        if (color_full_channels && clear_covers_render_area && clear_layers.covers_all_layers &&
+        // #1490 is unmerged: The Duskbloods only, other titles as build 177.
+        if (program_id == VideoCommon::FireEmblemUpscale::DuskbloodsProgramId &&
+            color_full_channels && clear_covers_render_area && clear_layers.covers_all_layers &&
             std::memcmp(&clear_value.color, &zero_color, sizeof(zero_color)) == 0) {
             if (const auto target = texture_cache.CoveredColorTarget(
                     color_attachment, render_area.width, render_area.height)) {

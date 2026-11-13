@@ -11,6 +11,7 @@
 #include "common/container/unordered_map.h"
 
 #include "common/common_types.h"
+#include "common/settings.h"
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/shader_info.h"
 #include "shader_recompiler/stage.h"
@@ -82,6 +83,12 @@ public:
     /// raw 8-byte arguments in constant buffers, without the NVN descriptor layout.
     [[nodiscard]] virtual bool IsNativeProgram() const { return false; }
 
+    /// #1490 (unmerged): the native local stack region and the fp32 SignedZeroInfNanPreserve mode
+    /// on NVIDIA, for The Duskbloods' native programs only; other titles as build 177.
+    [[nodiscard]] bool UsesNativeLocalStack() const {
+        return IsNativeProgram() && Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL;
+    }
+
     /// Native programs: whether the 8-byte constant at (index, offset) is a mapped GPU address.
     /// Native argument tables mix pointers with scalars (sizes, strides).
     [[nodiscard]] virtual bool IsCbufStorageBufferPointer(u32, u32) { return true; }
@@ -132,7 +139,7 @@ public:
     /// also the spare word and the stack region before it.
     [[nodiscard]] u32 LocalArraySize() const {
         const u32 declared = (LocalMemorySize() + 3U) & ~3U;
-        return IsNativeProgram() ? NATIVE_DECLARED_BASE + declared : LocalMemorySize();
+        return UsesNativeLocalStack() ? NATIVE_DECLARED_BASE + declared : LocalMemorySize();
     }
 
     [[nodiscard]] virtual u32 SharedMemorySize() const = 0;

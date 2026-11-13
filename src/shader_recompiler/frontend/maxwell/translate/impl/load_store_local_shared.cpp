@@ -141,7 +141,7 @@ IR::U32 LoadLocal(TranslatorVisitor& v, const IR::U32& word_offset, const IR::U3
 } // Anonymous namespace
 
 void TranslatorVisitor::LDL(u64 insn) {
-    if (env.IsNativeProgram()) {
+    if (env.UsesNativeLocalStack()) {
         const IR::U32 window_offset{Offset(*this, insn)};
         const NativeLocal local{MapNativeLocal(*this, window_offset)};
         const IR::U32 word{LoadNativeLocal(*this, local)};
@@ -223,7 +223,7 @@ void TranslatorVisitor::LDS(u64 insn) {
 }
 
 void TranslatorVisitor::STL(u64 insn) {
-    if (env.IsNativeProgram()) {
+    if (env.UsesNativeLocalStack()) {
         // Out-of-bounds stores go to the spare word, which no load reads.
         const IR::U32 window_offset{Offset(*this, insn)};
         const NativeLocal local{MapNativeLocal(*this, window_offset)};
