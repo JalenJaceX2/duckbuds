@@ -50,6 +50,7 @@
 #include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/texture_cache/writeback_ranges.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
 
@@ -683,9 +684,11 @@ private:
     /// Device byte ranges [begin, end) of a write-back that newer data owns.
     using KeepRanges = boost::container::small_vector<std::pair<DAddr, DAddr>, 4>;
     /// Fills `keep` with the image's bytes that newer write-backs (or newer images dropped
-    /// without one) cover; true when they cover all of it.
+    /// without one) cover, and `keep_ticks` (when given) with the modification tick of each;
+    /// true when they cover all of it.
     [[nodiscard]] bool OverlapHasNewerData(ImageId image_id, const ImageBase& image,
-                                           KeepRanges& keep);
+                                           KeepRanges& keep,
+                                           WritebackRanges::TickedRanges* keep_ticks = nullptr);
     /// SwizzleImage through `memory` that leaves the `keep` ranges of guest memory as they were.
     void SwizzleKeeping(Tegra::MemoryManager& memory, GPUVAddr gpu_addr, const ImageInfo& info,
                         std::span<const BufferImageCopy> copies, std::span<const u8> data,
@@ -716,7 +719,12 @@ private:
         }
         begin = (std::max)(begin, download.cpu_addr);
         end = (std::min)(end, download.cpu_addr + download.size);
-        if (begin >= end || std::ranges::any_of(download.keep, [&](const auto& range) {
+        if (begin >= end) {
+            return;
+        }
+        // The kept bytes are that image's: a guest read's downloads compare against its tick.
+        WritebackRanges::NoteTick(download.keep_ticks, begin, end, tick);
+        if (std::ranges::any_of(download.keep, [&](const auto& range) {
                 return range.first <= begin && end <= range.second;
             })) {
             return;
@@ -749,6 +757,9 @@ private:
         decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true)) map;
         bool cancelled;
         KeepRanges keep{};
+        /// The modification tick of the data each kept range holds instead (newer images', or
+        /// past the cache's tick for the guest's writes).
+        WritebackRanges::TickedRanges keep_ticks{};
         /// Modification tick of the written-back image's contents.
         u64 tick{};
         /// The image's address space: gpu_addr is in it, whichever channel is bound on landing.

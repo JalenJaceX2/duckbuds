@@ -184,6 +184,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         boost::container::small_vector<BufferImageCopy, 16> copies;
         DownloadMap map;
         KeepRanges keep;
+        WritebackRanges::TickedRanges keep_ticks;
         size_t address_space;
     };
     std::vector<OverlapDownload> overlap_downloads;
@@ -197,8 +198,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     // when the GPU is done with them.
     const bool async_downloads = download_overlaps && AsyncOverlapDownloadsEnabled();
     KeepRanges keep;
+    WritebackRanges::TickedRanges keep_ticks;
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &keep,
-                          &evict_old_costly, out_of_memory, &overlap_downloads,
+                          &keep_ticks, &evict_old_costly, out_of_memory, &overlap_downloads,
                           download_overlaps, async_downloads](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
@@ -220,7 +222,8 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             download_overlaps && True(image.flags & ImageFlagBits::BadOverlap) &&
             (async_downloads || image.guest_size_bytes <= OverlapDownloadMaxBytes()) &&
             IsDownloadable(image) && HasGuestRange(image);
-        const bool covered = overlap_writeback && OverlapHasNewerData(image_id, image, keep);
+        const bool covered =
+            overlap_writeback && OverlapHasNewerData(image_id, image, keep, &keep_ticks);
         if (must_download) {
             auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
             const auto copies = FullDownloadCopies(image.info);
@@ -256,6 +259,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 .copies = std::move(copies),
                 .map = std::move(map),
                 .keep = keep,
+                .keep_ticks = keep_ticks,
                 .address_space = image.address_space,
             });
             ++gc_download_deletes;
@@ -376,6 +380,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                     .map = download.map,
                     .cancelled = false,
                     .keep = download.keep,
+                    .keep_ticks = download.keep_ticks,
                     .tick = download.tick,
                     .address_space = download.address_space,
                 });
@@ -427,10 +432,14 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
 
 template <class P>
 bool TextureCache<P>::OverlapHasNewerData(ImageId image_id, const ImageBase& image,
-                                          KeepRanges& keep) {
+                                          KeepRanges& keep,
+                                          WritebackRanges::TickedRanges* keep_ticks) {
     // Memory the game reuses for other targets: an older image written back over it put another
     // format's data under the newer image's pages (purple enemies when that image was made again).
     keep.clear();
+    if (keep_ticks != nullptr) {
+        keep_ticks->clear();
+    }
     last_cover_lost = false;
     const u64 tick = image.modification_tick;
     const DAddr begin = image.cpu_addr;
@@ -478,6 +487,10 @@ bool TextureCache<P>::OverlapHasNewerData(ImageId image_id, const ImageBase& ima
                 continue;
             }
             keep.emplace_back((std::max)(range.begin, begin), (std::min)(range.end, end));
+            if (keep_ticks != nullptr) {
+                WritebackRanges::NoteTick(*keep_ticks, keep.back().first, keep.back().second,
+                                          range.tick);
+            }
             last_cover_lost |= range.lost;
         }
     }
@@ -497,6 +510,9 @@ bool TextureCache<P>::OverlapHasNewerData(ImageId image_id, const ImageBase& ima
     if (keep.size() == 1 && keep.front().first == begin && keep.front().second == end) {
         ++overlap_download_skips;
         keep.clear();
+        if (keep_ticks != nullptr) {
+            keep_ticks->clear();
+        }
         return true;
     }
     ++overlap_partial_keeps;
@@ -623,6 +639,9 @@ void TextureCache<P>::KeepGuestWrite(DAddr cpu_addr, u64 size) {
         }
         const DAddr begin = (std::max)(cpu_addr, download.cpu_addr);
         const DAddr end = (std::min)(cpu_addr + size, download_end);
+        // The guest's bytes are newer than every image's contents so far, and older than those
+        // of images modified from now on.
+        WritebackRanges::NoteTick(download.keep_ticks, begin, end, modification_tick + 1);
         // Coalesce every overlapping or touching range (a write can bridge two), so the checks
         // below see the distinct ranges.
         auto& keep = download.keep;
@@ -738,7 +757,8 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
                     // Bytes newer write-backs own stay theirs (OverlapHasNewerData); one they
                     // own entirely is not written back at all.
                     KeepRanges keep;
-                    if (OverlapHasNewerData(id, overlap, keep)) {
+                    WritebackRanges::TickedRanges keep_ticks;
+                    if (OverlapHasNewerData(id, overlap, keep, &keep_ticks)) {
                         continue;
                     }
                     auto map = runtime.DownloadStagingBuffer(overlap.unswizzled_size_bytes, true);
@@ -756,6 +776,7 @@ void TextureCache<P>::WriteBackBadOverlaps(ImageId new_image_id) {
                         .map = map,
                         .cancelled = false,
                         .keep = keep,
+                        .keep_ticks = keep_ticks,
                         .tick = overlap.modification_tick,
                         .address_space = overlap.address_space,
                     });
@@ -2027,19 +2048,15 @@ template <class P>
 void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureCache};
     // Write-backs landed for this read: an older image downloaded below leaves their ranges as
-    // they are, newest data winning as between write-backs (bytes a write-back left to newer
-    // data included).
-    struct Landed {
-        DAddr begin;
-        DAddr end;
-        u64 tick;
-    };
-    boost::container::small_vector<Landed, 4> landed;
+    // they are, newest data winning as between write-backs. A range a write-back left to newer
+    // data (or to the guest's writes) holds that data, at its own tick.
+    using WritebackRanges::TickedRange;
+    boost::container::small_vector<TickedRange, 8> landed;
     if (WritebackPendingOver(cpu_addr, size)) {
         for (const AsyncOverlapDownload& download : async_overlap_downloads) {
             if (!download.cancelled) {
-                landed.push_back({download.cpu_addr, download.cpu_addr + download.size,
-                                  download.tick});
+                WritebackRanges::AppendLanded(landed, download.cpu_addr, download.size,
+                                              download.tick, download.keep, download.keep_ticks);
             }
         }
         // A write-back still on the GPU holds this memory's data: land it before the guest reads
@@ -2084,7 +2101,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
             KeepRanges keep;
             if (!landed.empty()) {
                 ForEachWrittenRange(image, [&](DAddr begin, DAddr end) {
-                    for (const Landed& range : landed) {
+                    for (const TickedRange& range : landed) {
                         if (range.tick > image.modification_tick && range.begin < end &&
                             begin < range.end) {
                             keep.emplace_back((std::max)(range.begin, begin),
