@@ -20,6 +20,7 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_list_grid.h"
 #include "video_core/oot_network.h"
 #include "video_core/ocarina_upscale.h"
@@ -222,6 +223,7 @@ private:
     void FlushWork();
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
+    [[nodiscard]] bool DebugSkipsDraw(u32 index, const GraphicsPipeline& pipeline) const;
 
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
@@ -392,6 +394,9 @@ private:
         std::array<f32, 4> origin{};
         std::array<f32, 280 * 12> bones{};
     } oot_actor, oot_previous_actor;
+    /// Debug server draw_skip / EDEN_NX2_DRAW_SKIP, and the index of the next draw in this frame.
+    std::optional<VideoCore::Nx2Debug::DrawFilter> draw_filter;
+    u32 debug_draw_index = 0;
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;

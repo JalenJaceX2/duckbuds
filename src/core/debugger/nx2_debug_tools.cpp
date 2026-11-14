@@ -476,6 +476,56 @@ json RejectShaders(ToolState&, const json& params) {
     return result;
 }
 
+json DrawFilterJson(const VideoCore::Nx2Debug::DrawFilter& filter) {
+    return {{"range", {filter.range_begin, filter.range_end}},
+            {"vs", HexList(filter.vs)},
+            {"ps", HexList(filter.ps)},
+            {"lines", filter.lines},
+            {"rt0", HexAddress(filter.rt0)}};
+}
+
+/// Replaces the draw filter: {range: [a, b]?, vs: [hash]?, ps: [hash]?, lines?, rt0?} or
+/// {spec: "<EDEN_NX2_DRAW_SKIP text>"}; {} clears it. Skips only the draw calls, at the next frame.
+json DrawSkip(ToolState&, const json& params) {
+    if (!IsVulkan()) {
+        throw std::runtime_error{"draw_skip needs the Vulkan renderer"};
+    }
+    VideoCore::Nx2Debug::DrawFilter filter;
+    if (params.contains("spec")) {
+        try {
+            filter = VideoCore::Nx2Debug::ParseDrawFilter(params.at("spec").get<std::string>());
+        } catch (const std::invalid_argument& error) {
+            throw std::runtime_error{error.what()};
+        }
+    }
+    if (const json& range = params.value("range", json::array()); !range.empty()) {
+        if (!range.is_array() || range.size() != 2) {
+            throw std::runtime_error{"range must be [first, end) as two draw indices"};
+        }
+        filter.range_begin = range[0].get<u32>();
+        filter.range_end = range[1].get<u32>();
+    }
+    for (const json& hash : params.value("vs", json::array())) {
+        filter.vs.push_back(ParseShaderHash(hash.get<std::string>()));
+    }
+    for (const json& hash : params.value("ps", json::array())) {
+        filter.ps.push_back(ParseShaderHash(hash.get<std::string>()));
+    }
+    filter.lines |= params.value("lines", false);
+    if (params.contains("rt0")) {
+        filter.rt0 = AddressParam(params, "rt0");
+    }
+    const u64 generation = VideoCore::Nx2Debug::SetDrawFilter(filter);
+    const int timeout = Param<int>(params, "timeout_s", 5, 0, 60);
+    const bool applied =
+        VideoCore::Nx2Debug::WaitDrawFilterApplied(generation, std::chrono::seconds{timeout});
+    json result = {{"filter", DrawFilterJson(filter)}, {"active", !filter.Empty()}, {"applied", applied}};
+    if (!applied) {
+        result["note"] = "no frame was presented yet; the filter applies at the next frame end";
+    }
+    return result;
+}
+
 json SampleThreads(ToolState& state, const json& params) {
     const std::string threads = params.value("threads", std::string{"GPU,GPUBack"});
     const double seconds = Param<double>(params, "seconds", 10.0, 1.0, 60.0);
@@ -699,6 +749,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
+        {"draw_skip", handler(DrawSkip)},
         {"sample", handler(SampleThreads)},
         {"speed_limit", handler(SpeedLimit)},
         {"host_timing", handler(HostTiming)},

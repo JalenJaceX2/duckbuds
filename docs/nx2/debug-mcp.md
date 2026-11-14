@@ -250,6 +250,17 @@ The tool waits until the rasterizer applies the change and reports `applied`. A 
 loop: reject half of the candidates, screenshot, compare. Today each step is a rebuild of the
 environment plus a relaunch plus a replay.
 
+**`draw_skip`** `{range?: [first, end], vs?: [hash], ps?: [hash], lines?, rt0?, spec?, timeout_s?}`
+replaces the draw filter; `{}` clears it. A graphics draw is skipped when its index in the frame
+(counted from 0 at each `TickFrame`, only draws that got a pipeline) is in `[first, end)`, its
+vertex or pixel shader hash (frame dump `shaders`, `ShaderHashes()[1]` and `[5]`) is listed, its
+topology is a line type (`lines`), or its colour target 0 is at `rt0`. Only the draw call is left
+out (`RasterizerVulkan::PrepareDraw`, right before `draw_func`): pipeline, bindings, render pass,
+dynamic state and queries are set up as usual, so later draws see the same state. The filter
+changes at a frame end, like `reject_shaders`. `spec` takes the `EDEN_NX2_DRAW_SKIP` text
+(`range=a-b;ps=<hash>,...;vs=...;lines=1;rt0=0x...`), which applies the same filter from boot.
+Draws through `DrawTexture`, clears and blits are not counted or skipped.
+
 ### Guest and GPU memory (implemented)
 
 All three are read only. Reads return at most 64 KiB. Addresses are hex strings (`"0x8012345000"`)

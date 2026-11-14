@@ -474,6 +474,43 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         &scheduler);
     oot_performance_scale =
         Settings::AppliedOcarinaRenderScale() == Settings::NvidiaDlssQuality::Performance;
+    // EDEN_NX2_DRAW_SKIP: the debug server's draw_skip filter from boot (docs/nx2/debug-mcp.md).
+    if (const char* const skip = std::getenv("EDEN_NX2_DRAW_SKIP"); skip && *skip) {
+        try {
+            if (auto filter = VideoCore::Nx2Debug::ParseDrawFilter(skip); !filter.Empty()) {
+                draw_filter = std::move(filter);
+                LOG_WARNING(Render_Vulkan, "EDEN_NX2_DRAW_SKIP={}: matching draws are skipped", skip);
+            }
+        } catch (const std::exception& error) {
+            LOG_ERROR(Render_Vulkan, "EDEN_NX2_DRAW_SKIP={}: {}; ignored", skip, error.what());
+        }
+    }
+}
+
+bool RasterizerVulkan::DebugSkipsDraw(u32 index, const GraphicsPipeline& pipeline) const {
+    const auto& filter = *draw_filter;
+    if (index >= filter.range_begin && index < filter.range_end) {
+        return true;
+    }
+    const auto& hashes = pipeline.ShaderHashes();
+    if (std::ranges::find(filter.vs, hashes[1]) != filter.vs.end() ||
+        std::ranges::find(filter.ps, hashes[5]) != filter.ps.end()) {
+        return true;
+    }
+    if (filter.lines) {
+        using Topology = Tegra::Engines::Maxwell3D::Regs::PrimitiveTopology;
+        switch (maxwell3d->draw_manager.draw_state.topology) {
+        case Topology::Lines:
+        case Topology::LineLoop:
+        case Topology::LineStrip:
+        case Topology::LinesAdjacency:
+        case Topology::LineStripAdjacency:
+            return true;
+        default:
+            break;
+        }
+    }
+    return filter.rt0 != 0 && maxwell3d->regs.rt[0].Address() == filter.rt0;
 }
 
 RasterizerVulkan::~RasterizerVulkan() {
@@ -1299,11 +1336,16 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     query_cache.NotifySegment(true);
     HandleTransformFeedback();
     query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+    // Debug server draw_skip: everything above is set up as usual, only the draw call is left out.
+    const u32 debug_index = debug_draw_index++;
+    const bool debug_skip = draw_filter && DebugSkipsDraw(debug_index, *pipeline);
     {
         Profile::Scope scope{Profile::Zone::DrawRecord};
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
         trace_draw_hashes = {pipeline->ShaderHashes()[1], pipeline->ShaderHashes()[5]};
-        draw_func();
+        if (!debug_skip) {
+            draw_func();
+        }
     }
     submitted = true;
     buffer_cache.NoteWorkRecorded(false);
@@ -3839,6 +3881,14 @@ void RasterizerVulkan::TickFrame() {
             pipeline_cache.RefreshDebugRejections(change->unrejected);
             VideoCore::Nx2Debug::NoteRejectApplied(change->generation);
         }
+        if (auto change = VideoCore::Nx2Debug::TakeDrawFilter()) {
+            if (change->second.Empty()) {
+                draw_filter.reset();
+            } else {
+                draw_filter = std::move(change->second);
+            }
+            VideoCore::Nx2Debug::NoteDrawFilterApplied(change->first);
+        }
         while (const auto read = VideoCore::Nx2Debug::TakeGpuRead()) {
             std::vector<Tegra::MemoryManager*> spaces;
             if (gpu_memory != nullptr) {
@@ -3864,6 +3914,7 @@ void RasterizerVulkan::TickFrame() {
         TickDrawReuse();
     }
     frame_dump.TickFrame();
+    debug_draw_index = 0;
     ++render_trace_frame;
     render_trace_draws = 0;
     render_trace_clears = 0;
