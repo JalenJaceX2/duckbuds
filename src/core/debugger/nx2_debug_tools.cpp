@@ -32,7 +32,9 @@
 #include "core/memory.h"
 #include "hid_core/hid_core.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_base.h"
 
 namespace Core::Nx2Debug {
@@ -527,6 +529,168 @@ json DrawSkip(ToolState&, const json& params) {
     return result;
 }
 
+// Live optimisation switches (perf_sites / perf_slow / perf_flip): Nx2Perf::LiveState, applied
+// by the rasterizer at the next frame end.
+namespace Perf = VideoCommon::Nx2Perf;
+
+/// What the slow path of each site costs, roughly (for spacing screenshots after a flip).
+constexpr std::array<std::string_view, Perf::SiteNames.size()> SiteCosts{
+    "low",    "low",  "medium", "medium", "low",  "low",    "low",    "low",  "high",
+    "medium", "low",  "medium", "high",   "medium", "low", "high", "high (new pipelines)", "medium",
+};
+
+json LiveJson(const Perf::LiveState& live) {
+    json sites = json::array();
+    const u32 slow = live.Effective();
+    for (size_t i = 0; i < Perf::SiteNames.size(); ++i) {
+        sites.push_back({{"name", Perf::SiteNames[i]},
+                         {"state", (slow >> i & 1) != 0 ? "slow" : "fast"},
+                         {"named", (live.named >> i & 1) != 0},
+                         {"live", true},
+                         {"cost", SiteCosts[i]}});
+    }
+    json pieces = json::object();
+    for (size_t i = 0; i < VideoCommon::BackX::DuskPieceNames.size(); ++i) {
+        pieces[std::string{VideoCommon::BackX::DuskPieceNames[i]}] =
+            (live.dusk_off >> i & 1) != 0 ? "old" : "upstream";
+    }
+    const auto control = [](int value) -> json {
+        return value < 0 ? json("default") : json(value);
+    };
+    return {
+        {"verify", live.verify},
+        {"sites", std::move(sites)},
+        {"backx", std::move(pieces)},
+        {"inline_defer", (slow >> static_cast<u32>(Perf::Site::InlineDefer) & 1) == 0 ? 1 : 0},
+        {"uboreuse", control(live.uboreuse)},
+        {"frames_ahead", control(live.frames_ahead)},
+        {"fence_batch", control(live.fence_batch)},
+        {"sync_submit", control(live.sync_submit)},
+        {"start_time_only",
+         {"state_blocks: the split front decides whether it sends register blocks when it starts "
+          "(the back's handling of them is live)",
+          "EDEN_NX2_SPLIT, EDEN_NX2_HOSTTIMING_PRIO and every switch not listed here"}},
+    };
+}
+
+/// Queues `live` for the next frame end and waits (timeout_s, default 5) until it is applied.
+json ApplyLiveParams(ToolState& state, const json& params, const Perf::LiveState& live) {
+    if (!IsVulkan()) {
+        throw std::runtime_error{"live switches need the Vulkan renderer (applied at its frame end)"};
+    }
+    const u64 request = Perf::RequestLive(live);
+    const auto timeout = std::chrono::seconds{Param<int>(params, "timeout_s", 5, 0, 60)};
+    const auto begin = std::chrono::steady_clock::now();
+    while (Perf::g_live_applied.load(std::memory_order_acquire) < request &&
+           std::chrono::steady_clock::now() - begin < timeout &&
+           !state.stopping.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(10ms);
+    }
+    const bool applied = Perf::g_live_applied.load(std::memory_order_acquire) >= request;
+    json result = LiveJson(applied ? Perf::CurrentLive() : live);
+    result["applied"] = applied;
+    result["request"] = request;
+    result["frame"] = Perf::g_live_applied_frame.load(std::memory_order_relaxed);
+    result["presents"] = g_nx2_present_count.load(std::memory_order_relaxed);
+    if (!applied) {
+        result["note"] = "no frame end yet; the change applies at the next one";
+    }
+    return result;
+}
+
+u32 SiteBit(std::string_view name) {
+    for (size_t i = 0; i < Perf::SiteNames.size(); ++i) {
+        if (Perf::SiteNames[i] == name) {
+            return 1u << i;
+        }
+    }
+    throw std::runtime_error{"unknown site \"" + std::string{name} + "\" (see perf_sites)"};
+}
+
+/// Every Nx2Perf site, fast or slow now, and the other live controls.
+json PerfSites(ToolState&, const json&) {
+    json result = LiveJson(Perf::CurrentLive());
+    result["pending"] = Perf::g_live_requested.load(std::memory_order_relaxed) !=
+                        Perf::g_live_applied.load(std::memory_order_relaxed);
+    result["frame"] = Perf::g_live_applied_frame.load(std::memory_order_relaxed);
+    return result;
+}
+
+/// {sites: [name, ...] | "all" | [], verify?: bool (default false)}: replaces the slow set
+/// (inline_defer included; [] is everything fast, the normal state).
+json PerfSlow(ToolState& state, const json& params) {
+    Perf::LiveState live = Perf::TargetLive();
+    const json sites = params.value("sites", json::array());
+    if (sites.is_string()) {
+        if (sites.get<std::string>() != "all") {
+            throw std::runtime_error{"sites must be a list of names, \"all\" or []"};
+        }
+        live.named = (1u << Perf::SiteNames.size()) - 1;
+    } else if (sites.is_array()) {
+        live.named = 0;
+        for (const json& name : sites) {
+            live.named |= SiteBit(name.get<std::string>());
+        }
+    } else {
+        throw std::runtime_error{"sites must be a list of names, \"all\" or []"};
+    }
+    live.verify = params.value("verify", false);
+    return ApplyLiveParams(state, params, live);
+}
+
+/// {control, value}: inline_defer 0|1, uboreuse / frames_ahead / fence_batch / sync_submit
+/// 0|1|"default", backx.<piece> or backx (all pieces) "old"|"upstream", verify true|false.
+json PerfFlip(ToolState& state, const json& params) {
+    Perf::LiveState live = Perf::TargetLive();
+    const std::string control = params.at("control").get<std::string>();
+    const json& value = params.at("value");
+    const auto number = [&]() -> int {
+        if (value.is_string() && value.get<std::string>() == "default") {
+            return -1;
+        }
+        const int number = value.is_boolean() ? (value.get<bool>() ? 1 : 0) : value.get<int>();
+        if (number != 0 && number != 1) {
+            throw std::runtime_error{"value must be 0, 1 or \"default\""};
+        }
+        return number;
+    };
+    if (control == "inline_defer") {
+        const u32 bit = 1u << static_cast<u32>(Perf::Site::InlineDefer);
+        live.named = number() == 0 ? live.named | bit : live.named & ~bit;
+    } else if (control == "uboreuse") {
+        live.uboreuse = number();
+    } else if (control == "frames_ahead") {
+        live.frames_ahead = number();
+    } else if (control == "fence_batch") {
+        live.fence_batch = number();
+    } else if (control == "sync_submit") {
+        live.sync_submit = number();
+    } else if (control == "verify") {
+        live.verify = number() == 1;
+    } else if (control == "backx" || control.starts_with("backx.")) {
+        const std::string text = value.get<std::string>();
+        if (text != "old" && text != "upstream") {
+            throw std::runtime_error{"backx values are \"old\" or \"upstream\""};
+        }
+        u32 bits = (1u << VideoCommon::BackX::DuskPieceNames.size()) - 1;
+        if (control != "backx") {
+            const std::string_view piece = std::string_view{control}.substr(6);
+            const auto& names = VideoCommon::BackX::DuskPieceNames;
+            const auto it = std::ranges::find(names, piece);
+            if (it == names.end()) {
+                throw std::runtime_error{"unknown back piece \"" + std::string{piece} + "\""};
+            }
+            bits = 1u << static_cast<u32>(it - names.begin());
+        }
+        live.dusk_off = text == "old" ? live.dusk_off | bits : live.dusk_off & ~bits;
+    } else {
+        throw std::runtime_error{"unknown control \"" + control +
+                                 "\": inline_defer, uboreuse, frames_ahead, fence_batch, "
+                                 "sync_submit, verify, backx, backx.<piece>"};
+    }
+    return ApplyLiveParams(state, params, live);
+}
+
 /// The graphics draws of the next whole frame with their shaders and state; with save (default)
 /// also written as drawlist-<session>-<n>.json to the dump directory.
 json DrawList(ToolState& state, const json& params) {
@@ -852,6 +1016,9 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"reject_shaders", handler(RejectShaders)},
         {"draw_skip", handler(DrawSkip)},
         {"draw_list", handler(DrawList)},
+        {"perf_sites", handler(PerfSites)},
+        {"perf_slow", handler(PerfSlow)},
+        {"perf_flip", handler(PerfFlip)},
         {"sample", handler(SampleThreads)},
         {"speed_limit", handler(SpeedLimit)},
         {"host_timing", handler(HostTiming)},

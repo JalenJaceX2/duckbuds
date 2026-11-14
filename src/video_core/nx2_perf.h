@@ -4,7 +4,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <cstdlib>
 #include <string>
 #include <string_view>
@@ -108,49 +110,157 @@ static_assert(ParseSlow("bogus,,mapping_runs").mask == 1u << static_cast<int>(Si
     return value == nullptr ? SlowMask{} : ParseSlow(value);
 }
 
-/// EDEN_NX2_PERF_VERIFY=1. A plain flag: the buffer cache, the memory tracker and the 3D engine
-/// check it on hot paths, and a function's static is checked for its initialization on every
-/// call (MSVC reads a thread-local for it).
-inline bool g_verify = VerifySwitchSet();
-/// EDEN_NX2_PERF_SLOW's sites, a bit each.
-inline std::uint32_t g_slow_mask = SlowSwitch().mask;
+/// The sites PERF_VERIFY=1 turns slow: all but inline_defer (EDEN_NX2_INLINE_DEFER=0).
+inline constexpr std::uint32_t VerifyMask =
+    ((1u << SiteNames.size()) - 1) & ~(1u << static_cast<std::uint32_t>(Site::InlineDefer));
+
+/// The live state. Start: the switches (ReadSwitch). Then the debug server's perf_slow and
+/// perf_flip (docs/nx2/debug-mcp.md), applied by RasterizerVulkan::TickFrame at a frame end.
+/// Every site reads it with one relaxed atomic load where it decides, and each decision is per
+/// call (the fast and the slow path of a site leave the same state), so a flip is safe wherever
+/// another thread is; the frame end only gives the caches a reset point (ApplyLive's caller).
+struct LiveState {
+    bool verify{};              ///< EDEN_NX2_PERF_VERIFY
+    std::uint32_t named{};      ///< EDEN_NX2_PERF_SLOW sites (+ inline_defer for INLINE_DEFER=0)
+    std::uint32_t dusk_off{};   ///< BackX::DuskPiece bits on their old path
+    int uboreuse = -1;          ///< -1: the start switch, else 0/1 (EDEN_NX2_UBOREUSE)
+    int frames_ahead = -1;      ///< -1: the start switch, else 0/1 (EDEN_NX2_FRAMES_AHEAD)
+    int fence_batch = -1;       ///< -1: the start switch, else 0/1 (EDEN_NX2_FENCE_BATCH)
+    int sync_submit = -1;       ///< -1: the start switch, else 0/1 (EDEN_NX2_SYNC_SUBMIT)
+
+    [[nodiscard]] std::uint32_t Effective() const noexcept {
+        return named | (verify ? VerifyMask : 0);
+    }
+};
+
+/// Sites on their slow path (verify folded in): what Slow() reads.
+inline std::atomic<std::uint32_t> g_slow{};
+inline std::atomic<bool> g_verify{};
+inline std::atomic<std::uint32_t> g_named{};
+inline std::atomic<std::uint32_t> g_dusk_off{};
+inline std::atomic<int> g_uboreuse{-1};
+inline std::atomic<int> g_frames_ahead{-1};
+inline std::atomic<int> g_fence_batch{-1};
+inline std::atomic<int> g_sync_submit{-1};
+/// Live changes requested / applied, and the rasterizer frame of the last applied one.
+inline std::atomic<std::uint64_t> g_live_requested{};
+inline std::atomic<std::uint64_t> g_live_applied{};
+inline std::atomic<std::uint64_t> g_live_applied_frame{};
+inline std::mutex g_live_mutex;
+inline LiveState g_live_pending;
+
+inline void StoreLive(const LiveState& state) {
+    g_verify.store(state.verify, std::memory_order_relaxed);
+    g_named.store(state.named, std::memory_order_relaxed);
+    g_slow.store(state.Effective(), std::memory_order_relaxed);
+    g_dusk_off.store(state.dusk_off, std::memory_order_relaxed);
+    g_uboreuse.store(state.uboreuse, std::memory_order_relaxed);
+    g_frames_ahead.store(state.frames_ahead, std::memory_order_relaxed);
+    g_fence_batch.store(state.fence_batch, std::memory_order_relaxed);
+    g_sync_submit.store(state.sync_submit, std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline LiveState CurrentLive() {
+    return LiveState{
+        .verify = g_verify.load(std::memory_order_relaxed),
+        .named = g_named.load(std::memory_order_relaxed),
+        .dusk_off = g_dusk_off.load(std::memory_order_relaxed),
+        .uboreuse = g_uboreuse.load(std::memory_order_relaxed),
+        .frames_ahead = g_frames_ahead.load(std::memory_order_relaxed),
+        .fence_batch = g_fence_batch.load(std::memory_order_relaxed),
+        .sync_submit = g_sync_submit.load(std::memory_order_relaxed),
+    };
+}
+
+/// The state the next frame end applies (the pending one, else the live one).
+[[nodiscard]] inline LiveState TargetLive() {
+    std::scoped_lock lock{g_live_mutex};
+    return g_live_requested.load(std::memory_order_relaxed) !=
+                   g_live_applied.load(std::memory_order_relaxed)
+               ? g_live_pending
+               : CurrentLive();
+}
+
+/// Debug server thread: the next frame end applies `state`. Returns the request to wait for.
+inline std::uint64_t RequestLive(const LiveState& state) {
+    std::scoped_lock lock{g_live_mutex};
+    g_live_pending = state;
+    return g_live_requested.fetch_add(1, std::memory_order_release) + 1;
+}
+
+/// "name=slow name=fast ..." of an effective mask.
+[[nodiscard]] inline std::string SitesText(std::uint32_t slow) {
+    std::string sites;
+    for (std::size_t i = 0; i < SiteNames.size(); ++i) {
+        sites += sites.empty() ? "" : " ";
+        sites += SiteNames[i];
+        sites += (slow >> i & 1) != 0 ? "=slow" : "=fast";
+    }
+    return sites;
+}
+
+/// Rasterizer thread, at a frame end: applies a requested change. True when one was applied, so
+/// the caller resets the caches the flipped paths fill differently.
+inline bool ApplyLive(std::uint64_t frame) {
+    const std::uint64_t requested = g_live_requested.load(std::memory_order_acquire);
+    if (requested == g_live_applied.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    LiveState state;
+    {
+        std::scoped_lock lock{g_live_mutex};
+        state = g_live_pending;
+    }
+    StoreLive(state);
+    g_live_applied_frame.store(frame, std::memory_order_relaxed);
+    g_live_applied.store(requested, std::memory_order_release);
+    LOG_INFO(HW_GPU,
+             "Nx2Perf live change #{} at frame {}: verify={} dusk_off={:#x} uboreuse={} "
+             "frames_ahead={} fence_batch={} sync_submit={} sites: {}",
+             requested, frame, state.verify ? 1 : 0, state.dusk_off, state.uboreuse,
+             state.frames_ahead, state.fence_batch, state.sync_submit,
+             SitesText(state.Effective()));
+    return true;
+}
 
 /// Called by VideoCore::CreateGPU: static initialization runs before the frontend loads
 /// nx2_switches.txt, so a switch set only there takes effect from that point on.
 inline void ReadSwitch() {
-    g_verify = VerifySwitchSet();
     const SlowMask slow = SlowSwitch();
-    g_slow_mask = slow.mask;
     if (slow.unknown != 0) {
         LOG_WARNING(HW_GPU, "EDEN_NX2_PERF_SLOW: {} unknown site name(s) in \"{}\"", slow.unknown,
                     std::getenv("EDEN_NX2_PERF_SLOW"));
     }
-    std::string sites;
-    for (std::size_t i = 0; i < SiteNames.size(); ++i) {
-        // inline_defer is EDEN_NX2_INLINE_DEFER=0, which PERF_VERIFY never implied.
-        const bool slow_site =
-            (g_slow_mask >> i & 1) != 0 ||
-            (g_verify && i != static_cast<std::size_t>(Site::InlineDefer));
-        sites += sites.empty() ? "" : " ";
-        sites += SiteNames[i];
-        sites += slow_site ? "=slow" : "=fast";
+    LiveState state = CurrentLive();
+    state.verify = VerifySwitchSet();
+    state.named = slow.mask;
+    if (const char* defer = std::getenv("EDEN_NX2_INLINE_DEFER"); defer && defer[0] == '0') {
+        state.named |= 1u << static_cast<std::uint32_t>(Site::InlineDefer);
     }
-    LOG_INFO(HW_GPU, "Nx2Perf sites (PERF_VERIFY={}): {}", g_verify ? 1 : 0, sites);
+    StoreLive(state);
+    LOG_INFO(HW_GPU, "Nx2Perf sites (PERF_VERIFY={}): {}", state.verify ? 1 : 0,
+             SitesText(state.Effective()));
 }
 
 inline bool Verify() {
-    return g_verify;
+    return g_verify.load(std::memory_order_relaxed);
 }
 
-/// True when this site takes its slow (reference) path: EDEN_NX2_PERF_VERIFY=1, or the site is
-/// named in EDEN_NX2_PERF_SLOW.
+/// True when this site takes its slow (reference) path: EDEN_NX2_PERF_VERIFY=1, the site is
+/// named in EDEN_NX2_PERF_SLOW, or the debug server's perf_slow turned it slow.
 inline bool Slow(Site site) {
-    return g_verify || (g_slow_mask >> static_cast<std::uint32_t>(site) & 1) != 0;
+    return (g_slow.load(std::memory_order_relaxed) >> static_cast<std::uint32_t>(site) & 1) != 0;
 }
 
-/// EDEN_NX2_PERF_SLOW only (for inline_defer, which PERF_VERIFY does not change).
+/// inline_defer, which PERF_VERIFY does not change (VerifyMask leaves its bit out).
 inline bool SlowNamed(Site site) {
-    return (g_slow_mask >> static_cast<std::uint32_t>(site) & 1) != 0;
+    return Slow(site);
+}
+
+/// A live override (-1: none) of a start-time boolean switch.
+[[nodiscard]] inline bool LiveOr(const std::atomic<int>& live, bool start) {
+    const int value = live.load(std::memory_order_relaxed);
+    return value < 0 ? start : value != 0;
 }
 
 } // namespace VideoCommon::Nx2Perf

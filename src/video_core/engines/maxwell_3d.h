@@ -3474,19 +3474,25 @@ private:
         const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
         return value == nullptr || value[0] != '0';
     }();
-    const bool perf_slow_method =
-        VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodFast);
-    /// #1095's direct state register write in CallMethod. Off for The Duskbloods (unless
-    /// EDEN_NX2_DUSK_BACKX_PIECES names direct_state_write): CallMethodFast, as before #1095.
-    const bool direct_state_write =
-        !VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::DirectStateWrite);
-    const bool perf_slow_cb_batch =
-        VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodCbBatch);
-    // The Duskbloods takes the pre-#1585 path too (EDEN_NX2_DUSK_BACKX_PIECES=state_blocks
-    // keeps the blocks).
-    const bool perf_slow_state_blocks =
-        VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::StateBlocks) ||
-        VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::StateBlocks);
+    // Read live at each call (one relaxed atomic load; the debug server's perf_slow/perf_flip
+    // change them at frame ends): every choice is per method, both paths leave the same state.
+    static bool perf_slow_method() {
+        return VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodFast);
+    }
+    /// #1095's direct state register write in CallMethod. EDEN_NX2_DUSK_BACKX=off turns it off
+    /// for The Duskbloods: CallMethodFast, as before #1095.
+    static bool direct_state_write() {
+        return !VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::DirectStateWrite);
+    }
+    static bool perf_slow_cb_batch() {
+        return VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodCbBatch);
+    }
+    // The Duskbloods' pre-#1585 path too. Live for the back's WriteStateRegisters (blocks applied
+    // one write at a time); the front decides whether to send blocks when it starts (Front).
+    static bool perf_slow_state_blocks() {
+        return VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::StateBlocks) ||
+               VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::StateBlocks);
+    }
     const bool reg_block_verify = [] {
         const char* value = std::getenv("EDEN_NX2_REG_BLOCK_VERIFY");
         return value != nullptr && value[0] == '1';

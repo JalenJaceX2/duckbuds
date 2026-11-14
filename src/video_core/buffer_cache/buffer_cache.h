@@ -4334,7 +4334,10 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         (is_written ? 1U : 0U) | (native_pointer ? 2U : 0U) | (table_pointer ? 4U : 0U) |
         (compute ? 8U : 0U);
     const size_t owner = gpu_memory->GetID() + 1;
-    const u64 serial = gpu_memory->MapSerial();
+    // A live Nx2Perf change (debug server) forgets every thread's memo: the change count rides in
+    // the serial's top bits.
+    const u64 serial = gpu_memory->MapSerial() ^
+                       (Nx2Perf::g_live_applied.load(std::memory_order_relaxed) << 48);
     auto& set = binding_cache[((gpu_addr ^ next_qword ^ flags) * 0x9E3779B97F4A7C15ULL) >> 55];
     for (size_t way = 0; way < ways; ++way) {
         const CachedBinding& cached = set[way];

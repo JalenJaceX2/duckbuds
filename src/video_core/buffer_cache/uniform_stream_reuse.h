@@ -33,12 +33,14 @@ concept StreamUniformReusable = requires(R& runtime, u32 size) {
 };
 
 /// EDEN_NX2_UBOREUSE=0 turns the reuse off (every small uniform buffer is copied, as before).
+/// The debug server's perf_flip uboreuse overrides it at a frame end, which also resets the slots
+/// (RasterizerVulkan::TickFrame), so no kept bind outlives a flip.
 [[nodiscard]] inline bool UniformStreamReuseEnabled() noexcept {
     static const bool enabled = [] {
         const char* const value = std::getenv("EDEN_NX2_UBOREUSE");
         return value == nullptr || value[0] != '0';
     }();
-    return enabled;
+    return Nx2Perf::LiveOr(Nx2Perf::g_uboreuse, enabled);
 }
 
 template <class Ref>

@@ -3868,6 +3868,13 @@ void RasterizerVulkan::TickFrame() {
         VideoCore::Nx2Debug::FinishDrawList(*draw_list_id, std::exchange(draw_list, {}));
         draw_list_id.reset();
     }
+    // Debug server perf_slow / perf_flip (one load a frame without a change).
+    if (VideoCommon::Nx2Perf::ApplyLive(render_trace_frame)) {
+        // The flipped paths fill the uniform reuse slots differently: start them over (the
+        // storage binding memo keys on the applied change, Nx2Perf::g_live_applied).
+        std::scoped_lock lock{buffer_cache.mutex};
+        VideoCommon::ResetUniformStreamReuse<BufferCacheRuntime>();
+    }
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (const auto id = VideoCore::Nx2Debug::TakeDrawList()) {
             draw_list_id = id;
@@ -4124,12 +4131,10 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
     }
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
     // EDEN_NX2_INLINE_DEFER=0 (or EDEN_NX2_PERF_SLOW=inline_defer): invalidate every cache at
-    // once (for comparisons).
-    static const bool defer = [] {
-        const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");
-        return (value == nullptr || value[0] != '0') &&
-               !VideoCommon::Nx2Perf::SlowNamed(VideoCommon::Nx2Perf::Site::InlineDefer);
-    }();
+    // once (for comparisons). Nx2Perf::ReadSwitch folds the switch into the inline_defer site,
+    // which the debug server flips live: each write decides alone, and ranges deferred before a
+    // flip still reach the caches at the next FlushCaching.
+    const bool defer = !VideoCommon::Nx2Perf::SlowNamed(VideoCommon::Nx2Perf::Site::InlineDefer);
     // One cache at a time: holding both while waiting for either (std::lock) waited longer, the
     // fencing thread and CPU write traps holding one of them most of the time.
     bool uploaded = false;

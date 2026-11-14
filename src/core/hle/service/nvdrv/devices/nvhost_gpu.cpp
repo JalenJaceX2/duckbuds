@@ -28,6 +28,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_perf.h"
 
 namespace Service::Nvidia::Devices {
 namespace {
@@ -520,10 +521,13 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
     }
     flags.raw = 0;
 
-    static const bool sync_submit = [] {
+    static const bool sync_submit_switch = [] {
         const char* value = std::getenv("EDEN_NX2_SYNC_SUBMIT");
         return value != nullptr && value[0] != '0';
     }();
+    // The debug server's perf_flip sync_submit overrides it per submit (each waits alone).
+    const bool sync_submit =
+        VideoCommon::Nx2Perf::LiveOr(VideoCommon::Nx2Perf::g_sync_submit, sync_submit_switch);
     if (g_nx2_driver && sync_submit && increment > 0) {
         lock.unlock();
         auto& syncpoints = system.Host1x().GetSyncpointManager();

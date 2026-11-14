@@ -14,6 +14,7 @@
 
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "video_core/nx2_perf.h"
 
 /// The GPU back thread's work outside draw preparation: locks and passes it skips where a check
 /// without the lock shows the locked work would change nothing (ported from jpkto/Lichii
@@ -27,9 +28,11 @@ namespace VideoCommon::BackX {
 inline bool g_verify{};
 
 /// The Duskbloods network test (dusk-v3r experiment, never for nx2): the back micro-cuts of #1586
-/// (5e428570d2) and two split-thread register cuts (#1585 blocks, #1095 direct state write) run as
-/// before them unless EDEN_NX2_DUSK_BACKX=on, or the piece is named in
-/// EDEN_NX2_DUSK_BACKX_PIECES=<name>,... (those keep upstream behaviour). Other titles: upstream.
+/// (5e428570d2) and two split-thread register cuts (#1585 blocks, #1095 direct state write) keep
+/// upstream behaviour unless EDEN_NX2_DUSK_BACKX=off, which runs them as before those PRs, all
+/// but the pieces named in EDEN_NX2_DUSK_BACKX_PIECES=<name>,... (those stay upstream). The old
+/// paths did not remove the hub lasers (cd233b9707 test), so upstream is the default again; the
+/// debug server's perf_flip backx.<piece> flips each piece live. Other titles: upstream.
 enum class DuskPiece : u32 {
     GatherSkip,        // gpu.cpp InvalidateGPUCache: gather only when MayHavePending
     InlineLockFree,    // vk_rasterizer.cpp AccelerateInlineToMemory: skip the lock and InlineMemory
@@ -51,7 +54,7 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(DuskPiece::Cou
 /// EDEN_NX2_DUSK_BACKX_PIECES (either may be null). Unknown names count in `unknown`.
 [[nodiscard]] constexpr u32 DuskOffMask(bool duskbloods, std::string_view mode,
                                         std::string_view pieces, u32* unknown = nullptr) {
-    if (!duskbloods || mode == "on") {
+    if (!duskbloods || mode != "off") {
         return 0;
     }
     u32 off = (1u << DuskPieceNames.size()) - 1;
@@ -83,15 +86,16 @@ inline constexpr std::array<std::string_view, static_cast<size_t>(DuskPiece::Cou
 }
 static_assert(DuskOffMask(false, "", "") == 0);
 static_assert(DuskOffMask(true, "on", "") == 0);
-static_assert(DuskOffMask(true, "", "") == (1u << 9) - 1);
+static_assert(DuskOffMask(true, "", "") == 0);
+static_assert(DuskOffMask(true, "off", "") == (1u << 9) - 1);
 static_assert(DuskOffMask(true, "off", " state_blocks ,gather_skip\r") ==
               ((1u << 9) - 1 & ~(1u << 7) & ~1u));
 
-/// Set by ReadSwitch (CreateGPU runs after the program id is known, before any GPU thread).
-inline u32 g_dusk_off{};
-
+/// Nx2Perf::g_dusk_off: set by ReadSwitch (CreateGPU runs after the program id is known, before
+/// any GPU thread), then by the debug server's perf_flip at frame ends.
 inline bool DuskOff(DuskPiece piece) {
-    return (g_dusk_off >> static_cast<u32>(piece) & 1) != 0;
+    return (Nx2Perf::g_dusk_off.load(std::memory_order_relaxed) >> static_cast<u32>(piece) & 1) !=
+           0;
 }
 
 /// "name=old name=upstream ..." for the log.
@@ -121,12 +125,13 @@ inline void ReadSwitch(u64 program_id) {
         LOG_INFO(HW_GPU, "BackX verify on");
     }
     u32 unknown = 0;
-    g_dusk_off = DuskOffMaskFromEnv(program_id, &unknown);
+    const u32 off = DuskOffMaskFromEnv(program_id, &unknown);
+    Nx2Perf::g_dusk_off.store(off, std::memory_order_relaxed);
     if (unknown != 0) {
         LOG_WARNING(HW_GPU, "EDEN_NX2_DUSK_BACKX_PIECES: {} unknown piece name(s)", unknown);
     }
     if (program_id == 0x0400D1D02399A000ULL) {
-        LOG_INFO(HW_GPU, "Duskbloods back pieces: {}", DuskPiecesText(g_dusk_off));
+        LOG_INFO(HW_GPU, "Duskbloods back pieces: {}", DuskPiecesText(off));
     }
 }
 
