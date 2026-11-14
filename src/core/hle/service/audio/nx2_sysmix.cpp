@@ -118,18 +118,26 @@ struct SysmixOutput::Impl {
     // emu_us is the guest clock; the wall clock is the timestamp every log line carries.
     // Comparing their deltas over consecutive windows shows whether emulated time runs at the
     // host's rate (48000 frames of output per second of wall time).
-    void LogStatus(u32 filled) {
+    // owed/dropped/max_late_us: the timer's catch-up (ticks still owed, owed ticks dropped over
+    // the cap and the largest lateness, both since the last line).
+    void LogStatus(u32 filled, SysmixCatchUp* catch_up = nullptr) {
         const u64 emu_us = static_cast<u64>(
             std::chrono::duration_cast<std::chrono::microseconds>(
                 system.CoreTiming().GetGlobalTimeNs())
                 .count());
+        const SysmixCatchUp shown = catch_up ? *catch_up : SysmixCatchUp{};
+        if (catch_up) {
+            catch_up->dropped = 0;
+            catch_up->max_late_us = 0;
+        }
         LOG_INFO(Service_Audio,
                  "sysmix stream {} output: copied={} accepted={} nonzero={} blocks={} full={} "
-                 "queued={} retried={} padded={} deferred={} filled={} emu_us={}",
+                 "queued={} retried={} padded={} deferred={} filled={} emu_us={} owed={} "
+                 "dropped={} max_late_us={}",
                  id, counters.copied_frames, counters.accepted_frames, counters.nonzero_frames,
                  counters.admitted_blocks, counters.backpressure,
                  host ? host->GetQueueSize() : 0, counters.retried_frames, counters.padded_frames,
-                 counters.deferred, filled, emu_us);
+                 counters.deferred, filled, emu_us, shown.owed, shown.dropped, shown.max_late_us);
     }
 
     Core::System& system;
@@ -346,38 +354,38 @@ u32 SysmixOutput::GetState() const {
 }
 
 /// Transfer a bounded PCM block between host audio and the guest ring, preserving cursor ownership.
-void SysmixOutput::Pump() {
+bool SysmixOutput::Pump(SysmixCatchUp* catch_up) {
     auto& p = *impl;
     std::unique_lock lock{p.mutex, std::try_to_lock};
     if (!lock || !p.open || p.faulted || p.system.IsShuttingDown()) {
-        return;
+        return false;
     }
     ++p.counters.ticks;
     u32 read{}, write{}, filled{};
     if (!p.ReadOccupancy(read, write, filled)) {
         p.Fault();
-        return;
+        return false;
     }
     if (!p.engaged) {
         p.Notify(filled);
-        return;
+        return false;
     }
     if (!p.host->IsReady()) {
         p.Fault(ResultOperationFailed);
-        return;
+        return false;
     }
     if (p.input_stream) {
         const auto available = std::min(p.slots - 1 - filled, BlockFrames);
         if (!available) {
             ++p.counters.backpressure;
             p.Notify(filled);
-            return;
+            return false;
         }
         const auto captured = p.host->DrainInputSamples(available);
         const auto taken = static_cast<u32>(captured.size() / p.channels);
         if (!taken) {
             p.Notify(filled);
-            return;
+            return false;
         }
         u32 nonzero{};
         for (u32 frame = 0; frame < taken; ++frame) {
@@ -407,7 +415,7 @@ void SysmixOutput::Pump() {
                                 second * p.frame_bytes)) ||
             !memory.WriteExclusive32(p.buffer + WriteOffset, (write + taken) % p.slots, write)) {
             p.Fault();
-            return;
+            return false;
         }
         p.consumer = (write + taken) % p.slots;
         p.counters.copied_frames += taken;
@@ -416,14 +424,14 @@ void SysmixOutput::Pump() {
         ++p.counters.admitted_blocks;
         if (!p.ReadOccupancy(read, write, filled)) {
             p.Fault();
-            return;
+            return false;
         }
         p.Notify(filled);
         if (p.counters.admitted_blocks <= 3 || p.counters.ticks % 400 == 0) {
             LOG_INFO(Service_Audio, "sysmix input {}: captured={} nonzero={} filled={}", p.id,
                      p.counters.accepted_frames, p.counters.nonzero_frames, filled);
         }
-        return;
+        return true;
     }
     const u32 taken = std::min(filled, BlockFrames);
     // A short block is padded with silence. That is right for a real underrun, but while the host
@@ -434,7 +442,7 @@ void SysmixOutput::Pump() {
     if (taken < BlockFrames && p.host->HasPendingAudio()) {
         ++p.counters.deferred;
         p.Notify(filled);
-        return;
+        return false;
     }
     const u32 first = std::min(taken, p.slots - read);
     const u32 second = taken - first;
@@ -445,7 +453,7 @@ void SysmixOutput::Pump() {
          !memory.ReadBlock(p.buffer + PayloadOffset, p.input.data() + first * p.frame_bytes,
                            second * p.frame_bytes))) {
         p.Fault();
-        return;
+        return false;
     }
     p.counters.copied_frames += taken;
     p.output.fill(0);
@@ -475,7 +483,7 @@ void SysmixOutput::Pump() {
     if (!p.host->TryAppendOutputBlock(block, p.output)) {
         if (!p.host->IsReady()) {
             p.Fault(ResultOperationFailed);
-            return;
+            return false;
         }
         ++p.counters.backpressure;
         p.counters.retried_frames += taken;
@@ -484,9 +492,9 @@ void SysmixOutput::Pump() {
                      p.counters.accepted_frames, p.counters.admitted_blocks);
         }
         if (p.counters.ticks % 400 == 0) {
-            p.LogStatus(filled);
+            p.LogStatus(filled, catch_up);
         }
-        return;
+        return false;
     }
     ++p.counters.admitted_blocks;
     if (taken < BlockFrames) {
@@ -498,20 +506,21 @@ void SysmixOutput::Pump() {
         !memory.WriteExclusive32(p.buffer + ReadOffset, next, read) ||
         !memory.Read32Acquire(p.buffer + ReadOffset, checked) || checked != next) {
         p.Fault();
-        return;
+        return false;
     }
     p.consumer = next;
     p.counters.accepted_frames += taken;
     p.counters.nonzero_frames += nonzero;
     if (!p.ReadOccupancy(read, write, filled)) {
         p.Fault();
-        return;
+        return false;
     }
     p.Notify(filled);
     if (p.counters.admitted_blocks <= 3 || p.counters.ticks % 400 == 0 ||
         (nonzero && p.counters.nonzero_frames == nonzero)) {
-        p.LogStatus(filled);
+        p.LogStatus(filled, catch_up);
     }
+    return true;
 }
 
 Kernel::KReadableEvent* SysmixOutput::GetStateEvent() {
