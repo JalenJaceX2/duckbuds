@@ -522,6 +522,32 @@ struct System::Impl {
 
         // Expose program id to dump sites and other global readers.
         Settings::SetCurrentProgramID(params.program_id);
+        if (params.program_id == 0x0400D1D02399A000ULL) {
+            // One line naming the Duskbloods variants in effect (each switch is read where it acts;
+            // these are the same rules).
+            const auto env = [](const char* name) {
+                const char* value = std::getenv(name);
+                return std::string{value ? value : ""};
+            };
+            const auto flag = [&](const char* name, bool unset) {
+                const auto value = env(name);
+                return value.empty() ? unset : value[0] != '0';
+            };
+            LOG_INFO(Core,
+                     "Duskbloods variants: stack lowering {}, host-timing wait {}, upload stale {}, "
+                     "GPU-only regions {}, totals {} remote memory",
+                     env("EDEN_NX2_DUSK_STACK") == "upstream" ? "upstream (#1490)" : "v25 (fold)",
+                     flag("EDEN_NX2_HOSTTIMING_SPIN", true) ? "spin (v2.5)" : "OS sleep (#1016)",
+                     env("EDEN_NX2_UPLOAD_STALE").empty() || env("EDEN_NX2_UPLOAD_STALE")[0] == '1'
+                         ? "on (v2.5)"
+                         : "off (#818)",
+                     env("EDEN_NX2_GPU_MAP_FLAG_PROBE").empty() ||
+                             env("EDEN_NX2_GPU_MAP_FLAG_PROBE")[0] == '1'
+                         ? "client tile backing (v2.5)"
+                         : "server backed (#552)",
+                     env("EDEN_NX2_TOTAL_MINUS_REMOTE").starts_with('1') ? "minus (#552)"
+                                                                         : "include (v2.5)");
+        }
 
         // Track launch time for frontend launches
         LaunchTimestampCache::SaveLaunchTimestamp(params.program_id);
