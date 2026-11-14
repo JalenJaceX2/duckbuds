@@ -36,14 +36,20 @@ namespace Service::Audio {
 struct Nx2SysmixStreams {
     explicit Nx2SysmixStreams(Core::System& system_) : system{system_} {
         timer = Core::Timing::CreateEvent("sysmix output", [this](s64, std::chrono::nanoseconds late) {
-            std::unique_lock lock{mutex, std::try_to_lock};
-            if (lock) {
-                for (auto& [id, stream] : streams) {
-                    stream->Pump();
-                }
-            }
             const auto interval = std::chrono::nanoseconds{std::chrono::milliseconds{5}};
             const auto missed = std::max(late, std::chrono::nanoseconds::zero()) / interval;
+            // A late wake skips the missed ticks below, so pump their blocks now or that audio is
+            // lost for good (zero-filled host gaps). Bounded: a full host queue (SysmixQueueLimit)
+            // is backpressure that leaves the data in the guest ring, and a short guest ring defers.
+            std::unique_lock lock{mutex, std::try_to_lock};
+            if (lock) {
+                const auto pumps = std::min<s64>(missed + 1, 4);
+                for (s64 i = 0; i < pumps; ++i) {
+                    for (auto& [id, stream] : streams) {
+                        stream->Pump();
+                    }
+                }
+            }
             return std::optional<std::chrono::nanoseconds>{interval * (missed + 1)};
         });
         system.CoreTiming().ScheduleLoopingEvent(std::chrono::milliseconds{5},
