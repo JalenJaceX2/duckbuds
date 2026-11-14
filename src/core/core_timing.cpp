@@ -171,6 +171,24 @@ void CoreTiming::WaitForEvent(s64 next_time) {
     if (next_time <= start) {
         return;
     }
+    // Switch 2 titles: HostTiming joins the guest cores' and GPU threads' class (time critical),
+    // so it is not preempted by them and its timers (sysmix output) fire late. Once the program id
+    // is known (it is set after this thread starts). EDEN_NX2_HOSTTIMING_PRIO=0 keeps VeryHigh.
+    thread_local bool priority_checked = false;
+    if (!priority_checked) {
+        if (const u64 program_id = Settings::GetCurrentProgramID(); program_id != 0) {
+            priority_checked = true;
+            static const bool enabled = [] {
+                const char* value = std::getenv("EDEN_NX2_HOSTTIMING_PRIO");
+                return value == nullptr || std::strtol(value, nullptr, 10) != 0;
+            }();
+            if (enabled && (program_id >> 56) == 0x04) {
+                Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+                LOG_INFO(Core_Timing, "HostTiming priority: time critical (Switch 2 program {:016X})",
+                         program_id);
+            }
+        }
+    }
     s64 now = start;
     bool signalled = false;
     // The Duskbloods keeps the pre-#1016 hardware wait: an OS sleep at HostTiming priority wakes
