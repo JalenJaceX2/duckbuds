@@ -25,6 +25,7 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
@@ -3475,6 +3476,10 @@ private:
     }();
     const bool perf_slow_method =
         VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodFast);
+    /// #1095's direct state register write in CallMethod. Off for The Duskbloods (unless
+    /// EDEN_NX2_DUSK_BACKX_PIECES names direct_state_write): CallMethodFast, as before #1095.
+    const bool direct_state_write =
+        !VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::DirectStateWrite);
     const bool perf_slow_cb_batch =
         VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodCbBatch);
     // The Duskbloods takes the pre-#1585 path too (EDEN_NX2_DUSK_BACKX_PIECES=state_blocks

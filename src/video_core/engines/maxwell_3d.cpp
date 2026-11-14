@@ -528,7 +528,7 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
     // takes the longer path below; the profile, the write history and the first-write trace
     // leave fast_maxwell3d off.
     if (fast_maxwell3d && executing_macro == 0 && method < MacroRegistersStart &&
-        !execution_mask[method] && !perf_slow_method) {
+        !execution_mask[method] && !perf_slow_method && direct_state_write) {
         return WriteStateRegister(method, method_argument);
     }
     if (!fast_maxwell3d || executing_macro != 0 || method >= MacroRegistersStart ||
