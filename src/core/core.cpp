@@ -80,6 +80,7 @@
 #include "hid_core/hid_core.h"
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_stutter_trace.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
@@ -533,10 +534,12 @@ struct System::Impl {
                 const auto value = env(name);
                 return value.empty() ? unset : value[0] != '0';
             };
+            const u32 back_off = VideoCommon::BackX::DuskOffMaskFromEnv(params.program_id);
             LOG_INFO(Core,
                      "Duskbloods variants: stack lowering {}, host-timing wait {}, upload stale {}, "
                      "GPU-only regions {}, totals {} remote memory, AOFFI gather {}, "
-                     "host-timing priority {}, compute write mark {}, compute size word {}, ribbon {}",
+                     "host-timing priority {}, compute write mark {}, compute size word {}, ribbon {}, "
+                     "back cuts {} [{}], list-fed grid macros reverted (#1651)",
                      env("EDEN_NX2_DUSK_STACK") == "upstream" ? "upstream (#1490)" : "v25 (fold)",
                      flag("EDEN_NX2_HOSTTIMING_SPIN", true) ? "spin (v2.5)" : "OS sleep (#1016)",
                      env("EDEN_NX2_UPLOAD_STALE").empty() || env("EDEN_NX2_UPLOAD_STALE")[0] == '1'
@@ -556,7 +559,10 @@ struct System::Impl {
                                                              : "read (#1231)",
                      env("EDEN_NX2_DUSK_RIBBON") == "skip"   ? "skipped"
                      : env("EDEN_NX2_DUSK_RIBBON") == "diag" ? "drawn, traced"
-                                                             : "drawn");
+                                                             : "drawn",
+                     back_off == 0 ? "upstream (#1586, #1585, #1095)"
+                                   : "old (pre-#1586, pre-#1585, pre-#1095) where =old",
+                     VideoCommon::BackX::DuskPiecesText(back_off));
         }
 
         // Track launch time for frontend launches
