@@ -224,6 +224,8 @@ private:
 
     void TraceRenderState(bool is_indexed, const char* outcome, const Framebuffer* framebuffer);
     [[nodiscard]] bool DebugSkipsDraw(u32 index, const GraphicsPipeline& pipeline) const;
+    void RecordDebugDraw(u32 index, bool is_indexed, bool is_indirect, bool skipped,
+                         const GraphicsPipeline& pipeline);
 
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
@@ -397,6 +399,9 @@ private:
     /// Debug server draw_skip / EDEN_NX2_DRAW_SKIP, and the index of the next draw in this frame.
     std::optional<VideoCore::Nx2Debug::DrawFilter> draw_filter;
     u32 debug_draw_index = 0;
+    /// Debug server draw_list: the request being recorded this frame, and its draws.
+    std::optional<u64> draw_list_id;
+    std::vector<VideoCore::Nx2Debug::DrawRecord> draw_list;
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
     u32 render_trace_clears = 0;

@@ -32,6 +32,8 @@ struct State {
     u64 filter_generation{};
     u64 filter_applied{};
     bool filter_pending{};
+    std::deque<u64> draw_lists;
+    std::unordered_map<u64, std::vector<DrawRecord>> draw_list_results;
 };
 
 State state;
@@ -40,7 +42,7 @@ std::atomic<bool> any_rejected{};
 
 void UpdatePending() {
     pending.store(!state.captures.empty() || !state.gpu_reads.empty() || state.reject_pending ||
-                      state.filter_pending,
+                      state.filter_pending || !state.draw_lists.empty(),
                   std::memory_order_relaxed);
 }
 
@@ -130,6 +132,54 @@ void NoteDrawFilterApplied(u64 generation) {
     state.changed.notify_all();
 }
 
+void RequestDrawList(u64 id) {
+    std::scoped_lock lock{state.mutex};
+    state.draw_lists.push_back(id);
+    UpdatePending();
+}
+
+void CancelDrawList(u64 id) {
+    std::scoped_lock lock{state.mutex};
+    std::erase(state.draw_lists, id);
+    state.draw_list_results.erase(id);
+    UpdatePending();
+}
+
+std::optional<std::vector<DrawRecord>> WaitDrawList(u64 id, std::chrono::milliseconds timeout) {
+    std::unique_lock lock{state.mutex};
+    state.changed.wait_for(lock, timeout,
+                           [id] { return !state.open || state.draw_list_results.contains(id); });
+    const auto it = state.draw_list_results.find(id);
+    if (it == state.draw_list_results.end()) {
+        return std::nullopt;
+    }
+    std::vector<DrawRecord> draws = std::move(it->second);
+    state.draw_list_results.erase(it);
+    return draws;
+}
+
+std::optional<u64> TakeDrawList() {
+    std::scoped_lock lock{state.mutex};
+    if (state.draw_lists.empty()) {
+        return std::nullopt;
+    }
+    const u64 id = state.draw_lists.front();
+    state.draw_lists.pop_front();
+    UpdatePending();
+    return id;
+}
+
+void FinishDrawList(u64 id, std::vector<DrawRecord> draws) {
+    {
+        std::scoped_lock lock{state.mutex};
+        if (!state.open) {
+            return;
+        }
+        state.draw_list_results.insert_or_assign(id, std::move(draws));
+    }
+    state.changed.notify_all();
+}
+
 bool WaitDrawFilterApplied(u64 generation, std::chrono::milliseconds timeout) {
     std::unique_lock lock{state.mutex};
     return state.changed.wait_for(lock, timeout, [generation] {
@@ -143,6 +193,8 @@ void BeginSession() {
     state.finished.clear();
     state.gpu_reads.clear();
     state.gpu_read_results.clear();
+    state.draw_lists.clear();
+    state.draw_list_results.clear();
     state.rejected.clear();
     state.reject_pending = false;
     state.unrejected = false;
@@ -161,6 +213,7 @@ void EndSession() {
         state.open = false;
         state.captures.clear();
         state.gpu_reads.clear();
+        state.draw_lists.clear();
         UpdatePending();
     }
     state.changed.notify_all();

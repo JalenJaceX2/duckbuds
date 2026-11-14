@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <optional>
@@ -84,6 +85,52 @@ u64 SetDrawFilter(DrawFilter filter);
 [[nodiscard]] std::optional<std::pair<u64, DrawFilter>> TakeDrawFilter();
 void NoteDrawFilterApplied(u64 generation);
 [[nodiscard]] bool WaitDrawFilterApplied(u64 generation, std::chrono::milliseconds timeout);
+
+/// One graphics draw of a draw_list frame, as the rasterizer saw it right before the draw call.
+struct DrawRecord {
+    u32 index{};
+    u32 topology{};
+    bool indexed{};
+    bool indirect{};
+    bool skipped{};
+    u32 count{};
+    u32 first{};
+    u32 instances{};
+    std::array<u64, 6> programs{};      ///< guest GPU address per stage (0: disabled)
+    std::array<u64, 6> shader_hashes{}; ///< ShaderHashes() per stage
+    u32 rt_count{};
+    std::array<u64, 8> rt{};
+    std::array<u32, 8> rt_format{};
+    u32 rt_width{};
+    u32 rt_height{};
+    u64 zeta{};
+    u32 zeta_format{};
+    bool zeta_enable{};
+    u32 blend_enable{}; ///< bit per colour target
+    bool blend_per_target{};
+    std::array<u32, 6> blend0{}; ///< target 0: color op, src, dst, alpha op, src, dst
+    u32 color_mask0{};
+    bool depth_test{};
+    bool depth_write{};
+    u32 depth_func{};
+    bool cull{};
+    u32 cull_face{};
+    float line_width{};
+    std::array<float, 6> viewport0{}; ///< scale x y z, translate x y z
+    std::array<u64, 4> stream_address{};
+    std::array<u32, 4> stream_stride{};
+    u64 index_address{};
+    u32 index_format{};
+};
+
+/// Server thread: asks for the draws of the next whole frame (frame end to frame end).
+void RequestDrawList(u64 id);
+void CancelDrawList(u64 id);
+[[nodiscard]] std::optional<std::vector<DrawRecord>> WaitDrawList(u64 id,
+                                                                  std::chrono::milliseconds timeout);
+/// Rasterizer thread.
+[[nodiscard]] std::optional<u64> TakeDrawList();
+void FinishDrawList(u64 id, std::vector<DrawRecord> draws);
 
 /// Opens a debug server session (clears requests and rejections) or ends it (wakes waiters).
 void BeginSession();

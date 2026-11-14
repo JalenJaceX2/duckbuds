@@ -513,6 +513,78 @@ bool RasterizerVulkan::DebugSkipsDraw(u32 index, const GraphicsPipeline& pipelin
     return filter.rt0 != 0 && maxwell3d->regs.rt[0].Address() == filter.rt0;
 }
 
+void RasterizerVulkan::RecordDebugDraw(u32 index, bool is_indexed, bool is_indirect, bool skipped,
+                                       const GraphicsPipeline& pipeline) {
+    if (draw_list.size() >= 20000) {
+        return;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    VideoCore::Nx2Debug::DrawRecord& record = draw_list.emplace_back();
+    record.index = index;
+    record.topology = static_cast<u32>(draw.topology);
+    record.indexed = is_indexed;
+    record.indirect = is_indirect;
+    record.skipped = skipped;
+    record.count = is_indexed ? draw.index_buffer.count : draw.vertex_buffer.count;
+    record.first = is_indexed ? draw.index_buffer.first : draw.vertex_buffer.first;
+    record.instances = draw.instance_count;
+    for (size_t stage = 0; stage < record.programs.size(); ++stage) {
+        if (regs.IsShaderConfigEnabled(stage)) {
+            record.programs[stage] = (u64{regs.pipelines[stage].reserved[0] & 0xff} << 32) |
+                                     regs.pipelines[stage].reserved[1];
+        }
+    }
+    record.shader_hashes = pipeline.ShaderHashes();
+    record.rt_count = regs.rt_control.count;
+    for (u32 target = 0; target < (std::min)(record.rt_count, 8U); ++target) {
+        const auto& rt = regs.rt[regs.rt_control.Map(target)];
+        record.rt[target] = rt.Address();
+        record.rt_format[target] = static_cast<u32>(rt.format);
+    }
+    record.rt_width = regs.rt[0].width;
+    record.rt_height = regs.rt[0].height;
+    record.zeta = regs.zeta.Address();
+    record.zeta_format = static_cast<u32>(regs.zeta.format);
+    record.zeta_enable = regs.zeta_enable != 0;
+    for (u32 target = 0; target < 8; ++target) {
+        record.blend_enable |= (regs.blend.enable[target] != 0 ? 1U : 0U) << target;
+    }
+    record.blend_per_target = regs.blend_per_target_enabled != 0;
+    if (record.blend_per_target) {
+        const auto& blend = regs.blend_per_target[0];
+        record.blend0 = {static_cast<u32>(blend.color_op),  static_cast<u32>(blend.color_source),
+                         static_cast<u32>(blend.color_dest), static_cast<u32>(blend.alpha_op),
+                         static_cast<u32>(blend.alpha_source), static_cast<u32>(blend.alpha_dest)};
+    } else {
+        const auto& blend = regs.blend;
+        record.blend0 = {static_cast<u32>(blend.color_op),  static_cast<u32>(blend.color_source),
+                         static_cast<u32>(blend.color_dest), static_cast<u32>(blend.alpha_op),
+                         static_cast<u32>(blend.alpha_source), static_cast<u32>(blend.alpha_dest)};
+    }
+    record.color_mask0 = regs.color_mask[0].raw;
+    record.depth_test = regs.depth_test_enable != 0;
+    record.depth_write = regs.depth_write_enabled != 0;
+    record.depth_func = static_cast<u32>(regs.depth_test_func);
+    record.cull = regs.gl_cull_test_enabled != 0;
+    record.cull_face = static_cast<u32>(regs.gl_cull_face);
+    record.line_width = regs.line_width_aliased;
+    const auto& viewport = regs.viewport_transform[0];
+    record.viewport0 = {viewport.scale_x,     viewport.scale_y,     viewport.scale_z,
+                        viewport.translate_x, viewport.translate_y, viewport.translate_z};
+    for (size_t binding = 0; binding < record.stream_address.size(); ++binding) {
+        const auto& stream = regs.vertex_streams[binding];
+        if (stream.IsEnabled()) {
+            record.stream_address[binding] = stream.Address();
+            record.stream_stride[binding] = stream.stride.Value();
+        }
+    }
+    if (is_indexed) {
+        record.index_address = regs.index_buffer.StartAddress();
+        record.index_format = static_cast<u32>(regs.index_buffer.format);
+    }
+}
+
 RasterizerVulkan::~RasterizerVulkan() {
     VideoCommon::GpuSplit::Get().SetIdleHook(nullptr, nullptr);
     // The channels are gone by now, and submitting invalidates the state tracker's flags.
@@ -1339,6 +1411,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     // Debug server draw_skip: everything above is set up as usual, only the draw call is left out.
     const u32 debug_index = debug_draw_index++;
     const bool debug_skip = draw_filter && DebugSkipsDraw(debug_index, *pipeline);
+    if (draw_list_id) {
+        RecordDebugDraw(debug_index, is_indexed, is_indirect, debug_skip, *pipeline);
+    }
     {
         Profile::Scope scope{Profile::Zone::DrawRecord};
         scheduler.TraceGraphicsPipeline(pipeline->ShaderHashes());
@@ -3872,7 +3947,16 @@ void RasterizerVulkan::FrameDumpPass(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::TickFrame() {
+    // A draw_list request records from one frame end to the next.
+    if (draw_list_id) {
+        VideoCore::Nx2Debug::FinishDrawList(*draw_list_id, std::exchange(draw_list, {}));
+        draw_list_id.reset();
+    }
     if (VideoCore::Nx2Debug::HasRequests()) {
+        if (const auto id = VideoCore::Nx2Debug::TakeDrawList()) {
+            draw_list_id = id;
+            draw_list.clear();
+        }
         if (auto capture = VideoCore::Nx2Debug::TakeCapture()) {
             frame_dump.Arm(std::move(capture->directory), capture->sampled, capture->buffers,
                            capture->id);

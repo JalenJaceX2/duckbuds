@@ -79,6 +79,7 @@ struct ToolState {
     u64 screenshots{};
     u64 samples{};
     u64 gpu_reads{};
+    u64 draw_lists{};
     std::atomic<bool> stopping{};
 };
 
@@ -526,6 +527,106 @@ json DrawSkip(ToolState&, const json& params) {
     return result;
 }
 
+/// The graphics draws of the next whole frame with their shaders and state; with save (default)
+/// also written as drawlist-<session>-<n>.json to the dump directory.
+json DrawList(ToolState& state, const json& params) {
+    if (!IsVulkan()) {
+        throw std::runtime_error{"draw_list needs the Vulkan renderer"};
+    }
+    const u64 id = ++state.draw_lists;
+    const int timeout = Param<int>(params, "timeout_s", 10, 1, 60);
+    VideoCore::Nx2Debug::RequestDrawList(id);
+    const auto draws = VideoCore::Nx2Debug::WaitDrawList(id, std::chrono::seconds{timeout});
+    if (!draws) {
+        VideoCore::Nx2Debug::CancelDrawList(id);
+        throw std::runtime_error{
+            fmt::format("no whole frame was presented within {} s (paused or loading?)", timeout)};
+    }
+    const auto hex = [](u64 value) { return fmt::format("{:016x}", value); };
+    json list = json::array();
+    size_t skipped = 0;
+    for (const auto& draw : *draws) {
+        skipped += draw.skipped ? 1 : 0;
+        json programs = json::array();
+        json hashes = json::array();
+        for (size_t stage = 0; stage < draw.programs.size(); ++stage) {
+            programs.push_back(HexAddress(draw.programs[stage]));
+            hashes.push_back(hex(draw.shader_hashes[stage]));
+        }
+        json targets = json::array();
+        for (u32 target = 0; target < (std::min)(draw.rt_count, 8U); ++target) {
+            targets.push_back({{"address", HexAddress(draw.rt[target])},
+                               {"format", fmt::format("{:#x}", draw.rt_format[target])}});
+        }
+        json streams = json::array();
+        for (size_t binding = 0; binding < draw.stream_address.size(); ++binding) {
+            if (draw.stream_address[binding] != 0) {
+                streams.push_back({{"binding", binding},
+                                   {"address", HexAddress(draw.stream_address[binding])},
+                                   {"stride", draw.stream_stride[binding]}});
+            }
+        }
+        json entry = {
+            {"index", draw.index},
+            {"topology", draw.topology},
+            {"indexed", draw.indexed},
+            {"indirect", draw.indirect},
+            {"skipped", draw.skipped},
+            {"count", draw.count},
+            {"first", draw.first},
+            {"instances", draw.instances},
+            {"vs", hex(draw.shader_hashes[1])},
+            {"ps", hex(draw.shader_hashes[5])},
+            {"vs_address", HexAddress(draw.programs[1])},
+            {"ps_address", HexAddress(draw.programs[5])},
+            {"programs", std::move(programs)},
+            {"shader_hashes", std::move(hashes)},
+            {"rt0", HexAddress(draw.rt[0])},
+            {"targets", std::move(targets)},
+            {"rt_size", {draw.rt_width, draw.rt_height}},
+            {"depth", {{"address", HexAddress(draw.zeta)},
+                       {"format", fmt::format("{:#x}", draw.zeta_format)},
+                       {"enabled", draw.zeta_enable},
+                       {"test", draw.depth_test},
+                       {"write", draw.depth_write},
+                       {"func", fmt::format("{:#x}", draw.depth_func)}}},
+            {"blend", {{"enable_mask", draw.blend_enable},
+                       {"per_target", draw.blend_per_target},
+                       {"rt0", draw.blend0}}},
+            {"color_mask0", fmt::format("{:#x}", draw.color_mask0)},
+            {"cull", {{"enabled", draw.cull}, {"face", fmt::format("{:#x}", draw.cull_face)}}},
+            {"line_width", draw.line_width},
+            {"viewport0", draw.viewport0},
+            {"streams", std::move(streams)},
+        };
+        if (draw.indexed) {
+            entry["index_buffer"] = {{"address", HexAddress(draw.index_address)},
+                                     {"format", draw.index_format}};
+        }
+        list.push_back(std::move(entry));
+    }
+    json result = {{"draws_total", draws->size()},
+                   {"skipped", skipped},
+                   {"topologies",
+                    "0 points, 1 lines, 2 line loop, 3 line strip, 4 triangles, 5 strip, 6 fan, "
+                    "7 quads, 10/11 line adjacency, 12/13 triangle adjacency, 14 patches"}};
+    if (params.value("save", true)) {
+        std::filesystem::create_directories(state.dump_directory);
+        const auto path =
+            state.dump_directory / fmt::format("drawlist-{}-{:03}.json", state.session, id);
+        std::ofstream file{path};
+        file << json{{"draws", list}}.dump(1);
+        if (!file) {
+            throw std::runtime_error{fmt::format("cannot write {}", path.generic_string())};
+        }
+        result["path"] = path.generic_string();
+    }
+    if (params.value("inline", true)) {
+        result["draws"] = std::move(list);
+    }
+    return result;
+}
+
 json SampleThreads(ToolState& state, const json& params) {
     const std::string threads = params.value("threads", std::string{"GPU,GPUBack"});
     const double seconds = Param<double>(params, "seconds", 10.0, 1.0, 60.0);
@@ -750,6 +851,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
         {"draw_skip", handler(DrawSkip)},
+        {"draw_list", handler(DrawList)},
         {"sample", handler(SampleThreads)},
         {"speed_limit", handler(SpeedLimit)},
         {"host_timing", handler(HostTiming)},

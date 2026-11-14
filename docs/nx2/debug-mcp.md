@@ -261,6 +261,16 @@ changes at a frame end, like `reject_shaders`. `spec` takes the `EDEN_NX2_DRAW_S
 (`range=a-b;ps=<hash>,...;vs=...;lines=1;rt0=0x...`), which applies the same filter from boot.
 Draws through `DrawTexture`, clears and blits are not counted or skipped.
 
+**`draw_list`** `{save?, inline?, timeout_s?}` records the graphics draws of the next whole
+frame (frame end to frame end, at most 20000) right before each draw call, in the order and with
+the indices `draw_skip` uses: topology, indexed/indirect, count, first, instances, every stage's
+guest address and shader hash (`vs`, `ps` for the vertex and pixel ones), colour targets (address,
+format), render target size, depth target and test/write/func, blend enable mask and target 0's
+equation, colour mask, cull, line width, viewport 0, the first four vertex streams (address,
+stride) and the index buffer. Draws a filter skipped are listed with `skipped: true`. With `save`
+(default) the list also goes to `drawlist-<session>-<n>.json` in the dump directory. Read a draw's
+raw vertex or index data with `read_gpu_memory` at the stream address.
+
 ### Guest and GPU memory (implemented)
 
 All three are read only. Reads return at most 64 KiB. Addresses are hex strings (`"0x8012345000"`)
