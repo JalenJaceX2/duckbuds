@@ -3477,8 +3477,11 @@ private:
         VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodFast);
     const bool perf_slow_cb_batch =
         VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodCbBatch);
+    // The Duskbloods takes the pre-#1585 path too (EDEN_NX2_DUSK_BACKX_PIECES=state_blocks
+    // keeps the blocks).
     const bool perf_slow_state_blocks =
-        VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::StateBlocks);
+        VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::StateBlocks) ||
+        VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::StateBlocks);
     const bool reg_block_verify = [] {
         const char* value = std::getenv("EDEN_NX2_REG_BLOCK_VERIFY");
         return value != nullptr && value[0] == '1';
