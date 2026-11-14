@@ -19,6 +19,7 @@
 #include <optional>
 #include <source_location>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -402,6 +403,15 @@ public:
     void BindHostGeometryBuffers(bool is_indexed);
 
     void BindHostStageBuffers(size_t stage);
+
+    /// Traces the storage buffers of the next draw's stages (The Duskbloods' ribbon pipeline
+    /// with the debug server or EDEN_NX2_DUSK_RIBBON=diag): bound ranges, whether their pages were
+    /// uploaded or clean, GPU-written or not, and SSBO 0's first 64 guest bytes.
+    void Nx2SsboDiagBegin(bool on) {
+        nx2_ssbo_diag = on;
+        nx2_ssbo_diag_text.clear();
+        nx2_ssbo_diag_shape.clear();
+    }
 
     void BindHostComputeBuffers();
 
@@ -1232,6 +1242,14 @@ private:
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
     bool nx2_collect_list_copies{};
+
+    // Nx2SsboDiagBegin: the storage buffers of one traced pipeline's draw, logged at its fragment
+    // stage when their shape changes.
+    bool nx2_ssbo_diag{};
+    std::string nx2_ssbo_diag_text;
+    std::string nx2_ssbo_diag_shape;
+    std::string nx2_ssbo_diag_last_shape;
+    u32 nx2_ssbo_diag_lines{};
 };
 
 } // namespace VideoCommon

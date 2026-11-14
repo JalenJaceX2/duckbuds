@@ -536,7 +536,7 @@ struct System::Impl {
             LOG_INFO(Core,
                      "Duskbloods variants: stack lowering {}, host-timing wait {}, upload stale {}, "
                      "GPU-only regions {}, totals {} remote memory, AOFFI gather {}, "
-                     "host-timing priority {}",
+                     "host-timing priority {}, compute write mark {}, compute size word {}, ribbon {}",
                      env("EDEN_NX2_DUSK_STACK") == "upstream" ? "upstream (#1490)" : "v25 (fold)",
                      flag("EDEN_NX2_HOSTTIMING_SPIN", true) ? "spin (v2.5)" : "OS sleep (#1016)",
                      env("EDEN_NX2_UPLOAD_STALE").empty() || env("EDEN_NX2_UPLOAD_STALE")[0] == '1'
@@ -549,7 +549,14 @@ struct System::Impl {
                      env("EDEN_NX2_TOTAL_MINUS_REMOTE").starts_with('1') ? "minus (#552)"
                                                                          : "include (v2.5)",
                      env("EDEN_NX2_DUSK_GATHER") == "draw" ? "draw (#1363)" : "skip (v2.5)",
-                     flag("EDEN_NX2_HOSTTIMING_PRIO", true) ? "time critical" : "very high");
+                     flag("EDEN_NX2_HOSTTIMING_PRIO", true) ? "time critical" : "very high",
+                     env("EDEN_NX2_DUSK_SSBO_MARK") == "auto" ? "store extent (#816)"
+                                                              : "whole binding (v2.5)",
+                     env("EDEN_NX2_DUSK_SSBO_SIZE") == "v25" ? "8 MiB cap (v2.5)"
+                                                             : "read (#1231)",
+                     env("EDEN_NX2_DUSK_RIBBON") == "skip"   ? "skipped"
+                     : env("EDEN_NX2_DUSK_RIBBON") == "diag" ? "drawn, traced"
+                                                             : "drawn");
         }
 
         // Track launch time for frontend launches

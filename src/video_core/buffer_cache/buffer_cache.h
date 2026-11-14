@@ -15,6 +15,7 @@
 #include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <fmt/ranges.h>
@@ -1686,6 +1687,20 @@ void BufferCache<P>::BindHostStageBuffers(size_t stage) {
     if (channel_state->enabled_texture_buffers[stage] != 0) {
         BindHostGraphicsTextureBuffers(stage);
     }
+    if (nx2_ssbo_diag && stage == NUM_STAGES - 1) {
+        nx2_ssbo_diag = false;
+        // Once, then whenever the shape (stages, clean/uploaded, GPU-written, SSBO 0 zero) changes.
+        if (nx2_ssbo_diag_shape != nx2_ssbo_diag_last_shape && nx2_ssbo_diag_lines < 256) {
+            ++nx2_ssbo_diag_lines;
+            nx2_ssbo_diag_last_shape = nx2_ssbo_diag_shape;
+            const Binding& vertex = channel_state->vertex_buffers[0];
+            const Binding& index = channel_state->index_buffer;
+            LOG_INFO(HW_GPU,
+                     "Duskbloods ribbon draw: vertex 0 {:#x}+{:#x}, index {:#x}+{:#x};{}",
+                     vertex.device_addr, vertex.size, index.device_addr, index.size,
+                     nx2_ssbo_diag_text);
+        }
+    }
 }
 
 template <class P>
@@ -1972,7 +1987,16 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
     // binding is up to 8 MiB past it, and marking all of it defers the CPU's later writes to those
     // pages until the next fence and has fences copy the over-marked range back.
     u64 mark = binding.size;
-    if (native_pointer && is_written && binding.size != 0) {
+    // EDEN_NX2_DUSK_SSBO_MARK: unset or anything but "auto" marks the whole binding for The
+    // Duskbloods, as dusk-v2.5 (before #816). Its particle compute (d4b9d21ade153251) writes far
+    // past the proven extent, into the records its ribbon tessellation programs read; unmarked,
+    // those bytes counted as clean guest memory (zeros) and the ribbons drew long red beams.
+    static const bool dusk_full_mark = [] {
+        const char* value = std::getenv("EDEN_NX2_DUSK_SSBO_MARK");
+        return Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL &&
+               (value == nullptr || std::string_view{value} != "auto");
+    }();
+    if (native_pointer && is_written && binding.size != 0 && !dusk_full_mark) {
         switch (Settings::values.native_compute_write_mark.GetValue()) {
         case Settings::NativeComputeWriteMark::Auto: {
             const auto& qmd = launch_desc;
@@ -2799,12 +2823,36 @@ void BufferCache<P>::BindHostGraphicsStorageBuffers(size_t stage) {
         const Binding& binding = channel_state->storage_buffers[stage][index];
         const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
         if (BindMultiRangeStorage(binding, is_written, graphics_segments)) {
+            if (nx2_ssbo_diag) {
+                nx2_ssbo_diag_text += fmt::format(" s{}[{}] {:#x}+{:#x} multi-range;", stage,
+                                                  index, binding.gpu_addr, binding.size);
+                nx2_ssbo_diag_shape += fmt::format("s{}[{}]m;", stage, index);
+            }
             return;
         }
         Buffer& buffer = slot_buffers[binding.buffer_id];
         TouchBuffer(buffer, binding.buffer_id);
         const u32 size = binding.size;
-        SynchronizeBuffer(buffer, binding.device_addr, size);
+        const bool clean = SynchronizeBuffer(buffer, binding.device_addr, size);
+        if (nx2_ssbo_diag) {
+            const bool gpu_written = IsRegionGpuModified(binding.device_addr, size);
+            nx2_ssbo_diag_text += fmt::format(" s{}[{}] {:#x}+{:#x} {} {}{};", stage, index,
+                                              binding.gpu_addr, size,
+                                              clean ? "clean" : "uploaded",
+                                              gpu_written ? "gpu-written" : "cpu",
+                                              is_written ? " written" : "");
+            nx2_ssbo_diag_shape += fmt::format("s{}[{}]{}{}{};", stage, index, clean ? 'c' : 'u',
+                                               gpu_written ? 'g' : 'p', size > 16_MiB ? 'L' : 'S');
+            if (index == 0) {
+                std::array<u8, 64> bytes{};
+                device_memory.ReadBlockUnsafe(binding.device_addr, bytes.data(),
+                                              (std::min<size_t>)(bytes.size(), size));
+                const bool zero = std::ranges::all_of(bytes, [](u8 byte) { return byte == 0; });
+                nx2_ssbo_diag_text += fmt::format(" ssbo0 guest[0,64)={:02x};",
+                                                  fmt::join(bytes, ""));
+                nx2_ssbo_diag_shape += zero ? "z;" : "d;";
+            }
+        }
 
         const u32 offset = buffer.Offset(binding.device_addr);
         buffer.MarkUsage(offset, size);
@@ -4330,7 +4378,15 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                 // came back zero and lit land and characters too dark. A read-only compute binding
                 // takes a larger size word. Binding to the end of the mapping instead spanned
                 // Ocarina of Time's ~1 GiB heap and backed it with a 1 GiB buffer.
-                if (compute && !is_written && next_qword_is_size && packed_size > bare) {
+                // EDEN_NX2_DUSK_SSBO_SIZE=v25: The Duskbloods keeps dusk-v2.5's 8 MiB cap (A/B for
+                // its fog compute, which reads ~100 MiB bindings since #1231).
+                static const bool dusk_v25_size = [] {
+                    const char* value = std::getenv("EDEN_NX2_DUSK_SSBO_SIZE");
+                    return Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL &&
+                           value != nullptr && std::string_view{value} == "v25";
+                }();
+                if (compute && !is_written && next_qword_is_size && packed_size > bare &&
+                    !dusk_v25_size) {
                     return (std::min)(packed_size, limit);
                 }
                 return bare;

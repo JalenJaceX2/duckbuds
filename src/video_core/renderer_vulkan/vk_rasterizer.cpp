@@ -485,6 +485,14 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
             LOG_ERROR(Render_Vulkan, "EDEN_NX2_DRAW_SKIP={}: {}; ignored", skip, error.what());
         }
     }
+    // EDEN_NX2_DUSK_RIBBON=skip (opt-in): The Duskbloods' tessellated ribbon pipeline (vs
+    // 716237219b1f36da, ps 0c32a6d83f88e18d) is left out, unless EDEN_NX2_DRAW_SKIP set a filter.
+    if (const char* const ribbon = std::getenv("EDEN_NX2_DUSK_RIBBON");
+        ribbon && std::string_view{ribbon} == "skip" && !draw_filter &&
+        Settings::GetCurrentProgramID() == VideoCommon::FireEmblemUpscale::DuskbloodsProgramId) {
+        draw_filter = VideoCore::Nx2Debug::ParseDrawFilter("vs=716237219b1f36da");
+        LOG_WARNING(Render_Vulkan, "EDEN_NX2_DUSK_RIBBON=skip: ribbon draws are skipped");
+    }
 }
 
 bool RasterizerVulkan::DebugSkipsDraw(u32 index, const GraphicsPipeline& pipeline) const {
