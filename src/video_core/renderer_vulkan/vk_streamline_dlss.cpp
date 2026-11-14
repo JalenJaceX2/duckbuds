@@ -6,16 +6,22 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 
+#include <fmt/format.h>
+
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/dlss_evaluation.h"
 #include "video_core/dlss_mode.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_base.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
@@ -46,6 +52,52 @@ bool Evaluated(sl::Result result) {
 int EnvInt(const char* name, int fallback) {
     const char* const value = std::getenv(name);
     return value ? std::atoi(value) : fallback;
+}
+
+using Clock = std::chrono::steady_clock;
+
+u64 Nanoseconds(Clock::duration duration) {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+}
+
+/// "DLSS stats:" counters. The GPU thread adds its submit time and the rare events; the
+/// scheduler's worker adds its evaluate time and writes the line about once a second.
+struct Stats {
+    std::atomic<u64> submits{};
+    std::atomic<u64> submit_ns{};
+    std::atomic<u64> submit_max_ns{};
+    std::atomic<u64> resets{};
+    std::atomic<u64> reselects{};
+    std::atomic<u64> rebuilds{};
+    std::atomic<u64> finishes{};
+    std::atomic<bool> fell_back{};
+    // The worker's
+    u64 frames{};
+    u64 eval_ns{};
+    u64 eval_max_ns{};
+    Clock::time_point since{};
+};
+Stats stats;
+
+void PublishStats(std::string line) {
+    std::scoped_lock lock{VideoCommon::Nx2Perf::g_dlss_stats_mutex};
+    VideoCommon::Nx2Perf::g_dlss_stats = std::move(line);
+}
+
+std::string EventCounts() {
+    return fmt::format("resets={} reselects={} rebuilds={} finishes={} sl_problems={}",
+                       stats.resets.load(std::memory_order_relaxed),
+                       stats.reselects.load(std::memory_order_relaxed),
+                       stats.rebuilds.load(std::memory_order_relaxed),
+                       stats.finishes.load(std::memory_order_relaxed),
+                       Streamline::LoggedProblems());
+}
+
+std::string PresetName(sl::DLSSPreset preset) {
+    if (preset == sl::DLSSPreset::eDefault) {
+        return "default";
+    }
+    return std::string(1, static_cast<char>('A' + static_cast<int>(preset) - 1));
 }
 
 sl::DLSSMode ModeFor(Settings::NvidiaDlssQuality mode) {
@@ -415,8 +467,10 @@ StreamlineDlssUpscaler::~StreamlineDlssUpscaler() {
 
 void StreamlineDlssUpscaler::CreateOutput(VkExtent2D upscale_size) {
     if (output_image) {
+        stats.finishes.fetch_add(1, std::memory_order_relaxed);
         scheduler.Finish(); // the old output may still be in use
     }
+    stats.rebuilds.fetch_add(1, std::memory_order_relaxed);
     output_image = memory_allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
@@ -479,6 +533,15 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     if (failed) {
         return false;
     }
+    const Clock::time_point submit_begin = Clock::now();
+    SCOPE_EXIT {
+        const u64 ns = Nanoseconds(Clock::now() - submit_begin);
+        stats.submits.fetch_add(1, std::memory_order_relaxed);
+        stats.submit_ns.fetch_add(ns, std::memory_order_relaxed);
+        if (ns > stats.submit_max_ns.load(std::memory_order_relaxed)) {
+            stats.submit_max_ns.store(ns, std::memory_order_relaxed);
+        }
+    };
     // Only the output size rebuilds the output. A new render size (dynamic resolution) keeps the
     // history; the worker picks another mode only when it leaves the mode's range.
     const bool extent_changed = !output_image || in.upscale_size.width != upscale_extent.width ||
@@ -488,7 +551,11 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                                  quality_mode != settings.quality ||
                                  model_preset != settings.preset;
     const bool reset = in.reset || options_changed;
+    if (reset) {
+        stats.resets.fetch_add(1, std::memory_order_relaxed);
+    }
     if (options_changed && !extent_changed) {
+        stats.finishes.fetch_add(1, std::memory_order_relaxed);
         scheduler.Finish();
     }
     if (extent_changed) {
@@ -504,11 +571,17 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     sl::DLSSOptions options{};
     options.outputWidth = in.upscale_size.width;
     options.outputHeight = in.upscale_size.height;
-    options.colorBuffersHDR =
-        in.hdr && EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0 ? sl::eTrue : sl::eFalse;
-    options.useAutoExposure =
-        in.hdr && EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0 ? sl::eTrue : sl::eFalse;
-    const sl::DLSSPreset preset = PresetFor(settings.preset);
+    static const bool hdr_allowed = EnvInt("EDEN_NX2_DLSS_HDR", 1) != 0;
+    static const bool auto_exposure_allowed = EnvInt("EDEN_NX2_DLSS_AUTO_EXPOSURE", 1) != 0;
+    options.colorBuffersHDR = in.hdr && hdr_allowed ? sl::eTrue : sl::eFalse;
+    options.useAutoExposure = in.hdr && auto_exposure_allowed ? sl::eTrue : sl::eFalse;
+    // The Duskbloods on Automatic with the default preset (M): NVIDIA's own preset for the mode,
+    // K at the Balanced mode its ~0.58 render scale picks. M costs more, most on RTX 20 and 30.
+    const bool nvidia_preset = settings.quality == Settings::NvidiaDlssQuality::Automatic &&
+                               settings.preset == Settings::NvidiaDlssPreset::M &&
+                               Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL;
+    const sl::DLSSPreset preset =
+        nvidia_preset ? sl::DLSSPreset::eDefault : PresetFor(settings.preset);
     options.dlaaPreset = preset;
     options.qualityPreset = preset;
     options.balancedPreset = preset;
@@ -563,6 +636,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                       preset_setting = settings.preset, index, constants, set_constants,
                       frame_gen, frame_gen_inputs, output_image_handle = *output_image,
                       output_view_handle = *output_view](vk::CommandBuffer cmdbuf) {
+        const Clock::time_point eval_begin = Clock::now();
         const Streamline::Api& api = Streamline::GetApi();
         const sl::ViewportHandle viewport{0u};
         // The caller draws the output this frame even when DLSS writes nothing to it: clear it
@@ -670,6 +744,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                                mode_range)) {
                     return true;
                 }
+                stats.reselects.fetch_add(1, std::memory_order_relaxed);
                 auto validated = options;
                 const auto selection = Mode::Select(
                     requested, {in.render_size.width, in.render_size.height},
@@ -759,6 +834,11 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                       static_cast<int>(result), static_cast<int>(api_result));
         }
         if (result != VideoCommon::DlssEvaluationResult::Succeeded) {
+            static constexpr std::array<std::string_view, 5> STAGES{
+                "succeeded", "options", "frame_token", "constants", "evaluate"};
+            NoteFallback(fmt::format("{} failed, Streamline result {}",
+                                     STAGES[static_cast<size_t>(result)],
+                                     static_cast<int>(api_result)));
             clear_output();
             return;
         }
@@ -776,10 +856,55 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                      static_cast<int>(options.dlaaPreset),
                      static_cast<double>(state.estimatedVRAMUsageInBytes) / 1e6);
         }
+
+        const Clock::time_point now = Clock::now();
+        const u64 eval_ns = Nanoseconds(now - eval_begin);
+        if (stats.since == Clock::time_point{}) {
+            stats.since = eval_begin;
+        }
+        ++stats.frames;
+        stats.eval_ns += eval_ns;
+        stats.eval_max_ns = (std::max)(stats.eval_max_ns, eval_ns);
+        if (now - stats.since < std::chrono::seconds{1}) {
+            return;
+        }
+        const u64 submits = stats.submits.exchange(0, std::memory_order_relaxed);
+        const u64 submit_ns = stats.submit_ns.exchange(0, std::memory_order_relaxed);
+        const u64 submit_max_ns = stats.submit_max_ns.exchange(0, std::memory_order_relaxed);
+        std::string line = fmt::format(
+            "DLSS stats: frames={} secs={:.2f} total={} submit_us={}/{} eval_us={}/{} "
+            "render={}x{} output={}x{} mode={} preset={} preset_setting={} hdr={} "
+            "auto_exposure={} {} fallback=none",
+            stats.frames, std::chrono::duration<double>(now - stats.since).count(),
+            evaluations.load(std::memory_order_relaxed),
+            submits ? submit_ns / submits / 1000 : 0, submit_max_ns / 1000,
+            stats.eval_ns / stats.frames / 1000, stats.eval_max_ns / 1000, in.render_size.width,
+            in.render_size.height, in.upscale_size.width, in.upscale_size.height,
+            Settings::CanonicalizeEnum(evaluated_mode), PresetName(options.dlaaPreset),
+            Settings::CanonicalizeEnum(preset_setting),
+            options.colorBuffersHDR == sl::eTrue ? 1 : 0,
+            options.useAutoExposure == sl::eTrue ? 1 : 0, EventCounts());
+        LOG_INFO(Render_Vulkan, "{}", line);
+        PublishStats(std::move(line));
+        stats.frames = 0;
+        stats.eval_ns = 0;
+        stats.eval_max_ns = 0;
+        stats.since = now;
     });
     // DLSS binds its own pipelines and descriptors on the command buffer.
     scheduler.InvalidateState();
     return true;
+}
+
+void StreamlineDlssUpscaler::NoteFallback(std::string_view reason) {
+    if (stats.fell_back.exchange(true)) {
+        return;
+    }
+    std::string line = fmt::format("DLSS stats: total={} {} fallback={}",
+                                   evaluations.load(std::memory_order_relaxed), EventCounts(),
+                                   reason);
+    LOG_WARNING(Render_Vulkan, "{}", line);
+    PublishStats(std::move(line));
 }
 
 VideoCore::DlssStatus StreamlineDlssUpscaler::Status() {

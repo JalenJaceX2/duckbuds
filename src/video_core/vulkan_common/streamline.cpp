@@ -98,6 +98,8 @@ int LogLevel() {
     return value ? std::atoi(value) : 0;
 }
 
+std::atomic<u64> logged_problems{};
+
 void LogFromStreamline(sl::LogType type, const char* message) {
     std::string_view text{message ? message : ""};
     while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
@@ -105,9 +107,11 @@ void LogFromStreamline(sl::LogType type, const char* message) {
     }
     switch (type) {
     case sl::LogType::eError:
+        logged_problems.fetch_add(1, std::memory_order_relaxed);
         LOG_ERROR(Render_Vulkan, "Streamline: {}", text);
         break;
     case sl::LogType::eWarn:
+        logged_problems.fetch_add(1, std::memory_order_relaxed);
         LOG_WARNING(Render_Vulkan, "Streamline: {}", text);
         break;
     default:
@@ -536,18 +540,22 @@ bool FrameGenRequested() {
            }) == VideoCore::DlssgBlock::None;
 }
 
+bool Requested() {
+    // The setting, or EDEN_NX2_DLSS_REPLACEMENT=dlss (which leaves the setting alone).
+    static const bool env_dlss = [] {
+        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return value && std::string_view{value} == "dlss";
+    }();
+    return Settings::values.nvidia_dlss.GetValue() || env_dlss;
+}
+
 bool Start(void* window) {
     State& state = GetState();
     if (state.started) {
         return true;
     }
-    // Nothing of NVIDIA's is loaded and no swapchain call is hooked unless DLSS is asked for:
-    // the setting, or EDEN_NX2_DLSS_REPLACEMENT=dlss (which leaves the setting alone).
-    static const bool env_dlss = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "dlss";
-    }();
-    if (!Settings::values.nvidia_dlss.GetValue() && !env_dlss) {
+    // Nothing of NVIDIA's is loaded and no swapchain call is hooked unless DLSS is asked for.
+    if (!Requested()) {
         return false;
     }
     SetFrameGenReason(state, "NVIDIA Streamline did not start; the log above says why");
@@ -859,6 +867,10 @@ void DisableFrameGen(std::string_view reason) {
 bool IsDlssAvailable() {
     const State& state = GetState();
     return state.started && state.attached;
+}
+
+u64 LoggedProblems() {
+    return logged_problems.load(std::memory_order_relaxed);
 }
 
 bool FrameGenSession() {

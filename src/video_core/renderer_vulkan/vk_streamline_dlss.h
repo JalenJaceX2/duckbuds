@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <optional>
+#include <string_view>
 
 #include "common/common_types.h"
 #include "common/settings_enums.h"
@@ -81,6 +82,9 @@ public:
 
     /// Evaluations that succeeded in this process, for the status bar.
     [[nodiscard]] static VideoCore::DlssStatus Status();
+
+    /// Writes the last "DLSS stats:" line, once, with why FSR 3.1 takes over for the session.
+    static void NoteFallback(std::string_view reason);
 
     [[nodiscard]] VkImage OutputImage() const noexcept {
         return *output_image;

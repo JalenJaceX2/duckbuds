@@ -163,6 +163,10 @@ inline std::atomic<std::uint64_t> g_live_applied{};
 inline std::atomic<std::uint64_t> g_live_applied_frame{};
 inline std::mutex g_live_mutex;
 inline LiveState g_live_pending;
+/// The last "DLSS stats:" line (NVIDIA DLSS through Streamline), for the debug server's status;
+/// empty until DLSS has run.
+inline std::mutex g_dlss_stats_mutex;
+inline std::string g_dlss_stats;
 
 inline void StoreLive(const LiveState& state) {
     g_verify.store(state.verify, std::memory_order_relaxed);

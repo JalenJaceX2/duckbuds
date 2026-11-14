@@ -209,6 +209,10 @@ json Status(ToolState& state, const json& params) {
         {"dump_dir", state.dump_directory.generic_string()},
         {"log_filter", state.log_filter},
         {"rejected", HexList(VideoCore::Nx2Debug::RejectedHashes())},
+        {"dlss", [] {
+             std::scoped_lock lock{VideoCommon::Nx2Perf::g_dlss_stats_mutex};
+             return VideoCommon::Nx2Perf::g_dlss_stats;
+         }()},
     };
 }
 

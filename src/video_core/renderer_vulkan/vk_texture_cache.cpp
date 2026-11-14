@@ -1996,6 +1996,10 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
     if (!dlss_upscaler) {
         // Off in the settings, or Streamline didn't start: it has said why.
         if (!Streamline::IsDlssAvailable()) {
+            if (Streamline::Requested()) {
+                StreamlineDlssUpscaler::NoteFallback(
+                    "Streamline did not start or attach (see the log above)");
+            }
             dlss_unsupported = true;
             return false;
         }
@@ -2005,6 +2009,7 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         } catch (const vk::Exception& exception) {
             LOG_WARNING(Render_Vulkan, "NVIDIA DLSS unavailable ({}); using FSR 3.1",
                         exception.what());
+            StreamlineDlssUpscaler::NoteFallback(exception.what());
             dlss_unsupported = true;
             return false;
         }
@@ -2059,8 +2064,10 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
     } catch (const vk::Exception& exception) {
         LOG_WARNING(Render_Vulkan, "NVIDIA DLSS evaluation unavailable ({}); using FSR 3.1",
                     exception.what());
+        StreamlineDlssUpscaler::NoteFallback(exception.what());
     }
     if (!upscaled) {
+        StreamlineDlssUpscaler::NoteFallback("evaluation failed (see the log above)");
         dlss_unsupported = true;
         return false;
     }
