@@ -729,7 +729,7 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
             result = (std::min<size_t>)(size, std::prev(it)->end - gpu_addr);
         }
     }
-    if (VideoCommon::Nx2Perf::Verify()) {
+    if (VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MappingRuns)) {
         const size_t expected = MaxContinuousRangeUncached(gpu_addr, size);
         static std::atomic<u32> logged{};
         if (expected != result && logged.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -883,7 +883,7 @@ size_t MemoryManager::GetMemoryLayoutSize(GPUVAddr gpu_addr,
                      ? static_cast<size_t>((std::numeric_limits<s64>::max)() - address)
                      : static_cast<size_t>(it->first - address);
     }
-    if (VideoCommon::Nx2Perf::Verify()) {
+    if (VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::LayoutSize)) {
         const size_t expected = GetMemoryLayoutSizeUncached(gpu_addr);
         static std::atomic<u32> logged{};
         if (expected != result && logged.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -1058,7 +1058,7 @@ MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
         GetSubmappedRangeImpl<true>(gpu_addr, size, result);
         return result;
     }
-    if (VideoCommon::Nx2Perf::Verify()) {
+    if (VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::SubmappedRange)) {
         boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> walked{};
         GetSubmappedRangeImpl<true>(gpu_addr, size, walked);
         static std::atomic<u32> logged{};
@@ -1084,7 +1084,7 @@ MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) cons
         GetSubmappedRangeImpl<false>(gpu_addr, size, result);
         return result;
     }
-    if (VideoCommon::Nx2Perf::Verify()) {
+    if (VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::SubmappedRange)) {
         boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> walked{};
         GetSubmappedRangeImpl<false>(gpu_addr, size, walked);
         static std::atomic<u32> logged{};

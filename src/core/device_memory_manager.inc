@@ -899,7 +899,7 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
         std::ranges::adjacent_find(ranges, [](const auto& a, const auto& b) {
             return a.first > b.first || a.first + a.second >= b.first;
         }) == ranges.end();
-    if (separated && !VideoCommon::Nx2Perf::Verify()) {
+    if (separated && !VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::DeviceSeparated)) {
         const DAddr lock_begin = ranges.front().first;
         const DAddr lock_end = ranges.back().first + ranges.back().second;
         Common::ScopedRangeLock lk(counter_guard, lock_begin,

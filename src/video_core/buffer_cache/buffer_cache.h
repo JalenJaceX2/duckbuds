@@ -146,7 +146,7 @@ void BufferCache<P>::TickFrame() {
         }
     }
     if (const GeometryStats& stats = geometry_stats; frame_tick % 600 == 0 && stats.syncs != 0) {
-        if (Nx2Profile::Enabled() || Nx2Perf::Verify()) {
+        if (Nx2Profile::Enabled() || Nx2Perf::Slow(Nx2Perf::Site::GeometrySync)) {
             LOG_INFO(HW_GPU,
                      "Geometry upload scans in 600 frames: {} of {} skipped, {} verify mismatches",
                      stats.syncs_skipped, stats.syncs, stats.verify_mismatches);
@@ -257,7 +257,7 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
         const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
         const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
         if (!gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
-            if (!Nx2Perf::Verify()) {
+            if (!Nx2Perf::Slow(Nx2Perf::Site::WritePages)) {
                 if (engine_write) {
                     // Untracking the pages and tracking them again at the upload changed their
                     // host protection twice (two VirtualProtect calls each, ~4% of the GPU
@@ -2625,7 +2625,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
     }();
     if (native_bank &&
-        (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
+        (Nx2Perf::Slow(Nx2Perf::Site::NativeIndirectUniforms) || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
         !memory_tracker.IsRegionGpuModified(device_addr, size) &&
         native_indirect_uniforms_this_frame.insert(device_addr).second) {
         // The bank size is only an upper limit: stop at the end of the mapped memory.
@@ -3822,8 +3822,8 @@ template <class P>
 bool BufferCache<P>::SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size) {
     // An upload over a clean word of the tracker (word_manager.h) finds and changes nothing:
     // walk only the dirty ones. Verify walks every word and checks the clean words.
-    const bool skip_clean = !Nx2Perf::Verify();
-    if (Nx2Perf::Verify()) {
+    const bool skip_clean = !Nx2Perf::Slow(Nx2Perf::Site::CleanWords);
+    if (Nx2Perf::Slow(Nx2Perf::Site::CleanWords)) {
         static std::atomic<u32> logged{};
         if (!memory_tracker.CleanWordsHold(device_addr, size) &&
             logged.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -3916,7 +3916,7 @@ void BufferCache<P>::SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAd
         sync.device_addr == device_addr && sync.size == size &&
         sync.deletions == buffer_deletions) {
         ++geometry_stats.syncs_skipped;
-        if (Nx2Perf::Verify() && !SynchronizeBuffer(buffer, device_addr, size)) {
+        if (Nx2Perf::Slow(Nx2Perf::Site::GeometrySync) && !SynchronizeBuffer(buffer, device_addr, size)) {
             ++geometry_stats.verify_mismatches;
         }
         return;
@@ -4343,7 +4343,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
         const CachedBinding& cached = set[way];
         if (cached.owner == owner && cached.gpu_addr == gpu_addr &&
             cached.next_qword == next_qword && cached.serial == serial &&
-            cached.alignment == alignment && cached.flags == flags && !Nx2Perf::Verify()) {
+            cached.alignment == alignment && cached.flags == flags && !Nx2Perf::Slow(Nx2Perf::Site::StorageBindingCache)) {
             const Binding hit = cached.binding;
             std::rotate(set.begin(), set.begin() + way, set.begin() + way + 1);
             return hit;

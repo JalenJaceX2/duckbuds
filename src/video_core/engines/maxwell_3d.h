@@ -3470,14 +3470,19 @@ private:
     // model). Read per engine, not at static initialization, which runs before the frontend
     // loads nx2_switches.txt.
     const bool trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
-    // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY, read per engine like the switch above. Every
+    // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY/_SLOW, read per engine like the switch above. Every
     // method checks them, so they are members rather than function statics (MSVC reads a
     // thread-local to check a static's initialization on every call).
     const bool skip_same_value_writes = [] {
         const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
         return value == nullptr || value[0] != '0';
     }();
-    const bool perf_verify = VideoCommon::Nx2Perf::Verify();
+    const bool perf_slow_method =
+        VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodFast);
+    const bool perf_slow_cb_batch =
+        VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodCbBatch);
+    const bool perf_slow_state_blocks =
+        VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::StateBlocks);
     const bool reg_block_verify = [] {
         const char* value = std::getenv("EDEN_NX2_REG_BLOCK_VERIFY");
         return value != nullptr && value[0] == '1';

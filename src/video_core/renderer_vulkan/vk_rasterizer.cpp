@@ -78,6 +78,7 @@
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_fast_draw.h"
 #include "video_core/nx2_list_grid.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 
 namespace Vulkan {
@@ -4235,10 +4236,12 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
             return;
         }
     }
-    // EDEN_NX2_INLINE_DEFER=0: invalidate every cache at once (for comparisons).
+    // EDEN_NX2_INLINE_DEFER=0 (or EDEN_NX2_PERF_SLOW=inline_defer): invalidate every cache at
+    // once (for comparisons).
     static const bool defer = [] {
         const char* value = std::getenv("EDEN_NX2_INLINE_DEFER");
-        return value == nullptr || value[0] != '0';
+        return (value == nullptr || value[0] != '0') &&
+               !VideoCommon::Nx2Perf::SlowNamed(VideoCommon::Nx2Perf::Site::InlineDefer);
     }();
     // One cache at a time: holding both while waiting for either (std::lock) waited longer, the
     // fencing thread and CPU write traps holding one of them most of the time.
