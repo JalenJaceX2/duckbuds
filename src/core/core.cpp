@@ -535,7 +535,8 @@ struct System::Impl {
             };
             LOG_INFO(Core,
                      "Duskbloods variants: stack lowering {}, host-timing wait {}, upload stale {}, "
-                     "GPU-only regions {}, totals {} remote memory",
+                     "GPU-only regions {}, totals {} remote memory, AOFFI gather {}, "
+                     "host-timing priority {}",
                      env("EDEN_NX2_DUSK_STACK") == "upstream" ? "upstream (#1490)" : "v25 (fold)",
                      flag("EDEN_NX2_HOSTTIMING_SPIN", true) ? "spin (v2.5)" : "OS sleep (#1016)",
                      env("EDEN_NX2_UPLOAD_STALE").empty() || env("EDEN_NX2_UPLOAD_STALE")[0] == '1'
@@ -546,7 +547,9 @@ struct System::Impl {
                          ? "client tile backing (v2.5)"
                          : "server backed (#552)",
                      env("EDEN_NX2_TOTAL_MINUS_REMOTE").starts_with('1') ? "minus (#552)"
-                                                                         : "include (v2.5)");
+                                                                         : "include (v2.5)",
+                     env("EDEN_NX2_DUSK_GATHER") == "draw" ? "draw (#1363)" : "skip (v2.5)",
+                     flag("EDEN_NX2_HOSTTIMING_PRIO", true) ? "time critical" : "very high");
         }
 
         // Track launch time for frontend launches
