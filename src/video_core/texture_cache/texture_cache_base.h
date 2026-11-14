@@ -41,6 +41,7 @@
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
 #include "video_core/texture_cache/image_base.h"
@@ -314,6 +315,14 @@ public:
     /// Whether sampling the views now needs PrepareImageView: an image with an upload pending or
     /// a newer alias to copy in (fast draw delta draws keep their views and prepare none).
     [[nodiscard]] bool SampledViewsChange(std::span<const ImageViewInOut> views) const noexcept {
+        // alias_full_resolve (Nx2Perf): any sampled image with aliases takes the full path.
+        if (Nx2Perf::AliasOn(Nx2Perf::Alias::FullResolve) &&
+            std::ranges::any_of(views, [&](const ImageViewInOut& view) {
+                return PreparesImage(slot_image_views, view.id) &&
+                       !slot_images[slot_image_views[view.id].image_id].aliased_images.empty();
+            })) {
+            return true;
+        }
         return VideoCommon::SampledViewsChange(views, slot_image_views, slot_images);
     }
 
@@ -634,7 +643,7 @@ private:
     void MarkModification(ImageBase& image) noexcept;
 
     /// Synchronize image aliases, copying data if needed
-    void SynchronizeAliases(ImageId image_id);
+    void SynchronizeAliases(ImageId image_id, bool after_upload = false);
 
     /// Prepare an image view to be used
     void PrepareImageView(ImageViewId image_view_id, bool is_modification, bool invalidate);

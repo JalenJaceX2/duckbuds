@@ -3875,6 +3875,12 @@ void RasterizerVulkan::TickFrame() {
         std::scoped_lock lock{buffer_cache.mutex};
         VideoCommon::ResetUniformStreamReuse<BufferCacheRuntime>();
     }
+    if (VideoCommon::Nx2Perf::AliasOn(VideoCommon::Nx2Perf::Alias::Diag)) {
+        VideoCommon::Nx2Perf::FlushAliasStats(static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count()));
+    }
     if (VideoCore::Nx2Debug::HasRequests()) {
         if (const auto id = VideoCore::Nx2Debug::TakeDrawList()) {
             draw_list_id = id;

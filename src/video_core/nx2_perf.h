@@ -114,6 +114,19 @@ static_assert(ParseSlow("bogus,,mapping_runs").mask == 1u << static_cast<int>(Si
 inline constexpr std::uint32_t VerifyMask =
     ((1u << SiteNames.size()) - 1) & ~(1u << static_cast<std::uint32_t>(Site::InlineDefer));
 
+/// Texture alias controls for the Duskbloods exposure flicker (live through perf_flip, start
+/// switches EDEN_NX2_<NAME upper case>=1; all off is the normal behaviour).
+enum class Alias : std::uint32_t {
+    SyncAlways,    ///< SynchronizeAliases walks the aliases even when no alias tick is newer
+    FullResolve,   ///< fast draw delta draws take the full path when a sampled image has aliases
+    ResyncUpload,  ///< an upload of an aliased image copies GPU-written aliases of the same tick
+    Diag,          ///< per-second counts of alias work on images of at most 16x16
+    Count,
+};
+inline constexpr std::array<std::string_view, static_cast<std::size_t>(Alias::Count)> AliasNames{
+    "alias_sync_always", "alias_full_resolve", "alias_resync_upload", "alias_diag",
+};
+
 /// The live state. Start: the switches (ReadSwitch). Then the debug server's perf_slow and
 /// perf_flip (docs/nx2/debug-mcp.md), applied by RasterizerVulkan::TickFrame at a frame end.
 /// Every site reads it with one relaxed atomic load where it decides, and each decision is per
@@ -127,6 +140,7 @@ struct LiveState {
     int frames_ahead = -1;      ///< -1: the start switch, else 0/1 (EDEN_NX2_FRAMES_AHEAD)
     int fence_batch = -1;       ///< -1: the start switch, else 0/1 (EDEN_NX2_FENCE_BATCH)
     int sync_submit = -1;       ///< -1: the start switch, else 0/1 (EDEN_NX2_SYNC_SUBMIT)
+    std::uint32_t alias{};      ///< Alias bits
 
     [[nodiscard]] std::uint32_t Effective() const noexcept {
         return named | (verify ? VerifyMask : 0);
@@ -142,6 +156,7 @@ inline std::atomic<int> g_uboreuse{-1};
 inline std::atomic<int> g_frames_ahead{-1};
 inline std::atomic<int> g_fence_batch{-1};
 inline std::atomic<int> g_sync_submit{-1};
+inline std::atomic<std::uint32_t> g_alias{};
 /// Live changes requested / applied, and the rasterizer frame of the last applied one.
 inline std::atomic<std::uint64_t> g_live_requested{};
 inline std::atomic<std::uint64_t> g_live_applied{};
@@ -158,6 +173,7 @@ inline void StoreLive(const LiveState& state) {
     g_frames_ahead.store(state.frames_ahead, std::memory_order_relaxed);
     g_fence_batch.store(state.fence_batch, std::memory_order_relaxed);
     g_sync_submit.store(state.sync_submit, std::memory_order_relaxed);
+    g_alias.store(state.alias, std::memory_order_relaxed);
 }
 
 [[nodiscard]] inline LiveState CurrentLive() {
@@ -169,6 +185,7 @@ inline void StoreLive(const LiveState& state) {
         .frames_ahead = g_frames_ahead.load(std::memory_order_relaxed),
         .fence_batch = g_fence_batch.load(std::memory_order_relaxed),
         .sync_submit = g_sync_submit.load(std::memory_order_relaxed),
+        .alias = g_alias.load(std::memory_order_relaxed),
     };
 }
 
@@ -216,9 +233,9 @@ inline bool ApplyLive(std::uint64_t frame) {
     g_live_applied.store(requested, std::memory_order_release);
     LOG_INFO(HW_GPU,
              "Nx2Perf live change #{} at frame {}: verify={} dusk_off={:#x} uboreuse={} "
-             "frames_ahead={} fence_batch={} sync_submit={} sites: {}",
+             "frames_ahead={} fence_batch={} sync_submit={} alias={:#x} sites: {}",
              requested, frame, state.verify ? 1 : 0, state.dusk_off, state.uboreuse,
-             state.frames_ahead, state.fence_batch, state.sync_submit,
+             state.frames_ahead, state.fence_batch, state.sync_submit, state.alias,
              SitesText(state.Effective()));
     return true;
 }
@@ -237,9 +254,18 @@ inline void ReadSwitch() {
     if (const char* defer = std::getenv("EDEN_NX2_INLINE_DEFER"); defer && defer[0] == '0') {
         state.named |= 1u << static_cast<std::uint32_t>(Site::InlineDefer);
     }
+    for (std::size_t i = 0; i < AliasNames.size(); ++i) {
+        std::string name = "EDEN_NX2_";
+        for (const char c : AliasNames[i]) {
+            name += static_cast<char>(c >= 'a' && c <= 'z' ? c - 'a' + 'A' : c);
+        }
+        if (const char* value = std::getenv(name.c_str()); value && value[0] == '1') {
+            state.alias |= 1u << i;
+        }
+    }
     StoreLive(state);
-    LOG_INFO(HW_GPU, "Nx2Perf sites (PERF_VERIFY={}): {}", state.verify ? 1 : 0,
-             SitesText(state.Effective()));
+    LOG_INFO(HW_GPU, "Nx2Perf sites (PERF_VERIFY={}, alias={:#x}): {}", state.verify ? 1 : 0,
+             state.alias, SitesText(state.Effective()));
 }
 
 inline bool Verify() {
@@ -261,6 +287,51 @@ inline bool SlowNamed(Site site) {
 [[nodiscard]] inline bool LiveOr(const std::atomic<int>& live, bool start) {
     const int value = live.load(std::memory_order_relaxed);
     return value < 0 ? start : value != 0;
+}
+
+[[nodiscard]] inline bool AliasOn(Alias control) {
+    return (g_alias.load(std::memory_order_relaxed) >> static_cast<std::uint32_t>(control) & 1) != 0;
+}
+
+/// alias_diag counts (texture cache thread), images of at most 16x16 only.
+enum class AliasStat : std::uint32_t {
+    Skipped,     ///< SynchronizeAliases returned at the newest_alias_tick check
+    NoNewer,     ///< walked, no alias newer
+    Synced,      ///< walked and copied (one per image sync)
+    Uploads,     ///< uploads from guest memory of an image with aliases
+    CreatedAlias,///< created with at least one alias
+    CreatedBad,  ///< created with a bad overlap and no alias
+    Count,
+};
+inline constexpr std::array<std::string_view, static_cast<std::size_t>(AliasStat::Count)>
+    AliasStatNames{"skipped", "no_newer", "synced", "uploads", "created_alias", "created_bad"};
+inline std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(AliasStat::Count)>
+    g_alias_stats{};
+/// The last whole second's counts (perf_sites "alias_stats").
+inline std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(AliasStat::Count)>
+    g_alias_stats_last{};
+
+inline void NoteAlias(AliasStat stat, std::uint32_t width, std::uint32_t height) {
+    if (width <= 16 && height <= 16 && AliasOn(Alias::Diag)) {
+        g_alias_stats[static_cast<std::size_t>(stat)].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+/// Rasterizer thread, each frame end: at most once a second, logs and keeps the counts.
+inline void FlushAliasStats(std::uint64_t now_ms) {
+    static std::uint64_t last_ms{};
+    if (!AliasOn(Alias::Diag) || now_ms - last_ms < 1000) {
+        return;
+    }
+    last_ms = now_ms;
+    std::string text;
+    for (std::size_t i = 0; i < g_alias_stats.size(); ++i) {
+        const std::uint64_t count = g_alias_stats[i].exchange(0, std::memory_order_relaxed);
+        g_alias_stats_last[i].store(count, std::memory_order_relaxed);
+        text += (text.empty() ? "" : " ") + std::string{AliasStatNames[i]} + "=" +
+                std::to_string(count);
+    }
+    LOG_INFO(HW_GPU, "Alias sync (images <= 16x16, last second): {}", text);
 }
 
 } // namespace VideoCommon::Nx2Perf

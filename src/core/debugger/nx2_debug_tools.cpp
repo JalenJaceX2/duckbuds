@@ -566,6 +566,21 @@ json LiveJson(const Perf::LiveState& live) {
         {"frames_ahead", control(live.frames_ahead)},
         {"fence_batch", control(live.fence_batch)},
         {"sync_submit", control(live.sync_submit)},
+        {"alias", [&] {
+             json alias = json::object();
+             for (size_t i = 0; i < Perf::AliasNames.size(); ++i) {
+                 alias[std::string{Perf::AliasNames[i]}] = (live.alias >> i & 1) != 0 ? 1 : 0;
+             }
+             return alias;
+         }()},
+        {"alias_stats", [] {
+             json stats = json::object();
+             for (size_t i = 0; i < Perf::AliasStatNames.size(); ++i) {
+                 stats[std::string{Perf::AliasStatNames[i]}] =
+                     Perf::g_alias_stats_last[i].load(std::memory_order_relaxed);
+             }
+             return stats;
+         }()},
         {"start_time_only",
          {"state_blocks: the split front decides whether it sends register blocks when it starts "
           "(the back's handling of them is live)",
@@ -667,6 +682,10 @@ json PerfFlip(ToolState& state, const json& params) {
         live.sync_submit = number();
     } else if (control == "verify") {
         live.verify = number() == 1;
+    } else if (const auto alias_it = std::ranges::find(Perf::AliasNames, control);
+               alias_it != Perf::AliasNames.end()) {
+        const u32 bit = 1u << static_cast<u32>(alias_it - Perf::AliasNames.begin());
+        live.alias = number() == 1 ? live.alias | bit : live.alias & ~bit;
     } else if (control == "backx" || control.starts_with("backx.")) {
         const std::string text = value.get<std::string>();
         if (text != "old" && text != "upstream") {
@@ -686,7 +705,8 @@ json PerfFlip(ToolState& state, const json& params) {
     } else {
         throw std::runtime_error{"unknown control \"" + control +
                                  "\": inline_defer, uboreuse, frames_ahead, fence_batch, "
-                                 "sync_submit, verify, backx, backx.<piece>"};
+                                 "sync_submit, verify, backx, backx.<piece>, alias_sync_always, "
+                                 "alias_full_resolve, alias_resync_upload, alias_diag"};
     }
     return ApplyLiveParams(state, params, live);
 }

@@ -31,6 +31,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
 #include "video_core/texture_cache/conversion.h"
@@ -3483,6 +3484,30 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         DeleteImage(copy_object.id);
     }
 
+    {
+        namespace Perf = VideoCommon::Nx2Perf;
+        const u32 width = new_image.info.size.width;
+        const u32 height = new_image.info.size.height;
+        if (!new_image.aliased_images.empty()) {
+            Perf::NoteAlias(Perf::AliasStat::CreatedAlias, width, height);
+        } else if (!join_bad_overlap_ids.empty()) {
+            Perf::NoteAlias(Perf::AliasStat::CreatedBad, width, height);
+        }
+        if (width <= 16 && height <= 16 && Perf::AliasOn(Perf::Alias::Diag) &&
+            (!new_image.aliased_images.empty() || !join_bad_overlap_ids.empty())) {
+            static u32 logged{};
+            if (logged++ < 64) {
+                LOG_INFO(HW_GPU,
+                         "Alias diag: {}x{} format {} at {:#x} ({} bytes, block {}x{}x{}): {} "
+                         "aliases, {} bad overlaps, {} joined",
+                         width, height, static_cast<u32>(new_image.info.format), gpu_addr,
+                         new_image.guest_size_bytes, new_image.info.block.width,
+                         new_image.info.block.height, new_image.info.block.depth,
+                         new_image.aliased_images.size(), join_bad_overlap_ids.size(),
+                         join_overlap_ids.size());
+            }
+        }
+    }
     RegisterImage(new_image_id);
     return new_image_id;
 }
@@ -4317,12 +4342,17 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
 }
 
 template <class P>
-void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
+void TextureCache<P>::SynchronizeAliases(ImageId image_id, bool after_upload) {
+    namespace Perf = VideoCommon::Nx2Perf;
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
+    const u32 diag_width = image.info.size.width;
+    const u32 diag_height = image.info.size.height;
     // Nothing aliased was modified after this image: skip walking its (possibly long) alias list
     // for every draw that samples it (~7% of the GPU back thread in DK Bananza's open areas).
-    if (image.newest_alias_tick <= image.modification_tick) {
+    if (image.newest_alias_tick <= image.modification_tick && !after_upload &&
+        !Perf::AliasOn(Perf::Alias::SyncAlways)) {
+        Perf::NoteAlias(Perf::AliasStat::Skipped, diag_width, diag_height);
         DEBUG_ASSERT(std::ranges::none_of(image.aliased_images, [&](const AliasedImage& alias) {
             return slot_images[alias.id].modification_tick > image.modification_tick;
         }));
@@ -4333,7 +4363,12 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     u64 most_recent_tick = image.modification_tick;
     for (const AliasedImage& aliased : image.aliased_images) {
         ImageBase& aliased_image = slot_images[aliased.id];
-        if (image.modification_tick < aliased_image.modification_tick) {
+        // alias_resync_upload: the upload just replaced what an alias of the same tick copied in.
+        const bool same_tick_gpu = after_upload &&
+                                   image.modification_tick == aliased_image.modification_tick &&
+                                   True(aliased_image.flags & ImageFlagBits::GpuModified) &&
+                                   False(aliased_image.flags & ImageFlagBits::CpuModified);
+        if (image.modification_tick < aliased_image.modification_tick || same_tick_gpu) {
             most_recent_tick = (std::max)(most_recent_tick, aliased_image.modification_tick);
             aliased_images.push_back(&aliased);
             any_rescaled |= True(aliased_image.flags & ImageFlagBits::Rescaled);
@@ -4343,8 +4378,10 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     if (aliased_images.empty()) {
         // Newer aliases were deleted since: skip the walk until one is modified again.
         image.newest_alias_tick = image.modification_tick;
+        Perf::NoteAlias(Perf::AliasStat::NoNewer, diag_width, diag_height);
         return;
     }
+    Perf::NoteAlias(Perf::AliasStat::Synced, diag_width, diag_height);
     const bool can_rescale = ImageCanRescale(image);
     if (any_rescaled) {
         if (can_rescale) {
@@ -4395,9 +4432,15 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             TrackImage(image, image_id);
         }
     } else {
+        const bool upload = True(image.flags & ImageFlagBits::CpuModified);
         RefreshContents(image, image_id);
         if (!image.aliased_images.empty()) {
-            SynchronizeAliases(image_id);
+            namespace Perf = VideoCommon::Nx2Perf;
+            if (upload) {
+                Perf::NoteAlias(Perf::AliasStat::Uploads, image.info.size.width,
+                                image.info.size.height);
+            }
+            SynchronizeAliases(image_id, upload && Perf::AliasOn(Perf::Alias::ResyncUpload));
         }
     }
     if (is_modification) {
