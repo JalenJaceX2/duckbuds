@@ -231,10 +231,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "game's render/output sizes. Native (DLAA) "
               "applies anti-aliasing at the game's render resolution, then scales to its output; "
               "Ocarina's 1440p mode stays at 1440p instead of reconstructing to 4K.\n"
-              "Explicit modes only apply when the game's render size is within NVIDIA's "
-              "supported range; otherwise Automatic is used and the fallback is logged. "
-              "This does not change the game's render resolution. Apply/OK updates it while "
-              "playing."));
+              "In The Legend of Zelda: Ocarina of Time (docked, with the Max Resolution add-on), "
+              "Balanced, Performance and Ultra Performance lower the game's render resolution "
+              "from 2560x1440 to 2276x1280, 1920x1080 and 1280x720 before DLSS reconstructs 4K. "
+              "That resolution changes when the game starts.\n"
+              "In other games, explicit modes only apply when the game's render size is within "
+              "NVIDIA's supported range; otherwise Automatic is used and the fallback is logged. "
+              "There they don't change the game's render resolution. Apply/OK updates the mode "
+              "while playing."));
     INSERT(
         Settings, nvidia_dlss_preset, tr("NVIDIA DLSS model preset:"),
         tr("Applies only when a game uses its own DLSS.\nM (DLSS 4.5) is Lichii's default for "
@@ -392,12 +396,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "files internally."));
     INSERT(Settings, precache_shaders, tr("Precache shaders before game start:"),
            tr("Builds shaders on the loading screen, on every CPU thread, so they don't stutter "
-              "the first time the game uses them: the compute shaders found in the game files, "
-              "and the shaders saved by earlier play sessions that the normal shader loading "
-              "leaves for later. The first launch reads the game files and takes a few minutes; "
-              "later launches only build what is new, until the GPU driver changes. The loading "
-              "screen has a Skip button.\nAsk asks at launch while the game has never been "
-              "precached."));
+              "the first time the game uses them: the compute shaders found in the game files. "
+              "The first launch reads the game files and takes a few minutes; later launches "
+              "only build what is new, until the GPU driver changes. The loading screen has a "
+              "Skip button.\nAsk asks at launch while the game has never been precached."));
     INSERT(Settings, build_all_cached_shaders, tr("Build all cached shaders before game start"),
            tr("Builds every shader saved by earlier play sessions on the loading screen and keeps "
               "them built, so places you visited long ago don't stutter. Without it, only the "
