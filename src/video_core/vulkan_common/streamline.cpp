@@ -541,7 +541,13 @@ bool Start(void* window) {
     if (state.started) {
         return true;
     }
-    if (!Settings::values.nvidia_dlss.GetValue()) {
+    // Nothing of NVIDIA's is loaded and no swapchain call is hooked unless DLSS is asked for:
+    // the setting, or EDEN_NX2_DLSS_REPLACEMENT=dlss (which leaves the setting alone).
+    static const bool env_dlss = [] {
+        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return value && std::string_view{value} == "dlss";
+    }();
+    if (!Settings::values.nvidia_dlss.GetValue() && !env_dlss) {
         return false;
     }
     SetFrameGenReason(state, "NVIDIA Streamline did not start; the log above says why");

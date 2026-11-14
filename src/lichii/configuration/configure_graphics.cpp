@@ -204,6 +204,7 @@ void ConfigureGraphics::UpdateDeviceSelection(int device) {
         vulkan_device = device;
     }
     UpdateAmdFsr4Visibility();
+    UpdateNvidiaDlssVisibility();
 }
 
 ConfigureGraphics::~ConfigureGraphics() = default;
@@ -281,6 +282,7 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
                                      setting->Id() == Settings::values.nvidia_dlss_preset.Id())) {
             widget->setVisible(nvidia_dlss_checkbox->isChecked());
             connect(nvidia_dlss_checkbox, &QCheckBox::toggled, widget, &QWidget::setVisible);
+            nvidia_dlss_options.push_back(widget);
         }
 
         if (setting->Id() == Settings::values.hdr_mode.Id() ||
@@ -379,6 +381,8 @@ void ConfigureGraphics::Setup(const ConfigurationShared::Builder& builder) {
             nvidia_dlss_panel = new NvidiaDlssPanel(group);
             group_layout->addWidget(nvidia_dlss_panel);
             hold_graphics.emplace(setting->Id(), group);
+            nvidia_dlss_group = group;
+            dlss_checkbox = widget->checkbox;
 #endif
         } else if (setting->Id() == Settings::values.amd_fsr4.Id()) {
             // AMD's files and a download button under the checkbox, shown for GPUs FSR 4 runs on.
@@ -605,6 +609,22 @@ void ConfigureGraphics::UpdateAPILayout() {
         vulkan_device_combobox->setCurrentIndex(vulkan_device);
     }
     UpdateAmdFsr4Visibility();
+    UpdateNvidiaDlssVisibility();
+}
+
+void ConfigureGraphics::UpdateNvidiaDlssVisibility() {
+    // Only GeForce RTX cards run DLSS; Streamline still checks the card when a game starts.
+    if (nvidia_dlss_group == nullptr) {
+        return;
+    }
+    const int device = vulkan_device_combobox->currentIndex();
+    const bool rtx = GetCurrentGraphicsBackend() == Settings::RendererBackend::Vulkan &&
+                     device >= 0 && static_cast<size_t>(device) < records.size() &&
+                     records[device].nvidia_rtx;
+    nvidia_dlss_group->setVisible(rtx);
+    for (QWidget* const widget : nvidia_dlss_options) {
+        widget->setVisible(rtx && dlss_checkbox->isChecked());
+    }
 }
 
 void ConfigureGraphics::UpdateAmdFsr4Visibility() {

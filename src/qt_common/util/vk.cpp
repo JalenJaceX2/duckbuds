@@ -23,9 +23,9 @@ class QWindow;
 
 namespace VkDeviceInfo {
 Record::Record(std::string_view name_, const std::vector<VkPresentModeKHR>& vsync_modes_,
-               bool has_broken_compute_, bool fsr4_capable_)
+               bool has_broken_compute_, bool fsr4_capable_, bool nvidia_rtx_)
     : name{name_}, vsync_support{vsync_modes_}, has_broken_compute{has_broken_compute_},
-      fsr4_capable{fsr4_capable_} {}
+      fsr4_capable{fsr4_capable_}, nvidia_rtx{nvidia_rtx_} {}
 
 Record::~Record() = default;
 
@@ -85,6 +85,9 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
             properties.properties.vendorID, driverID == VK_DRIVER_ID_AMD_PROPRIETARY, name);
 #endif
 
+        const bool nvidia_rtx = properties.properties.vendorID == 0x10DE &&
+                                name.find("RTX") != std::string::npos;
+
         std::string driver_string = Vulkan::vk::GetDriverName(driver_properties);
 
         if (driver_string.empty())
@@ -93,7 +96,7 @@ void PopulateRecords(std::vector<Record>& records, QWindow* window) try {
         name = fmt::format("{} ({})", name, driver_string);
 
         records.push_back(
-            VkDeviceInfo::Record(name, present_modes, has_broken_compute, fsr4_capable));
+            VkDeviceInfo::Record(name, present_modes, has_broken_compute, fsr4_capable, nvidia_rtx));
     }
 } catch (const Vulkan::vk::Exception& exception) {
     LOG_ERROR(Frontend, "Failed to enumerate devices with error: {}", exception.what());
