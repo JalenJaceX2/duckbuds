@@ -2135,10 +2135,26 @@ void RasterizerVulkan::Clear(u32 layer_count) {
         if (zeroed_memory.empty()) {
             return;
         }
-        std::scoped_lock buffer_lock{buffer_cache.mutex};
-        // Piece by piece: DMAClear clears one device-contiguous range.
-        for (const auto& [address, size] : zeroed_memory) {
-            buffer_cache.DMAClear(address, size / sizeof(u32), 0);
+        boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> cleared;
+        {
+            std::scoped_lock buffer_lock{buffer_cache.mutex};
+            // Piece by piece: DMAClear clears one device-contiguous range.
+            for (const auto& [address, size] : zeroed_memory) {
+                const u64 words = size / sizeof(u32);
+                if (buffer_cache.DMAClear(address, words, 0)) {
+                    cleared.emplace_back(address, words * sizeof(u32));
+                }
+            }
+        }
+        // DMAClear stops tracking the range as GPU-modified: the copy engine's constant fill
+        // writes its value to guest memory as well. So do the zeros here, or a CPU read of the
+        // range, or an upload of it into a buffer over it, would get its old bytes back.
+        static constexpr std::array<u8, 0x10000> zeros{};
+        for (const auto& [address, size] : cleared) {
+            for (std::size_t offset = 0; offset < size; offset += zeros.size()) {
+                gpu_memory->WriteBlockUnsafe(address + offset, zeros.data(),
+                                             (std::min)(zeros.size(), size - offset));
+            }
         }
     };
     std::scoped_lock lock{texture_cache.mutex};
