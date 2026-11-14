@@ -6,6 +6,8 @@
 #pragma once
 
 #include <array>
+#include <cstdlib>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include "common/container/unordered_map.h"
@@ -138,8 +140,28 @@ public:
     /// Bytes of the program's local array: the declared local memory, and for native programs
     /// also the spare word and the stack region before it.
     [[nodiscard]] u32 LocalArraySize() const {
+        if (!UsesNativeLocalStack()) {
+            return LocalMemorySize();
+        }
+        if (UsesV25NativeStack()) {
+            return LocalMemorySize() + NATIVE_STACK_BYTES;
+        }
         const u32 declared = (LocalMemorySize() + 3U) & ~3U;
-        return UsesNativeLocalStack() ? NATIVE_DECLARED_BASE + declared : LocalMemorySize();
+        return NATIVE_DECLARED_BASE + declared;
+    }
+
+    /// EDEN_NX2_DUSK_STACK=v25 (default) | upstream: The Duskbloods' native stack lowering.
+    /// v25 (dusk-v2.5, c7b75c47): the declared memory first, then NATIVE_STACK_BYTES; window
+    /// offsets in the upper half are folded onto that region (a deeper stack aliases the declared
+    /// memory), and bounds are only checked against the whole array. upstream: #1490's layout above
+    /// with per-access bounds (spare word). Translation runs every session (no translated code is
+    /// cached on disk), so switching never reuses the other variant's output.
+    [[nodiscard]] static bool UsesV25NativeStack() {
+        static const bool v25 = [] {
+            const char* value = std::getenv("EDEN_NX2_DUSK_STACK");
+            return value == nullptr || std::string_view{value} != "upstream";
+        }();
+        return v25;
     }
 
     [[nodiscard]] virtual u32 SharedMemorySize() const = 0;
