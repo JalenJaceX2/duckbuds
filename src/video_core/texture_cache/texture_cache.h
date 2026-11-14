@@ -191,12 +191,14 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     static const int download_overlaps_setting =
         WritebackSwitches::SwitchSetting("EDEN_NX2_GC_DOWNLOAD_OVERLAPS");
     // Staging maps that release themselves when destroyed (OpenGL) cannot wait in a vector.
-    const bool download_overlaps = std::is_trivially_destructible_v<DownloadMap> &&
-                                   WritebackSwitches::DuskbloodsDefault(download_overlaps_setting);
+    // Not const, here and below: with OpenGL both would be constant expressions, which the
+    // lambda below must then not capture (-Wunused-lambda-capture), while Vulkan's must be.
+    bool download_overlaps = std::is_trivially_destructible_v<DownloadMap> &&
+                             WritebackSwitches::DuskbloodsDefault(download_overlaps_setting);
     // EDEN_NX2_GC_DOWNLOAD_ASYNC (on unless =0): the collector does not wait for its
     // write-backs (each wait was 5-10 ms, several a second in combat); they reach guest memory
     // when the GPU is done with them.
-    const bool async_downloads = download_overlaps && AsyncOverlapDownloadsEnabled();
+    bool async_downloads = download_overlaps && AsyncOverlapDownloadsEnabled();
     KeepRanges keep;
     WritebackRanges::TickedRanges keep_ticks;
     const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &keep,
