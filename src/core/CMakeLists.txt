@@ -1112,6 +1112,8 @@ add_library(core STATIC
     hle/service/sockets/nextendo_redirect.h
     hle/service/sockets/numeric_name_info.cpp
     hle/service/sockets/numeric_name_info.h
+    hle/service/sockets/online_profile.cpp
+    hle/service/sockets/online_profile.h
     hle/service/sockets/sfdnsres.cpp
     hle/service/sockets/sfdnsres.h
     hle/service/sockets/sockets.cpp
