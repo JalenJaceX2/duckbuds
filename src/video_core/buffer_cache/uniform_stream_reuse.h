@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "common/common_types.h"
+#include "video_core/nx2_backx.h"
 
 namespace VideoCommon {
 
@@ -139,7 +140,8 @@ template <class Runtime, class DeviceMemory>
     } else {
         slot.size = size;
         std::memcpy(slot.bytes.data(), scratch, size);
-        if (++slot.misses >= Reuse::MissStreak) {
+        // The Duskbloods (before #1586): no streaks, every bind compares.
+        if (!BackX::DuskOff(BackX::DuskPiece::UboStreak) && ++slot.misses >= Reuse::MissStreak) {
             slot.misses = 0;
             slot.direct = Reuse::DirectBinds;
         }

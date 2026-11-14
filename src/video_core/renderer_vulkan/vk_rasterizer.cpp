@@ -3098,6 +3098,18 @@ bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {
 }
 
 void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
+    if (VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::InvalidationBatch)) {
+        // Before #1586: out of the GPU-written ranges first (WriteMemory downloads the GPU's
+        // bytes elsewhere on its pages), then each write through every cache.
+        {
+            std::scoped_lock lock{buffer_cache.mutex};
+            buffer_cache.ClaimCpuWrites(ranges);
+        }
+        for (const auto& [addr, size] : ranges) {
+            OnCacheInvalidation(addr, size);
+        }
+        return;
+    }
     // Each cache's lock is taken once for all the writes, not once a write (jpkto/Lichii
     // f5edeabdbb): guest CPU write traps hold the buffer cache's for long. The caches are
     // independent (TextureCache::WriteMemory reads and changes only texture state, and the page
@@ -4141,7 +4153,10 @@ void RasterizerVulkan::AccelerateInlineToMemory(GPUVAddr address, size_t copy_si
         }
         return false;
     };
-    const bool lock_free = defer && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+    const bool lock_free = defer &&
+                           !VideoCommon::BackX::DuskOff(
+                               VideoCommon::BackX::DuskPiece::InlineLockFree) &&
+                           Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
                            !Tegra::Nx2MayBeGpuWritten(page_begin, page_end - page_begin) &&
                            !reaches_list_page();
     if (lock_free) {
@@ -5260,12 +5275,18 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         key.repacked |= (buffer_cache_runtime.IsVertexRepacked(binding) ? 1U : 0U) << binding;
     }
     const u64 hash = key.Hash();
-    std::shared_ptr<const VertexInputState> state = vertex_input_cache.Find(key, hash);
+    // The Duskbloods (before #1586): built from the registers every time, no cache.
+    const bool no_cache =
+        VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::VertexInputCache);
+    std::shared_ptr<const VertexInputState> state =
+        no_cache ? nullptr : vertex_input_cache.Find(key, hash);
     if (!state) {
         auto built = std::make_shared<VertexInputState>();
         BuildVertexInput(regs, max_attributes, max_bindings, *built);
         state = std::move(built);
-        vertex_input_cache.Insert(key, hash, state);
+        if (!no_cache) {
+            vertex_input_cache.Insert(key, hash, state);
+        }
     } else if (fast_draw_verify) {
         // The key must hold everything the build reads.
         VertexInputState built;

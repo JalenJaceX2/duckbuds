@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/nx2_backx.h"
 
 namespace Tegra {
 class MemoryManager;
@@ -127,7 +128,8 @@ inline void Break(Reason reason, u32 method = 0) {
         return;
     }
     g_last_break.store(static_cast<u32>(reason) | (method << 8), std::memory_order_relaxed);
-    if (!(t_reads_serial && t_serial_bumped)) {
+    // The Duskbloods (before #1586): every break bumps.
+    if (!(t_reads_serial && t_serial_bumped) || BackX::DuskOff(BackX::DuskPiece::BreakSkip)) {
         g_serial.fetch_add(1, std::memory_order_relaxed);
         t_serial_bumped = t_reads_serial;
     }
