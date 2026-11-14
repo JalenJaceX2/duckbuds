@@ -2241,7 +2241,17 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
 
     // Made where a dropped GPU-written image left stale bytes (MarkStale): nothing to upload.
     // Pages the buffer cache wrote on the GPU may hold data written back since: upload those.
-    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && image.dirty_layers.empty() &&
+    // EDEN_NX2_UPLOAD_STALE (from open PR #1501): unset = upload anyway for The Duskbloods (as
+    // dusk-v2.5, before #818: the skip left leftover host memory in its new targets), 1 = upload
+    // for every title, 0 = skip (#818).
+    static const int upload_stale_env = [] {
+        const char* value = std::getenv("EDEN_NX2_UPLOAD_STALE");
+        return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
+    }();
+    const bool upload_stale =
+        upload_stale_env == -1 ? Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL
+                               : upload_stale_env == 1;
+    if (!upload_stale && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && image.dirty_layers.empty() &&
         False(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
                              ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked)) &&
         stale_pages.IsAll(image.cpu_addr, image.guest_size_bytes)) {
