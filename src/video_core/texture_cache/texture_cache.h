@@ -4350,8 +4350,13 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id, bool after_upload) {
     const u32 diag_height = image.info.size.height;
     // Nothing aliased was modified after this image: skip walking its (possibly long) alias list
     // for every draw that samples it (~7% of the GPU back thread in DK Bananza's open areas).
-    if (image.newest_alias_tick <= image.modification_tick && !after_upload &&
-        !Perf::AliasOn(Perf::Alias::SyncAlways)) {
+    // The Duskbloods' tiny images (exposure and the like) skip the early-out by default, as before
+    // #858: an unverified precaution against the FSR 3.1 exposure flicker (alias_sync_always).
+    const int sync_always = Perf::AliasSync();
+    const bool walk_always =
+        sync_always > 0 || (sync_always < 0 && diag_width <= 16 && diag_height <= 16 &&
+                            Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL);
+    if (image.newest_alias_tick <= image.modification_tick && !after_upload && !walk_always) {
         Perf::NoteAlias(Perf::AliasStat::Skipped, diag_width, diag_height);
         DEBUG_ASSERT(std::ranges::none_of(image.aliased_images, [&](const AliasedImage& alias) {
             return slot_images[alias.id].modification_tick > image.modification_tick;

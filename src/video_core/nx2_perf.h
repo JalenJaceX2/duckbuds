@@ -117,7 +117,7 @@ inline constexpr std::uint32_t VerifyMask =
 /// Texture alias controls for the Duskbloods exposure flicker (live through perf_flip, start
 /// switches EDEN_NX2_<NAME upper case>=1; all off is the normal behaviour).
 enum class Alias : std::uint32_t {
-    SyncAlways,    ///< SynchronizeAliases walks the aliases even when no alias tick is newer
+    SyncAlways,    ///< unused bit: alias_sync_always is the tri-state LiveState::alias_sync
     FullResolve,   ///< fast draw delta draws take the full path when a sampled image has aliases
     ResyncUpload,  ///< an upload of an aliased image copies GPU-written aliases of the same tick
     Diag,          ///< per-second counts of alias work on images of at most 16x16
@@ -141,6 +141,9 @@ struct LiveState {
     int fence_batch = -1;       ///< -1: the start switch, else 0/1 (EDEN_NX2_FENCE_BATCH)
     int sync_submit = -1;       ///< -1: the start switch, else 0/1 (EDEN_NX2_SYNC_SUBMIT)
     std::uint32_t alias{};      ///< Alias bits
+    /// SynchronizeAliases walks the aliases even when no alias tick is newer: -1 (default) for
+    /// The Duskbloods' images of at most 16x16, 0 never, 1 always (EDEN_NX2_ALIAS_SYNC_ALWAYS)
+    int alias_sync = -1;
 
     [[nodiscard]] std::uint32_t Effective() const noexcept {
         return named | (verify ? VerifyMask : 0);
@@ -157,6 +160,7 @@ inline std::atomic<int> g_frames_ahead{-1};
 inline std::atomic<int> g_fence_batch{-1};
 inline std::atomic<int> g_sync_submit{-1};
 inline std::atomic<std::uint32_t> g_alias{};
+inline std::atomic<int> g_alias_sync{-1};
 /// Live changes requested / applied, and the rasterizer frame of the last applied one.
 inline std::atomic<std::uint64_t> g_live_requested{};
 inline std::atomic<std::uint64_t> g_live_applied{};
@@ -178,6 +182,7 @@ inline void StoreLive(const LiveState& state) {
     g_fence_batch.store(state.fence_batch, std::memory_order_relaxed);
     g_sync_submit.store(state.sync_submit, std::memory_order_relaxed);
     g_alias.store(state.alias, std::memory_order_relaxed);
+    g_alias_sync.store(state.alias_sync, std::memory_order_relaxed);
 }
 
 [[nodiscard]] inline LiveState CurrentLive() {
@@ -190,6 +195,7 @@ inline void StoreLive(const LiveState& state) {
         .fence_batch = g_fence_batch.load(std::memory_order_relaxed),
         .sync_submit = g_sync_submit.load(std::memory_order_relaxed),
         .alias = g_alias.load(std::memory_order_relaxed),
+        .alias_sync = g_alias_sync.load(std::memory_order_relaxed),
     };
 }
 
@@ -237,10 +243,10 @@ inline bool ApplyLive(std::uint64_t frame) {
     g_live_applied.store(requested, std::memory_order_release);
     LOG_INFO(HW_GPU,
              "Nx2Perf live change #{} at frame {}: verify={} dusk_off={:#x} uboreuse={} "
-             "frames_ahead={} fence_batch={} sync_submit={} alias={:#x} sites: {}",
+             "frames_ahead={} fence_batch={} sync_submit={} alias={:#x} alias_sync={} sites: {}",
              requested, frame, state.verify ? 1 : 0, state.dusk_off, state.uboreuse,
              state.frames_ahead, state.fence_batch, state.sync_submit, state.alias,
-             SitesText(state.Effective()));
+             state.alias_sync, SitesText(state.Effective()));
     return true;
 }
 
@@ -267,9 +273,12 @@ inline void ReadSwitch() {
             state.alias |= 1u << i;
         }
     }
+    if (const char* value = std::getenv("EDEN_NX2_ALIAS_SYNC_ALWAYS"); value && *value) {
+        state.alias_sync = value[0] == '1' ? 1 : 0;
+    }
     StoreLive(state);
-    LOG_INFO(HW_GPU, "Nx2Perf sites (PERF_VERIFY={}, alias={:#x}): {}", state.verify ? 1 : 0,
-             state.alias, SitesText(state.Effective()));
+    LOG_INFO(HW_GPU, "Nx2Perf sites (PERF_VERIFY={}, alias={:#x}, alias_sync={}): {}",
+             state.verify ? 1 : 0, state.alias, state.alias_sync, SitesText(state.Effective()));
 }
 
 inline bool Verify() {
@@ -291,6 +300,10 @@ inline bool SlowNamed(Site site) {
 [[nodiscard]] inline bool LiveOr(const std::atomic<int>& live, bool start) {
     const int value = live.load(std::memory_order_relaxed);
     return value < 0 ? start : value != 0;
+}
+
+[[nodiscard]] inline int AliasSync() {
+    return g_alias_sync.load(std::memory_order_relaxed);
 }
 
 [[nodiscard]] inline bool AliasOn(Alias control) {

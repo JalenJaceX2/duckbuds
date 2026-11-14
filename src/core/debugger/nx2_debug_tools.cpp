@@ -575,6 +575,7 @@ json LiveJson(const Perf::LiveState& live) {
              for (size_t i = 0; i < Perf::AliasNames.size(); ++i) {
                  alias[std::string{Perf::AliasNames[i]}] = (live.alias >> i & 1) != 0 ? 1 : 0;
              }
+             alias["alias_sync_always"] = control(live.alias_sync);
              return alias;
          }()},
         {"alias_stats", [] {
@@ -686,6 +687,8 @@ json PerfFlip(ToolState& state, const json& params) {
         live.sync_submit = number();
     } else if (control == "verify") {
         live.verify = number() == 1;
+    } else if (control == "alias_sync_always") {
+        live.alias_sync = number(); // "default": The Duskbloods' images of at most 16x16
     } else if (const auto alias_it = std::ranges::find(Perf::AliasNames, control);
                alias_it != Perf::AliasNames.end()) {
         const u32 bit = 1u << static_cast<u32>(alias_it - Perf::AliasNames.begin());
