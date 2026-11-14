@@ -21,6 +21,16 @@ namespace {
 // The application's memory totals leave out the Switch 2 remote memory its pool also backs; other
 // processes, and totals smaller than the allowance, are reported as they are.
 u64 WithoutRemoteMemory(const KProcess& process, u64 total) {
+    // dusk-v2.5 (EDEN_NX2_APP_POOL_PROBE=1152) reported the whole totals to The Duskbloods, the only
+    // title with remote memory (it may size its heaps from them). EDEN_NX2_TOTAL_MINUS_REMOTE=1 restores
+    // the subtraction (#552).
+    static const bool subtract = [] {
+        const char* value = std::getenv("EDEN_NX2_TOTAL_MINUS_REMOTE");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!subtract) {
+        return total;
+    }
     const u64 remote = KSystemControl::Nx2RemoteMemorySize();
     return process.IsApplication() && total >= remote ? total - remote : total;
 }
