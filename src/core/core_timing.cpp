@@ -133,6 +133,9 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
     if (const char* stats = std::getenv("EDEN_NX2_HOSTTIMING_STATS")) {
         host_wait_stats = std::strtol(stats, nullptr, 10) != 0;
     }
+    if (const char* spin = std::getenv("EDEN_NX2_HOSTTIMING_SPIN")) {
+        host_spin_env = std::strtol(spin, nullptr, 10) != 0 ? 1 : 0;
+    }
     if (is_multicore) {
         timer_thread = std::jthread([this](std::stop_token stop_token) {
             Common::SetCurrentThreadName("HostTiming");
@@ -170,7 +173,11 @@ void CoreTiming::WaitForEvent(s64 next_time) {
     }
     s64 now = start;
     bool signalled = false;
-    if (next_time - now > HOST_WAIT_MARGIN_NS) {
+    // The Duskbloods keeps the pre-#1016 hardware wait: an OS sleep at HostTiming priority wakes
+    // 5+ ms late under its time-critical threads, which starved the sysmix output timer.
+    const bool spin = host_spin_env == 1 ||
+                      (host_spin_env == -1 && Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL);
+    if (!spin && next_time - now > HOST_WAIT_MARGIN_NS) {
         signalled = event.SleepFor(std::chrono::nanoseconds{next_time - HOST_WAIT_MARGIN_NS - now});
         now = GetGlobalTimeNs().count();
     }
