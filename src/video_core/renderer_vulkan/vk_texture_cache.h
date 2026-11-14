@@ -281,6 +281,7 @@ public:
                          std::array<u32, 2> max_render_size);
     std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;
     bool dlss_unsupported{};
+    bool temporal_dlss{}; ///< The last TemporalUpscale was meant for DLSS
 #endif
 
     /// TemporalUpscale's history: its previous result (images[current]) and the image the next

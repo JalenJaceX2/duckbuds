@@ -95,8 +95,13 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
 /// Whether DLSS can run on the attached device.
 [[nodiscard]] bool IsDlssAvailable();
 
-/// DLSS is asked for: the nvidia_dlss setting or EDEN_NX2_DLSS_REPLACEMENT=dlss.
+/// DLSS was asked for when Streamline was last started: the nvidia_dlss setting or
+/// EDEN_NX2_DLSS_REPLACEMENT=dlss, and not EDEN_NX2_DLSS_REPLACEMENT=fsr.
 [[nodiscard]] bool Requested();
+
+/// DLSS rather than FSR 3.1 now: EDEN_NX2_DLSS_REPLACEMENT=dlss|fsr, else the nvidia_dlss setting
+/// (live, through Settings::RefreshNvidiaDlssRuntimeSettings).
+[[nodiscard]] bool DlssWanted();
 
 /// Warnings and errors Streamline has logged, for the DLSS stats line.
 [[nodiscard]] u64 LoggedProblems();

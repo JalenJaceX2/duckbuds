@@ -1832,11 +1832,7 @@ bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
 
 bool TextureCacheRuntime::UsesNvidiaDlss() const {
 #ifdef EGLANTINE_STREAMLINE
-    static const bool force_fsr = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
-    }();
-    return !force_fsr && !dlss_unsupported && Streamline::IsDlssAvailable();
+    return !dlss_unsupported && Streamline::IsDlssAvailable() && Streamline::DlssWanted();
 #else
     return false;
 #endif
@@ -1868,9 +1864,14 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
         fsr3_last_evaluation
             ? std::chrono::duration<f32, std::milli>(now - *fsr3_last_evaluation).count()
             : 1000.0f / 30.0f;
-    const bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f;
+    bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f;
     fsr3_last_evaluation = now;
 #ifdef EGLANTINE_STREAMLINE
+    // Switching between DLSS and FSR 3.1 (the status bar's upscaler button) starts the history
+    // again; both upscalers stay allocated, so switching back costs nothing more.
+    const bool dlss = UsesNvidiaDlss();
+    reset = reset || dlss != temporal_dlss;
+    temporal_dlss = dlss;
     if (UpscaleWithDlss(dst_framebuffer, input_color, motion_vectors, depth, render_size, jitter,
                         motion_scale, reset, max_render_size)) {
         return true;
@@ -1985,16 +1986,12 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
                                           std::array<f32, 2> jitter,
                                           std::array<f32, 2> motion_scale, bool reset,
                                           std::array<u32, 2> max_render_size) {
-    // EDEN_NX2_DLSS_REPLACEMENT=fsr keeps FSR 3.1 for A/B runs.
-    static const bool force_fsr = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
-    }();
-    if (force_fsr || dlss_unsupported) {
+    // FSR 3.1 when DLSS is off (the setting, the upscaler button or EDEN_NX2_DLSS_REPLACEMENT=fsr).
+    if (dlss_unsupported || !Streamline::DlssWanted()) {
         return false;
     }
     if (!dlss_upscaler) {
-        // Off in the settings, or Streamline didn't start: it has said why.
+        // Streamline didn't start: it has said why, or DLSS was off when the game started.
         if (!Streamline::IsDlssAvailable()) {
             if (Streamline::Requested()) {
                 StreamlineDlssUpscaler::NoteFallback(

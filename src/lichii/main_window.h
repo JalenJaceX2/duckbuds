@@ -489,6 +489,9 @@ private:
     void UpdateAAText();
     void UpdatePostShaderText();
     void UpdateFrameGenButton();
+    void UpdateUpscalerButton();
+    void SetUpscaler(std::optional<Settings::NvidiaDlssQuality> choice);
+    void OnCycleUpscaler();
     void UpdateVolumeUI();
     void UpdateStatusBar();
     void UpdateGPUAccuracyButton();
@@ -574,6 +577,12 @@ private:
     QPushButton* aa_status_button = nullptr;
     QPushButton* post_shader_status_button = nullptr;
     QPushButton* frame_gen_status_button = nullptr;
+    QPushButton* upscaler_status_button = nullptr;
+    bool dlss_running = false;  ///< DLSS evaluated since the last status update
+    bool dlss_session = false;  ///< Streamline runs this session
+    bool upscaler_rtx = false;  ///< The renderer's GPU is a GeForce RTX
+    Settings::NvidiaDlssQuality dlss_mode{};
+    QString dlss_fallback;
     VideoCore::FrameGenState frame_gen_state{};
     u64 frame_gen_frames = 0;
     u64 dlss_evaluations = 0;

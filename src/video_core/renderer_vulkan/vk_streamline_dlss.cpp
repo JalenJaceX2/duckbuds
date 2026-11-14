@@ -78,6 +78,8 @@ struct Stats {
     Clock::time_point since{};
 };
 Stats stats;
+std::mutex fallback_mutex;
+std::string fallback_reason;
 
 void PublishStats(std::string line) {
     std::scoped_lock lock{VideoCommon::Nx2Perf::g_dlss_stats_mutex};
@@ -900,6 +902,10 @@ void StreamlineDlssUpscaler::NoteFallback(std::string_view reason) {
     if (stats.fell_back.exchange(true)) {
         return;
     }
+    {
+        std::scoped_lock lock{fallback_mutex};
+        fallback_reason = reason;
+    }
     std::string line = fmt::format("DLSS stats: total={} {} fallback={}",
                                    evaluations.load(std::memory_order_relaxed), EventCounts(),
                                    reason);
@@ -910,11 +916,14 @@ void StreamlineDlssUpscaler::NoteFallback(std::string_view reason) {
 VideoCore::DlssStatus StreamlineDlssUpscaler::Status() {
     const u64 count = evaluations.load(std::memory_order_acquire);
     const u32 last = last_evaluation.load(std::memory_order_relaxed);
+    std::scoped_lock lock{fallback_mutex};
     return {
         .evaluations = count,
         .mode = static_cast<Settings::NvidiaDlssQuality>(last & 0xff),
         .requested = static_cast<Settings::NvidiaDlssQuality>((last >> 8) & 0xff),
         .preset = static_cast<Settings::NvidiaDlssPreset>((last >> 16) & 0xff),
+        .streamline = Streamline::IsDlssAvailable(),
+        .fallback = fallback_reason,
     };
 }
 

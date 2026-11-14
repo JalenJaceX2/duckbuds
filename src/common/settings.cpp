@@ -96,7 +96,8 @@ std::atomic<u32> applied_ocarina_render_scale{};
 void RefreshNvidiaDlssRuntimeSettings() {
     nvidia_dlss_runtime_options.store(
         static_cast<u32>(values.nvidia_dlss_quality.GetValue()) |
-            (static_cast<u32>(values.nvidia_dlss_preset.GetValue()) << 8),
+            (static_cast<u32>(values.nvidia_dlss_preset.GetValue()) << 8) |
+            (values.nvidia_dlss.GetValue() ? 1u << 16 : 0u),
         std::memory_order_relaxed);
 }
 
@@ -126,7 +127,7 @@ std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale() {
 NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings() {
     const u32 options = nvidia_dlss_runtime_options.load(std::memory_order_relaxed);
     return {static_cast<NvidiaDlssQuality>(options & 0xff),
-            static_cast<NvidiaDlssPreset>((options >> 8) & 0xff)};
+            static_cast<NvidiaDlssPreset>((options >> 8) & 0xff), (options & (1u << 16)) != 0};
 }
 
 std::string GetTimeZoneString(TimeZone time_zone) {

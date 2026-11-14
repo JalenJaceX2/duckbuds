@@ -84,6 +84,7 @@ struct State {
     std::atomic<bool> frame_gen_available{};
     std::mutex frame_gen_reason_mutex;
     std::string frame_gen_reason;
+    bool requested{};
     bool started{};
     bool attached{};
 };
@@ -541,12 +542,19 @@ bool FrameGenRequested() {
 }
 
 bool Requested() {
-    // The setting, or EDEN_NX2_DLSS_REPLACEMENT=dlss (which leaves the setting alone).
-    static const bool env_dlss = [] {
+    return GetState().requested;
+}
+
+bool DlssWanted() {
+    // EDEN_NX2_DLSS_REPLACEMENT=dlss or fsr overrides the setting (and leaves it alone).
+    static const std::string env = [] {
         const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "dlss";
+        return std::string{value ? value : ""};
     }();
-    return Settings::values.nvidia_dlss.GetValue() || env_dlss;
+    if (env == "dlss" || env == "fsr") {
+        return env == "dlss";
+    }
+    return Settings::GetNvidiaDlssRuntimeSettings().enabled;
 }
 
 bool Start(void* window) {
@@ -554,8 +562,10 @@ bool Start(void* window) {
     if (state.started) {
         return true;
     }
-    // Nothing of NVIDIA's is loaded and no swapchain call is hooked unless DLSS is asked for.
-    if (!Requested()) {
+    // Nothing of NVIDIA's is loaded and no swapchain call is hooked unless DLSS is asked for when
+    // the game starts: the interposer hooks every present, so FSR 3.1 sessions keep it out.
+    state.requested = DlssWanted();
+    if (!state.requested) {
         return false;
     }
     SetFrameGenReason(state, "NVIDIA Streamline did not start; the log above says why");

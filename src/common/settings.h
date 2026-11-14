@@ -425,7 +425,13 @@ struct Values {
                                                   true,
                                                   false};
     // NVIDIA DLSS (through NVIDIA Streamline) in place of a game's DLSS.
-    SwitchableSetting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
+    SwitchableSetting<bool> nvidia_dlss{linkage,
+                                        false,
+                                        "nvidia_dlss",
+                                        Category::Renderer,
+                                        Specialization::Default,
+                                        true,
+                                        true};
     SwitchableSetting<NvidiaDlssQuality> nvidia_dlss_quality{linkage,
                                                              NvidiaDlssQuality::Automatic,
                                                              "nvidia_dlss_quality",
@@ -1131,6 +1137,7 @@ extern Values values;
 struct NvidiaDlssRuntimeSettings {
     NvidiaDlssQuality quality;
     NvidiaDlssPreset preset;
+    bool enabled; ///< nvidia_dlss: DLSS rather than FSR 3.1 while Streamline runs
 };
 
 void RefreshNvidiaDlssRuntimeSettings();
