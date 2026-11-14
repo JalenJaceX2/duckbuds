@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <cstdlib>
 #include <array>
 #include <bit>
 #include <deque>
@@ -1452,12 +1451,7 @@ bool WalkLoadedPointer(const IR::Value& low_addr, LoadedPointer& result, u32 dep
                 pending.emplace_back(*unique, parent);
                 break;
             }
-            // EDEN_NX2_NULL_PHI_POINTERS=0 treats such a phi as before (the generic path).
-            static const bool null_phi_pointers = [] {
-                const char* value = std::getenv("EDEN_NX2_NULL_PHI_POINTERS");
-                return value == nullptr || value[0] != '0';
-            }();
-            if (null_phi_pointers && has_zero && one_nonzero && unique_nonzero && depth < 4) {
+            if (has_zero && one_nonzero && unique_nonzero && depth < 4) {
                 LoadedPointer merged;
                 if (!WalkLoadedPointer(*unique_nonzero, merged, depth + 1)) {
                     return false;
@@ -1710,7 +1704,7 @@ bool CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
             // A pointer or null: only the reads whose null path is given its zero below.
             // Not in compute shaders: The Duskbloods' tiled compute pass 6148b6ff87c55d4f
             // (120x68 groups) took ~100 ms a frame instead of 0.6 ms during area transitions with
-            // them (EDEN_NX2_NULL_PHI_POINTERS=0 made the transitions smooth again).
+            // them.
             if (single_loaded && single_loaded->null_phi != nullptr &&
                 (inst.GetOpcode() != IR::Opcode::LoadGlobal32 ||
                  env.ShaderStage() == Stage::Compute)) {
