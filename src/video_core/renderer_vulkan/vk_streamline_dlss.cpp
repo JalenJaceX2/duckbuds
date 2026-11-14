@@ -479,9 +479,9 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     if (failed) {
         return false;
     }
-    const bool extent_changed = !output_image || in.render_size.width != render_extent.width ||
-                                in.render_size.height != render_extent.height ||
-                                in.upscale_size.width != upscale_extent.width ||
+    // Only the output size rebuilds the output. A new render size (dynamic resolution) keeps the
+    // history; the worker picks another mode only when it leaves the mode's range.
+    const bool extent_changed = !output_image || in.upscale_size.width != upscale_extent.width ||
                                 in.upscale_size.height != upscale_extent.height;
     const auto settings = Settings::GetNvidiaDlssRuntimeSettings();
     const bool options_changed = extent_changed || in.hdr != hdr_input ||
@@ -493,7 +493,6 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
     }
     if (extent_changed) {
         CreateOutput(in.upscale_size);
-        render_extent = in.render_size;
         upscale_extent = in.upscale_size;
     }
     hdr_input = in.hdr;
@@ -616,17 +615,20 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                     VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
         };
 
+        // Each resource has its image's real size; render_area is the region DLSS reads.
+        const auto size_or_render = [&](VkExtent2D size) {
+            return size.width != 0 ? size : in.render_size;
+        };
         sl::Resource color = Resource(in.color.image, in.color.view, in.color.format,
-                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
-                                      VK_IMAGE_USAGE_SAMPLED_BIT);
+                                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                      size_or_render(in.color_size), VK_IMAGE_USAGE_SAMPLED_BIT);
         sl::Resource depth = Resource(in.depth.image, in.depth.view, in.depth.format,
                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                      in.depth_size.width != 0 ? in.depth_size : in.render_size,
-                                      VK_IMAGE_USAGE_SAMPLED_BIT);
+                                      size_or_render(in.depth_size), VK_IMAGE_USAGE_SAMPLED_BIT);
         sl::Resource motion = Resource(in.motion_vectors.image, in.motion_vectors.view,
                                        in.motion_vectors.format,
-                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, in.render_size,
-                                       VK_IMAGE_USAGE_SAMPLED_BIT);
+                                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                       size_or_render(in.motion_size), VK_IMAGE_USAGE_SAMPLED_BIT);
         sl::Resource output = Resource(output_image_handle, output_view_handle, OUTPUT_FORMAT,
                                        VK_IMAGE_LAYOUT_GENERAL, in.upscale_size, OUTPUT_USAGE);
         const sl::Extent render_area{0, 0, in.render_size.width, in.render_size.height};
@@ -661,10 +663,13 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
         const auto lock = Streamline::LockStreamline();
         const auto result = VideoCommon::RecordDlssEvaluation(
             [&] {
-                if (!options_changed) {
+                namespace Mode = VideoCommon::DlssMode;
+                if (!options_changed &&
+                    Mode::Fits({in.render_size.width, in.render_size.height},
+                               {in.upscale_size.width, in.upscale_size.height}, evaluated_mode,
+                               mode_range)) {
                     return true;
                 }
-                namespace Mode = VideoCommon::DlssMode;
                 auto validated = options;
                 const auto selection = Mode::Select(
                     requested, {in.render_size.width, in.render_size.height},
@@ -701,6 +706,7 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 }
                 validated.mode = ModeFor(*selection.mode);
                 evaluated_mode = *selection.mode;
+                mode_range = selection.range;
                 LOG_INFO(Render_Vulkan,
                          "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}, {}",
                          in.render_size.width, in.render_size.height, in.upscale_size.width,

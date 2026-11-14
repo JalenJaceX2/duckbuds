@@ -67,6 +67,8 @@ TEST_CASE("DLSS requested modes fall back to a validated automatic mode", "[dlss
     REQUIRE(fallback.mode == Quality::Performance);
     REQUIRE(fallback.fallback);
     REQUIRE(fallback.requested_range->min.width == 2400);
+    REQUIRE(fallback.range.max.width == 2000);
+    REQUIRE(valid.range.max.height == 1520);
     const auto unavailable = Mode::Select(Quality::Balanced, {1920, 1080}, {3840, 2160}, query);
     REQUIRE(unavailable.mode == Quality::Performance);
     REQUIRE(unavailable.fallback);

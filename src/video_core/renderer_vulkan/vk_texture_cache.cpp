@@ -1872,7 +1872,7 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
     fsr3_last_evaluation = now;
 #ifdef EGLANTINE_STREAMLINE
     if (UpscaleWithDlss(dst_framebuffer, input_color, motion_vectors, depth, render_size, jitter,
-                        motion_scale, reset)) {
+                        motion_scale, reset, max_render_size)) {
         return true;
     }
 #endif
@@ -1983,7 +1983,8 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView& motion_vectors, ImageView& depth,
                                           std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale, bool reset) {
+                                          std::array<f32, 2> motion_scale, bool reset,
+                                          std::array<u32, 2> max_render_size) {
     // EDEN_NX2_DLSS_REPLACEMENT=fsr keeps FSR 3.1 for A/B runs.
     static const bool force_fsr = [] {
         const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
@@ -2024,6 +2025,14 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
             .barrier_aspect = ImageAspectMask(view.format),
         };
     };
+    // An image's size on the host (after resolution scaling); the render size is a region of it.
+    const auto host_size = [&](const ImageView& view) {
+        const Image* const backing = view.BackingImage();
+        return backing && backing->IsRescaled()
+                   ? VkExtent2D{resolution.ScaleUp(view.size.width),
+                                resolution.ScaleUp(view.size.height)}
+                   : VkExtent2D{view.size.width, view.size.height};
+    };
     const bool native_resolution =
         Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native;
     const VkExtent2D extent = native_resolution ? VkExtent2D{render_size[0], render_size[1]}
@@ -2043,6 +2052,9 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
             .reset = reset,
+            .depth_size = host_size(depth),
+            .color_size = {max_render_size[0], max_render_size[1]},
+            .motion_size = host_size(motion_vectors),
         });
     } catch (const vk::Exception& exception) {
         LOG_WARNING(Render_Vulkan, "NVIDIA DLSS evaluation unavailable ({}); using FSR 3.1",
