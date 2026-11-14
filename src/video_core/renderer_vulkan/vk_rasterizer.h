@@ -8,7 +8,6 @@
 #include <array>
 #include <optional>
 #include <string_view>
-#include <unordered_map>
 #include <unordered_set>
 
 #include <boost/container/static_vector.hpp>
@@ -19,7 +18,6 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
-#include "video_core/nx2_list_grid.h"
 #include "video_core/oot_network.h"
 #include "video_core/ocarina_upscale.h"
 #include "video_core/rasterizer_interface.h"
@@ -35,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/vertex_input_cache.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -117,12 +116,6 @@ public:
     bool IsGpuTickDone(u64 tick) override;
     void NoteGpuWrittenCommandListSynced(DAddr page) override;
     void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) override;
-    [[nodiscard]] bool Nx2ListGridSupported() const override;
-    void Nx2KeepListWords(u64 keep_id, GPUVAddr address, u64 hash,
-                          std::span<const u32> real) override;
-    void Nx2ExpectKeptWord(DAddr device_addr, u64 keep_id, u32 index) override;
-    [[nodiscard]] bool Nx2ReadKeptListWords(u64 keep_id, std::span<u32> words) override;
-    [[nodiscard]] std::optional<u64> Nx2FindKeptWord(DAddr device_addr, u32 marker) override;
     bool MustFlushRegion(DAddr addr, u64 size,
                          VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     VideoCore::RasterizerDownloadArea GetFlushArea(DAddr addr, u64 size) override;
@@ -165,8 +158,8 @@ public:
         return true;
     }
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
-        const Tegra::Engines::Fermi2D::Surface& src,
-        const Tegra::Engines::Fermi2D::Surface& dst) override;
+        const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst,
+        std::optional<std::array<u32, 2>> src_region) override;
     bool AccelerateTemporalUpscale(const Tegra::Engines::Fermi2D::Surface& src,
                                    const Tegra::Engines::Fermi2D::Surface& dst,
                                    const Tegra::Engines::Fermi2D::Surface& motion_vectors,
@@ -219,14 +212,6 @@ private:
     /// Records the copies of the command list pages the work just recorded wrote and submits, so
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
     void SubmitNx2ListCopies();
-    /// Verify mode (nx2_list_grid.h): an indirect dispatch's kept grid against the real one.
-    void VerifyKeptGrid(u64 keep_id);
-    /// AccelerateInlineToMemory for a write that carries list-fed grid markers: uploaded at once,
-    /// with the kept words copied over the markers on the host GPU.
-    void InlineKeptWords(DAddr device_addr, std::span<const u8> data,
-                         std::span<const Tegra::Nx2ListGrid::KeptPatch> patches);
-    /// Nx2ExpectKeptWord's words not yet written: keep id and word by device address (back).
-    std::unordered_map<DAddr, std::pair<u64, u32>> nx2_expected_words;
 
     /// Records the dynamic state of the draw being prepared with `pipeline` (null for
     /// DrawTexture's blit).
@@ -266,6 +251,18 @@ private:
     void UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
+
+    /// A dynamic vertex input state: what vkCmdSetVertexInputEXT is given.
+    struct VertexInputState {
+        boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
+        boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
+    };
+    /// Builds the state from the attribute formats, vertex streams and repacked bindings (the
+    /// registers VideoCommon::VertexInputKey holds).
+    void BuildVertexInput(const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes,
+                          u32 max_bindings, VertexInputState& state);
+    /// Dynamic vertex input states built before, by the registers they were built from.
+    VideoCommon::VertexInputCache<VertexInputState> vertex_input_cache;
 
     /// Clears a 3D color target whose slices the framebuffer can't reach. Returns true when handled.
     bool ClearVolumeSlices(const Framebuffer* framebuffer, u32 first_slice, u32 slice_count);
@@ -320,6 +317,8 @@ private:
     u32 draw_counter = 0;
     std::optional<u64> oot_camera_sample_frame;
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
+    /// The game started at the DLSS Performance render scale (1920x1080).
+    bool oot_performance_scale{};
     struct OcarinaMotionTrace {
         const Tegra::MemoryManager* camera_channel{};
         const Tegra::MemoryManager* depth_channel{};
@@ -327,8 +326,17 @@ private:
         GPUVAddr depth_address{};
         u32 depth_tic{};
         VkExtent2D extent{};
+        /// The scene render targets' size: larger than the extent where the game pads them.
+        VkExtent2D image_extent{};
         std::array<f32, 16> current{};
         std::array<f32, 16> previous{};
+
+        /// Whether an image holds the whole scene: the game samples padded targets through
+        /// descriptors of the scene's own size.
+        [[nodiscard]] bool SceneSized(u32 width, u32 height) const noexcept {
+            return (width == extent.width || width == image_extent.width) &&
+                   (height == extent.height || height == image_extent.height);
+        }
     } oot_motion;
     std::unique_ptr<class OcarinaUpscaler> oot_live_dlss;
     bool oot_live_failed{};
@@ -386,6 +394,7 @@ private:
         u32 vertex_lines{};
         u32 max_vertices{};
         u32 max_primitives{};
+        u32 primitive_vertices{3};
         std::array<u32, 4> position_lines{};
         bool pending{};
     } mesh_probe;
@@ -524,8 +533,7 @@ private:
     /// EDEN_NX2_FAST_DRAW_VERIFY: this draw passed DeltaStillHolds, so UpdateVertexInput compares
     /// the vertex input recorded last with what the registers give now.
     bool verify_vertex_input{};
-    boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> recorded_bindings;
-    boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> recorded_attributes;
+    VertexInputState recorded_vertex_input;
     bool vertex_input_recorded{};
 
     struct IndirectTrace {
