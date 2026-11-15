@@ -22,7 +22,7 @@ It pairs with the [playDB-CNT](https://github.com/sikoGD/playDB-CNT) launcher by
 ## What's new in v3
 
 - **Rebased on zortos293/Lichii build 177** (v2 was build 117).
-- **Sharper image with AMD FSR 3.1:** the game's own DLSS pass is replaced by FSR 3.1, fed with the game's real depth, motion vectors and jitter. The image is sharp and stable instead of blocky or blurry.
+- **Sharper image with AMD FSR 3.1:** the game's own DLSS pass is replaced by FSR 3.1, fed with the game's real depth, motion vectors and jitter. The image is sharp and stable instead of blocky or blurry. Based on Siko's v30 work (see [Credits](#credits-and-license)).
 - **Optional NVIDIA DLSS** for RTX cards (real DLSS through NVIDIA Streamline), with Auto, DLAA, Quality, Balanced, Performance and Ultra Performance modes. Switch live in game between FSR 3.1 and the DLSS modes. FSR 3.1 stays the automatic fallback. See [NVIDIA DLSS](#nvidia-dlss-optional).
 - **Fixes:**
   - the freeze / error 2153-0002 when the game saves
@@ -142,6 +142,8 @@ Branch [`dusk-v3r`](https://github.com/Mr-Tb/lichii-dusk/tree/dusk-v3r) (v2: [`d
 
 Built on [zortos293/Lichii](https://github.com/zortos293/Lichii), [Frizti/Lichii](https://github.com/Frizti/Lichii), [Eglantine](https://github.com/Djihads80/Eglantine), Eden, yuzu and Sudachi. The launcher and network-test servers are [playDB-CNT](https://github.com/sikoGD/playDB-CNT) by sikoGD. Licensed under GPL-3.0-or-later (see [LICENSE.txt](LICENSE.txt)). NVIDIA DLSS runs through NVIDIA Streamline (MIT license); NVIDIA's files are downloaded by the user, not shipped.
 
+Special thanks to **Siko** ([sikoGD](https://github.com/sikoGD)), author of the [playDB-CNT](https://github.com/sikoGD/playDB-CNT) launcher. This release owes a lot to his Duskbloods build v30 and its v31/v32 follow-ups. From his work we took how to feed the game's real inputs to the temporal upscaler: the motion-vector scale and jitter conventions, tracking the game's depth and velocity render targets, and keeping the upscaler history when the render region changes size. That is the basis of the sharp FSR 3.1 image. His v32 also pointed the way to the save-freeze (2153-0002) fix, and its pause logging is ported here.
+
 </details>
 
 <a id="arabic"></a>
@@ -158,7 +160,7 @@ Built on [zortos293/Lichii](https://github.com/zortos293/Lichii), [Frizti/Lichii
 ## الجديد في الإصدار الثالث
 
 - **مبني على الإصدار 177 من zortos293/Lichii** (الإصدار الثاني كان مبنيًا على 117).
-- **صورة أوضح مع AMD FSR 3.1:** استبدلنا مرحلة DLSS الخاصة باللعبة بـ FSR 3.1، ويستقبل العمق ومتجهات الحركة والـ jitter الحقيقية من اللعبة. النتيجة صورة حادّة وثابتة بدل الصورة المربّعة أو الضبابية.
+- **صورة أوضح مع AMD FSR 3.1:** استبدلنا مرحلة DLSS الخاصة باللعبة بـ FSR 3.1، ويستقبل العمق ومتجهات الحركة والـ jitter الحقيقية من اللعبة. النتيجة صورة حادّة وثابتة بدل الصورة المربّعة أو الضبابية. مبني على عمل Siko في نسخته v30 (راجع [الشكر](#الشكر-والترخيص)).
 - **NVIDIA DLSS اختياري** لكروت RTX (DLSS حقيقي عبر NVIDIA Streamline)، بأوضاع Auto وDLAA وQuality وBalanced وPerformance وUltra Performance. يمكنك التبديل بين FSR 3.1 وأوضاع DLSS أثناء اللعب مباشرة، ويبقى FSR 3.1 هو البديل التلقائي. راجع قسم [NVIDIA DLSS](#nvidia-dlss-اختياري).
 - **إصلاحات:**
   - التجمّد / الخطأ 2153-0002 عند حفظ اللعبة
@@ -284,6 +286,8 @@ Built on [zortos293/Lichii](https://github.com/zortos293/Lichii), [Frizti/Lichii
 ## الشكر والترخيص
 
 مبني على [zortos293/Lichii](https://github.com/zortos293/Lichii) و[Frizti/Lichii](https://github.com/Frizti/Lichii) و[Eglantine](https://github.com/Djihads80/Eglantine) وEden وyuzu وSudachi. المشغّل وخوادم الشبكة من [playDB-CNT](https://github.com/sikoGD/playDB-CNT) لـ sikoGD. الترخيص: GPL-3.0-or-later (راجع [LICENSE.txt](LICENSE.txt)). يعمل NVIDIA DLSS عبر NVIDIA Streamline (ترخيص MIT)، وملفات NVIDIA يحمّلها المستخدم بنفسه ولا تُوزَّع مع المحاكي.
+
+شكر خاص لـ **Siko** ‏([sikoGD](https://github.com/sikoGD))، صاحب المشغّل [playDB-CNT](https://github.com/sikoGD/playDB-CNT). هذا الإصدار مدين كثيرًا لنسخته v30 من Duskbloods ولتحديثيها v31 وv32. أخذنا من عمله طريقة تمرير مدخلات اللعبة الحقيقية إلى أداة رفع الدقة الزمنية (temporal upscaler): مقياس متجهات الحركة واصطلاحات الـ jitter، وتتبّع أهداف الرسم الخاصة بالعمق والسرعة في اللعبة، والاحتفاظ بسجلّ أداة رفع الدقة عندما يتغيّر حجم منطقة الرسم. هذا هو أساس صورة FSR 3.1 الحادّة. كما أرشدتنا نسخته v32 إلى طريق إصلاح تجمّد الحفظ (2153-0002)، ونقلنا منها تسجيل فترات التوقّف.
 
 </div>
 
