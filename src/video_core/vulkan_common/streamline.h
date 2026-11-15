@@ -95,6 +95,17 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
 /// Whether DLSS can run on the attached device.
 [[nodiscard]] bool IsDlssAvailable();
 
+/// DLSS was asked for when Streamline was last started: the nvidia_dlss setting or
+/// EDEN_NX2_DLSS_REPLACEMENT=dlss, and not EDEN_NX2_DLSS_REPLACEMENT=fsr.
+[[nodiscard]] bool Requested();
+
+/// DLSS rather than FSR 3.1 now: EDEN_NX2_DLSS_REPLACEMENT=dlss|fsr, else the nvidia_dlss setting
+/// (live, through Settings::RefreshNvidiaDlssRuntimeSettings).
+[[nodiscard]] bool DlssWanted();
+
+/// Warnings and errors Streamline has logged, for the DLSS stats line.
+[[nodiscard]] u64 LoggedProblems();
+
 /// DLSS Frame Generation is this session's frame generator: it was the frame generation type when
 /// the game started, the game hands it its inputs, DLSS-G, Reflex and PCL run on the attached
 /// device with their functions in GetApi(), and nothing (scRGB output, Streamline's swapchain

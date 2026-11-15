@@ -174,6 +174,9 @@ public:
     /// Logs the timer thread's waits once a second (EDEN_NX2_HOSTTIMING_STATS=1, or the debug
     /// server's host_timing).
     std::atomic<bool> host_wait_stats{};
+    /// EDEN_NX2_HOSTTIMING_SPIN: 1 = wait with Event::WaitFor only (pre-#1016), 0 = OS sleep,
+    /// -1 (unset) = WaitFor for The Duskbloods only.
+    int host_spin_env{-1};
 };
 
 /// Creates a core timing event with the given name and callback.

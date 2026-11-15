@@ -356,7 +356,7 @@ struct WordManager {
         if (ranges.empty())
             return;
         std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-        if (!Nx2Perf::Verify()) {
+        if (!Nx2Perf::Slow(Nx2Perf::Site::TrackerRuns)) {
             CoalesceInPlace(ranges);
             if (t_deferred_page_caching != nullptr) {
                 ASSERT_MSG(delta < 0, "deferred page caching was asked to track pages");

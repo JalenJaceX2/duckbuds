@@ -528,14 +528,14 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
     // takes the longer path below; the profile, the write history and the first-write trace
     // leave fast_maxwell3d off.
     if (fast_maxwell3d && executing_macro == 0 && method < MacroRegistersStart &&
-        !execution_mask[method] && !perf_verify) {
+        !execution_mask[method] && !perf_slow_method() && direct_state_write()) {
         return WriteStateRegister(method, method_argument);
     }
     if (!fast_maxwell3d || executing_macro != 0 || method >= MacroRegistersStart ||
         method == MAXWELL3D_REG_INDEX(shadow_ram_control)) {
         return CallMethodSlow(system, method, method_argument, is_last_call);
     }
-    if (perf_verify) {
+    if (perf_slow_method()) {
         return VerifyCallMethod(system, method, method_argument, is_last_call);
     }
     CallMethodFast(method, method_argument, is_last_call);
@@ -656,7 +656,7 @@ void Maxwell3D::CallConstBufferWords(Core::System& system, const u32* methods,
     for (u32 i = 0; i < count; ++i) {
         values[i] = replay ? shadow_state.reg_array[methods[i]] : arguments[i];
     }
-    if (perf_verify) {
+    if (perf_slow_cb_batch()) {
         for (u32 i = 0; i < count; ++i) {
             CallMethod(system, methods[i], arguments[i], true);
         }
@@ -700,7 +700,7 @@ void Maxwell3D::WriteStateRegisters(Core::System& system, std::span<const u64, 4
     // for registers the back changes itself: each normally changes the register here too, and is
     // then all CallMethod would do for it. Otherwise, and where CallMethod takes other paths,
     // the writes go one by one.
-    bool changes = fast_maxwell3d && executing_macro == 0 && !perf_verify &&
+    bool changes = fast_maxwell3d && executing_macro == 0 && !perf_slow_state_blocks() &&
                    SkipSameValueWrites() &&
                    shadow_state.shadow_ram_control != Regs::ShadowRamControl::Replay &&
                    !draw_manager.HasDeferredDraw();
@@ -1401,10 +1401,6 @@ struct Maxwell3D::FrontState {
     u64 back_last{};                 ///< The position after the last macro sent to the back
     std::atomic<u32> back_escapes{}; ///< Back macros that wrote outside their write set
     u32 back_escapes_seen{};
-    /// By start in the macro code of data_ram_generation: 0 unknown, 1 the macro can't use the
-    /// data RAM, 2 it can.
-    std::vector<u8> data_ram_macros;
-    u64 data_ram_generation{~u64{0}};
 };
 
 namespace {
@@ -1578,7 +1574,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
         front->control = shadow_state.shadow_ram_control;
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
-        front->state_blocks = front->skip_same && fast_maxwell3d && !perf_verify;
+        front->state_blocks = front->skip_same && fast_maxwell3d && !perf_slow_state_blocks();
         front->split_start = split.Starts();
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
@@ -1593,10 +1589,6 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
 // split stopped (accuracy settings changed mid-game). Hand the macros back: the front's copy
 // goes stale from now on, and a restart copies the registers again (Front).
 void Maxwell3D::ReleaseFront() {
-    // The engine's macros run unguarded from now on.
-    if (grid_marker.set) {
-        Nx2ListGrid::ResolveCells(grid_marker, native_data_ram);
-    }
     executing_macro = front->executing_macro;
     macro_params = std::move(front->parameters);
     // Entries macros the back ran may have written are the engine's already.
@@ -1859,25 +1851,6 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
     VideoCommon::Nx2Profile::CountMethod(method, false);
-    // List-fed grid markers (nx2_list_grid.h) in the data RAM: a 3D macro that can read it gets
-    // the real words first.
-    if (grid_marker.set && grid_marker.In(native_data_ram)) {
-        if (fs.data_ram_generation != engine.native_code_generation) {
-            fs.data_ram_macros.assign(engine.native_code.size() / 3, 0);
-            fs.data_ram_generation = engine.native_code_generation;
-        }
-        if (start < fs.data_ram_macros.size()) {
-            u8& uses = fs.data_ram_macros[start];
-            if (uses == 0) {
-                uses = TuringMacroInterpreter::AnalyzeEffects(engine.native_code, start).data_ram
-                           ? 2
-                           : 1;
-            }
-            if (uses == 2) {
-                Nx2ListGrid::ResolveCells(grid_marker, native_data_ram);
-            }
-        }
-    }
     namespace ListTrace = VideoCommon::ListMacroTrace;
     ListTrace::Call* const trace =
         ListTrace::g_enabled

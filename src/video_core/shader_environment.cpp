@@ -792,6 +792,31 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(
             }
         }
     }
+    // EDEN_NX2_DUSK_GATHER=skip (default) | draw: The Duskbloods' TLD4 0xf63 with a uniform-register
+    // handle and an AOFFI offset (bit 76). dusk-v2.5 rejected it ("native texture gather mode") and
+    // skipped its draws; #1363 lowers it, and in v3r the hub then shows red line artifacts. skip
+    // keeps v2.5's behaviour; draw lowers it as upstream does.
+    if (Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL &&
+        std::ranges::any_of(native, [](const Instruction& insn) {
+            return (insn.words[0] & 0xfff) == 0xf63 && ((insn.words[0] >> 12) & 15) != 15 &&
+                   ((insn.words[2] >> 12) & 1) != 0;
+        })) {
+        static const bool skip = [] {
+            const char* value = std::getenv("EDEN_NX2_DUSK_GATHER");
+            return value == nullptr || std::string_view{value} != "draw";
+        }();
+        if (skip) {
+            throw Shader::RuntimeError("Duskbloods: native texture gather mode rejected (v2.5 behaviour), "
+                                       "draw skipped: native shader at {:#x} ({:016x})",
+                                       program_base, result->native_program_key);
+        }
+        static std::atomic_flag logged;
+        if (!logged.test_and_set()) {
+            LOG_INFO(Shader, "Duskbloods: bindless AOFFI texture gather drawn (EDEN_NX2_DUSK_GATHER=draw): "
+                             "native shader at {:#x}, key {:016x} (EDEN_NX2_REJECT_HASH)",
+                     program_base, result->native_program_key);
+        }
+    }
     // The same list, changed at runtime by the debug server (docs/nx2/debug-mcp.md).
     if (VideoCore::Nx2Debug::AnyRejected()) {
         for (const u64 hash : {result->native_program_key, NativeShaderHash(lowered_code)}) {

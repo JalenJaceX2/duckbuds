@@ -6,6 +6,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <vulkan/vulkan_core.h>
 #include "common/settings.h"
 #include "video_core/framebuffer_config.h"
@@ -42,17 +43,23 @@ void BlitScreen::SetWindowAdaptPass(const Device& device) {
     layers.clear();
     scaling_filter = filters.get_scaling_filter();
 
+    // Bilinear without mips skips texels when minifying (a 2x/4K image in a smaller window), which
+    // leaves thin HUD lines and text jagged. Area sampling averages the whole footprint.
+    const auto make_linear = [&](VkFormat format) {
+        return area_downscale ? MakeArea(device, format) : MakeBilinear(device, format);
+    };
+
     hdr10_encode.reset();
     hdr10_composite.clear();
     if (swapchain_view_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
         // Layers are blended in linear light (scRGB) and the composite encoded to PQ, as alpha
         // blending PQ code values darkens translucent layers far beyond their alpha.
-        window_adapt = MakeBilinear(device, VK_FORMAT_R16G16B16A16_SFLOAT);
+        window_adapt = make_linear(VK_FORMAT_R16G16B16A16_SFLOAT);
         hdr10_encode.emplace(device, image_count, swapchain_view_format);
         return;
     }
     if (swapchain_view_format == VK_FORMAT_R16G16B16A16_SFLOAT) {
-        window_adapt = MakeBilinear(device, swapchain_view_format);
+        window_adapt = make_linear(swapchain_view_format);
         return;
     }
 
@@ -96,7 +103,7 @@ void BlitScreen::SetWindowAdaptPass(const Device& device) {
     case Settings::ScalingFilter::SgsrEdge:
     case Settings::ScalingFilter::Bilinear:
     default:
-        window_adapt = MakeBilinear(device, swapchain_view_format);
+        window_adapt = make_linear(swapchain_view_format);
         break;
     }
 }
@@ -128,6 +135,18 @@ void BlitScreen::DrawToFrame(const Device& device, RasterizerVulkan& rasterizer,
     bool presentation_recreate_required = false;
 
     if (!window_adapt || scaling_filter != filters.get_scaling_filter()) {
+        resource_update_required = true;
+    }
+
+    const auto& resolution = Settings::values.resolution_info;
+    const bool downscale =
+        filters.get_scaling_filter() == Settings::ScalingFilter::Bilinear &&
+        std::ranges::any_of(framebuffers, [&](const Tegra::FramebufferConfig& fb) {
+            return resolution.ScaleUp(fb.width) > layout.screen.GetWidth() ||
+                   resolution.ScaleUp(fb.height) > layout.screen.GetHeight();
+        });
+    if (downscale != area_downscale) {
+        area_downscale = downscale;
         resource_update_required = true;
     }
 

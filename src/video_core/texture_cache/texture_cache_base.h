@@ -28,6 +28,7 @@
 #include "common/common_types.h"
 #include "common/spin_recursive_mutex.h"
 #include "common/hash.h"
+#include "common/settings.h"
 #include "common/literals.h"
 #include "common/lru_cache.h"
 #include <ranges>
@@ -40,6 +41,7 @@
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/game_dlss_status.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/descriptor_table.h"
 #include "video_core/texture_cache/image_base.h"
@@ -313,6 +315,14 @@ public:
     /// Whether sampling the views now needs PrepareImageView: an image with an upload pending or
     /// a newer alias to copy in (fast draw delta draws keep their views and prepare none).
     [[nodiscard]] bool SampledViewsChange(std::span<const ImageViewInOut> views) const noexcept {
+        // alias_full_resolve (Nx2Perf): any sampled image with aliases takes the full path.
+        if (Nx2Perf::AliasOn(Nx2Perf::Alias::FullResolve) &&
+            std::ranges::any_of(views, [&](const ImageViewInOut& view) {
+                return PreparesImage(slot_image_views, view.id) &&
+                       !slot_images[slot_image_views[view.id].image_id].aliased_images.empty();
+            })) {
+            return true;
+        }
         return VideoCommon::SampledViewsChange(views, slot_image_views, slot_images);
     }
 
@@ -367,6 +377,37 @@ public:
         return std::exchange(churn, {});
     }
 
+    /// The guest memory [gpu_addr, +size) of colour target `index` when a clear of `area` (host
+    /// pixels, from the origin) covers all of it: a single-level, single-layer 2D image whose
+    /// view starts at its base. nullopt otherwise.
+    [[nodiscard]] std::optional<std::pair<GPUVAddr, u64>> CoveredColorTarget(size_t index,
+                                                                             u32 area_width,
+                                                                             u32 area_height) {
+        const ImageViewId view_id = render_targets.color_buffer_ids[index];
+        if (!view_id) {
+            return std::nullopt;
+        }
+        const ImageView& view = slot_image_views[view_id];
+        if (!view.image_id || view.range.base.layer != 0 || view.range.base.level != 0) {
+            return std::nullopt;
+        }
+        const Image& image = slot_images[view.image_id];
+        if (image.info.type != ImageType::e2D || image.info.resources.levels != 1 ||
+            image.info.resources.layers != 1) {
+            return std::nullopt;
+        }
+        u32 width = image.info.size.width;
+        u32 height = image.info.size.height;
+        if (True(image.flags & ImageFlagBits::Rescaled)) {
+            width = Settings::values.resolution_info.ScaleUp(width);
+            height = Settings::values.resolution_info.ScaleUp(height);
+        }
+        if (area_width < width || area_height < height) {
+            return std::nullopt;
+        }
+        return std::pair{image.gpu_addr, image.guest_size_bytes};
+    }
+
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
 
@@ -397,7 +438,8 @@ public:
                          const Tegra::Engines::Fermi2D::Surface& motion_vectors,
                          const Tegra::Texture::TICEntry* depth, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale, bool use_history,
-                         std::optional<std::array<u32, 2>> render_region = std::nullopt);
+                         std::optional<std::array<u32, 2>> render_region = std::nullopt,
+                         const std::pair<ImageInfo, GPUVAddr>* depth_target = nullptr);
 
     /// Health check of a game's DLSS network output (dst) against its input (src); see the
     /// runtime's ProbeGameDlssOutput. Returns an earlier check's result when one is ready.
@@ -499,6 +541,13 @@ private:
     /// Refresh the contents (pixel data) of an image
     [[nodiscard]] bool IsDownloadable(const ImageBase& image) const noexcept;
 
+    /// Overlaps the GPU drew to after a badly overlapping image, and theirs, oldest first.
+    [[nodiscard]] boost::container::small_vector<ImageId, 8> NewerGpuOverlaps(
+        const ImageBase& image) const;
+
+    /// Copies a GPU-written image back to guest memory and waits for it.
+    void WriteBackImage(Image& image);
+
     void RefreshContents(Image& image, ImageId image_id);
 
     /// Upload data from guest to an image
@@ -594,7 +643,7 @@ private:
     void MarkModification(ImageBase& image) noexcept;
 
     /// Synchronize image aliases, copying data if needed
-    void SynchronizeAliases(ImageId image_id);
+    void SynchronizeAliases(ImageId image_id, bool after_upload = false);
 
     /// Prepare an image view to be used
     void PrepareImageView(ImageViewId image_view_id, bool is_modification, bool invalidate);

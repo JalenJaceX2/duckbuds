@@ -57,13 +57,14 @@ namespace VkDeviceInfo {
 class Record {
 public:
     explicit Record(std::string_view name, const std::vector<VkPresentModeKHR>& vsync_modes,
-                    bool has_broken_compute, bool fsr4_capable);
+                    bool has_broken_compute, bool fsr4_capable, bool nvidia_rtx);
     ~Record();
 
     const std::string name;
     const std::vector<VkPresentModeKHR> vsync_support;
     const bool has_broken_compute;
     const bool fsr4_capable; ///< VideoCommon::IsFsr4CapableGpu, IsFsr4PortGpu on Linux
+    const bool nvidia_rtx;   ///< NVIDIA (0x10DE) with "RTX" in its name: DLSS settings are shown
 };
 
 // TODO(crueter): Port some configure_graphics.cpp stuff

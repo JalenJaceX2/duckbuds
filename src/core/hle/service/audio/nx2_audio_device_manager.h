@@ -36,14 +36,41 @@ namespace Service::Audio {
 struct Nx2SysmixStreams {
     explicit Nx2SysmixStreams(Core::System& system_) : system{system_} {
         timer = Core::Timing::CreateEvent("sysmix output", [this](s64, std::chrono::nanoseconds late) {
-            std::unique_lock lock{mutex, std::try_to_lock};
-            if (lock) {
-                for (auto& [id, stream] : streams) {
-                    stream->Pump();
-                }
-            }
             const auto interval = std::chrono::nanoseconds{std::chrono::milliseconds{5}};
             const auto missed = std::max(late, std::chrono::nanoseconds::zero()) / interval;
+            // A late wake skips the missed ticks below; they are owed and pumped as soon as a
+            // stream can take a block (a full host queue, SysmixQueueLimit, or a short guest ring
+            // keeps the debt for later ticks), or that audio is lost for good. Lateness after a
+            // pause is clamped by core timing, so a pause owes nothing. Over the cap (200 ms) the
+            // excess is dropped rather than played late as a burst. Only this callback touches
+            // catch_up (core timing runs it serialized).
+            constexpr u32 MaxOwed = 40;
+            catch_up.max_late_us = std::max<s64>(catch_up.max_late_us, late.count() / 1000);
+            u64 owed = u64{catch_up.owed} + static_cast<u64>(missed);
+            std::unique_lock lock{mutex, std::try_to_lock};
+            if (!lock) {
+                ++owed; // This tick's pump too.
+            }
+            if (owed > MaxOwed) {
+                catch_up.dropped += owed - MaxOwed;
+                owed = MaxOwed;
+            }
+            catch_up.owed = static_cast<u32>(owed);
+            if (lock) {
+                for (auto& [id, stream] : streams) {
+                    stream->Pump(&catch_up);
+                }
+                while (catch_up.owed > 0) {
+                    bool moved = false;
+                    for (auto& [id, stream] : streams) {
+                        moved |= stream->Pump(&catch_up);
+                    }
+                    if (!moved) {
+                        break;
+                    }
+                    --catch_up.owed;
+                }
+            }
             return std::optional<std::chrono::nanoseconds>{interval * (missed + 1)};
         });
         system.CoreTiming().ScheduleLoopingEvent(std::chrono::milliseconds{5},
@@ -82,6 +109,7 @@ struct Nx2SysmixStreams {
 
     std::mutex mutex;
     std::map<u32, std::shared_ptr<SysmixOutput>> streams;
+    SysmixCatchUp catch_up;
     u32 next_id{1};
     Core::System& system;
     std::shared_ptr<Core::Timing::EventType> timer;

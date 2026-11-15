@@ -118,6 +118,10 @@ struct GPU::Impl {
         // ~900 calls a frame, most with nothing collected: gather (applying_writes_mutex and two
         // locks per core's manager) only when a manager shows a write. One collected after this
         // check is gathered by the next call, as one collected just after the gather would be.
+        if (VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::GatherSkip)) {
+            ApplyCollectedWrites(); // before #1586: gather on every call
+            return;
+        }
         const auto managers = system.GetGPUDirtyMemoryManager();
         const auto collects = [&managers] {
             u64 sum = 0;

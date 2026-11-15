@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <condition_variable>
+#include <stdexcept>
 #include <deque>
 #include <mutex>
 #include <unordered_map>
@@ -26,6 +28,12 @@ struct State {
     bool reject_pending{};
     bool unrejected{};
     bool open{};
+    DrawFilter filter;
+    u64 filter_generation{};
+    u64 filter_applied{};
+    bool filter_pending{};
+    std::deque<u64> draw_lists;
+    std::unordered_map<u64, std::vector<DrawRecord>> draw_list_results;
 };
 
 State state;
@@ -33,10 +41,151 @@ std::atomic<bool> pending{};
 std::atomic<bool> any_rejected{};
 
 void UpdatePending() {
-    pending.store(!state.captures.empty() || !state.gpu_reads.empty() || state.reject_pending, std::memory_order_relaxed);
+    pending.store(!state.captures.empty() || !state.gpu_reads.empty() || state.reject_pending ||
+                      state.filter_pending || !state.draw_lists.empty(),
+                  std::memory_order_relaxed);
+}
+
+u64 ParseNumber(std::string_view text, int base) {
+    if (base == 16 && (text.starts_with("0x") || text.starts_with("0X"))) {
+        text.remove_prefix(2);
+    }
+    u64 value{};
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value, base);
+    if (text.empty() || error != std::errc{} || end != text.data() + text.size()) {
+        throw std::invalid_argument{"bad number \"" + std::string{text} + "\""};
+    }
+    return value;
 }
 
 } // Anonymous namespace
+
+DrawFilter ParseDrawFilter(std::string_view text) {
+    DrawFilter filter;
+    while (!text.empty()) {
+        const size_t end = (std::min)(text.find(';'), text.size());
+        const std::string_view rule = text.substr(0, end);
+        text.remove_prefix((std::min)(end + 1, text.size()));
+        if (rule.empty()) {
+            continue;
+        }
+        const size_t equals = rule.find('=');
+        if (equals == std::string_view::npos) {
+            throw std::invalid_argument{"rule \"" + std::string{rule} + "\" has no '='"};
+        }
+        const std::string_view key = rule.substr(0, equals);
+        std::string_view value = rule.substr(equals + 1);
+        if (key == "range") {
+            const size_t dash = value.find('-');
+            if (dash == std::string_view::npos) {
+                throw std::invalid_argument{"range wants a-b"};
+            }
+            filter.range_begin = static_cast<u32>(ParseNumber(value.substr(0, dash), 10));
+            filter.range_end = static_cast<u32>(ParseNumber(value.substr(dash + 1), 10));
+        } else if (key == "ps" || key == "vs") {
+            auto& list = key == "ps" ? filter.ps : filter.vs;
+            while (!value.empty()) {
+                const size_t comma = (std::min)(value.find(','), value.size());
+                list.push_back(ParseNumber(value.substr(0, comma), 16));
+                value.remove_prefix((std::min)(comma + 1, value.size()));
+            }
+        } else if (key == "lines") {
+            filter.lines = value != "0";
+        } else if (key == "rt0") {
+            filter.rt0 = ParseNumber(value, 16);
+        } else {
+            throw std::invalid_argument{"unknown rule \"" + std::string{key} +
+                                        "\": want range, ps, vs, lines or rt0"};
+        }
+    }
+    return filter;
+}
+
+u64 SetDrawFilter(DrawFilter filter) {
+    std::scoped_lock lock{state.mutex};
+    state.filter = std::move(filter);
+    state.filter_pending = true;
+    UpdatePending();
+    return ++state.filter_generation;
+}
+
+DrawFilter CurrentDrawFilter() {
+    std::scoped_lock lock{state.mutex};
+    return state.filter;
+}
+
+std::optional<std::pair<u64, DrawFilter>> TakeDrawFilter() {
+    std::scoped_lock lock{state.mutex};
+    if (!state.filter_pending) {
+        return std::nullopt;
+    }
+    state.filter_pending = false;
+    UpdatePending();
+    return std::make_pair(state.filter_generation, state.filter);
+}
+
+void NoteDrawFilterApplied(u64 generation) {
+    {
+        std::scoped_lock lock{state.mutex};
+        state.filter_applied = (std::max)(state.filter_applied, generation);
+    }
+    state.changed.notify_all();
+}
+
+void RequestDrawList(u64 id) {
+    std::scoped_lock lock{state.mutex};
+    state.draw_lists.push_back(id);
+    UpdatePending();
+}
+
+void CancelDrawList(u64 id) {
+    std::scoped_lock lock{state.mutex};
+    std::erase(state.draw_lists, id);
+    state.draw_list_results.erase(id);
+    UpdatePending();
+}
+
+std::optional<std::vector<DrawRecord>> WaitDrawList(u64 id, std::chrono::milliseconds timeout) {
+    std::unique_lock lock{state.mutex};
+    state.changed.wait_for(lock, timeout,
+                           [id] { return !state.open || state.draw_list_results.contains(id); });
+    const auto it = state.draw_list_results.find(id);
+    if (it == state.draw_list_results.end()) {
+        return std::nullopt;
+    }
+    std::vector<DrawRecord> draws = std::move(it->second);
+    state.draw_list_results.erase(it);
+    return draws;
+}
+
+std::optional<u64> TakeDrawList() {
+    std::scoped_lock lock{state.mutex};
+    if (state.draw_lists.empty()) {
+        return std::nullopt;
+    }
+    const u64 id = state.draw_lists.front();
+    state.draw_lists.pop_front();
+    UpdatePending();
+    return id;
+}
+
+void FinishDrawList(u64 id, std::vector<DrawRecord> draws) {
+    {
+        std::scoped_lock lock{state.mutex};
+        if (!state.open) {
+            return;
+        }
+        state.draw_list_results.insert_or_assign(id, std::move(draws));
+    }
+    state.changed.notify_all();
+}
+
+bool WaitDrawFilterApplied(u64 generation, std::chrono::milliseconds timeout) {
+    std::unique_lock lock{state.mutex};
+    return state.changed.wait_for(lock, timeout, [generation] {
+        return !state.open || state.filter_applied >= generation;
+    }) && state.filter_applied >= generation;
+}
 
 void BeginSession() {
     std::scoped_lock lock{state.mutex};
@@ -44,10 +193,15 @@ void BeginSession() {
     state.finished.clear();
     state.gpu_reads.clear();
     state.gpu_read_results.clear();
+    state.draw_lists.clear();
+    state.draw_list_results.clear();
     state.rejected.clear();
     state.reject_pending = false;
     state.unrejected = false;
     state.applied_generation = state.reject_generation;
+    state.filter = {};
+    state.filter_pending = false;
+    state.filter_applied = state.filter_generation;
     state.open = true;
     any_rejected.store(false, std::memory_order_relaxed);
     UpdatePending();
@@ -59,6 +213,7 @@ void EndSession() {
         state.open = false;
         state.captures.clear();
         state.gpu_reads.clear();
+        state.draw_lists.clear();
         UpdatePending();
     }
     state.changed.notify_all();

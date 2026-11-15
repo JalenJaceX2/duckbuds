@@ -250,6 +250,59 @@ The tool waits until the rasterizer applies the change and reports `applied`. A 
 loop: reject half of the candidates, screenshot, compare. Today each step is a rebuild of the
 environment plus a relaunch plus a replay.
 
+**`draw_skip`** `{range?: [first, end], vs?: [hash], ps?: [hash], lines?, rt0?, spec?, timeout_s?}`
+replaces the draw filter; `{}` clears it. A graphics draw is skipped when its index in the frame
+(counted from 0 at each `TickFrame`, only draws that got a pipeline) is in `[first, end)`, its
+vertex or pixel shader hash (frame dump `shaders`, `ShaderHashes()[1]` and `[5]`) is listed, its
+topology is a line type (`lines`), or its colour target 0 is at `rt0`. Only the draw call is left
+out (`RasterizerVulkan::PrepareDraw`, right before `draw_func`): pipeline, bindings, render pass,
+dynamic state and queries are set up as usual, so later draws see the same state. The filter
+changes at a frame end, like `reject_shaders`. `spec` takes the `EDEN_NX2_DRAW_SKIP` text
+(`range=a-b;ps=<hash>,...;vs=...;lines=1;rt0=0x...`), which applies the same filter from boot.
+Draws through `DrawTexture`, clears and blits are not counted or skipped.
+
+**`draw_list`** `{save?, inline?, timeout_s?}` records the graphics draws of the next whole
+frame (frame end to frame end, at most 20000) right before each draw call, in the order and with
+the indices `draw_skip` uses: topology, indexed/indirect, count, first, instances, every stage's
+guest address and shader hash (`vs`, `ps` for the vertex and pixel ones), colour targets (address,
+format), render target size, depth target and test/write/func, blend enable mask and target 0's
+equation, colour mask, cull, line width, viewport 0, the first four vertex streams (address,
+stride) and the index buffer. Draws a filter skipped are listed with `skipped: true`. With `save`
+(default) the list also goes to `drawlist-<session>-<n>.json` in the dump directory. Read a draw's
+raw vertex or index data with `read_gpu_memory` at the stream address.
+
+### Live optimisation switches (implemented)
+
+Bisecting an optimisation inside one running session instead of one relaunch per guess. The state
+is `VideoCommon::Nx2Perf::LiveState` (`video_core/nx2_perf.h`): it starts from the switches
+(`EDEN_NX2_PERF_VERIFY`, `_PERF_SLOW`, `_INLINE_DEFER`, `_DUSK_BACKX(_PIECES)`, `_UBOREUSE`,
+`_FRAMES_AHEAD`, `_FENCE_BATCH`, `_SYNC_SUBMIT`); a change is queued and `RasterizerVulkan::TickFrame`
+applies it at the next frame end (log line `Nx2Perf live change #n at frame f`), then resets the
+uniform stream reuse slots; the thread-local storage binding memo keys on the change count. Every
+site reads the state with one relaxed atomic load where it decides, and each decision is per call:
+both paths of a site leave the same cache state (that is what `PERF_VERIFY` checks), so a flip is
+safe whichever thread is in the middle of a site. Each call waits (`timeout_s`, default 5) for the
+frame end and returns the applied state with `applied`, `frame` (rasterizer frame) and `presents`.
+
+**`perf_sites`** `{}` lists every site with `state` (`fast`/`slow`), `named`, `live` (all are) and
+a rough `cost` of its slow path, the Duskbloods back pieces (`old`/`upstream`), the other controls
+and what stays start-time only.
+
+**`perf_slow`** `{sites: [name, ...] | "all" | [], verify?: false}` replaces the slow set,
+`inline_defer` included (slow = immediate invalidation); `[]` is everything fast, the normal state.
+`verify: true` is `EDEN_NX2_PERF_VERIFY=1` (every site but `inline_defer`).
+
+**`perf_flip`** `{control, value}`: `inline_defer` 0 (immediate) | 1 (deferred, normal);
+`uboreuse`, `frames_ahead`, `fence_batch`, `sync_submit` 0 | 1 | `"default"` (the start switch);
+`backx` (all pieces) or `backx.<piece>` `"old"` | `"upstream"`; `verify` 0 | 1. `frames_ahead`
+acts from the next present, `fence_batch` from the next fence batch, `sync_submit` from the next
+GPFIFO submit (the guest thread waits up to 2 s for its own fence, as `EDEN_NX2_SYNC_SUBMIT=1`).
+
+Start-time only: `state_blocks`' front half (the split front decides whether it sends register
+blocks when it starts; the back applying them one write at a time is live), `EDEN_NX2_SPLIT`, and
+every other switch. Read the frame rate after a flip with `status {fps_window_ms}` or
+`frame_times {seconds}`.
+
 ### Guest and GPU memory (implemented)
 
 All three are read only. Reads return at most 64 KiB. Addresses are hex strings (`"0x8012345000"`)

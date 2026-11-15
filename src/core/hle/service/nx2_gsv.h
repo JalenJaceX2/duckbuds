@@ -70,6 +70,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/nx2_video_decoder.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/textures/decoders.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
@@ -681,9 +682,12 @@ private:
                  w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12]);
         if (last > start && ((last + 1 - start) % Core::Memory::LICHII_PAGESIZE) == 0) {
             const u64 size = last + 1 - start;
+            // dusk-v2.5 with EDEN_NX2_GPU_MAP_FLAG_PROBE=1: The Duskbloods' own 216 maps back its
+            // GPU-only regions (generic registry mapping); the server allocates nothing for them.
+            const bool client_tiles = UsesClientTileBacking();
             const bool lazy_sparse = (w[7] & SparseRegionFlag) != 0 && LazySparseRegions();
             const bool back_whole =
-                !lazy_sparse && (!LazyGpuOnlyRegions() || KeepsConstantsInGpuOnlyRegions());
+                !client_tiles && !lazy_sparse && (!LazyGpuOnlyRegions() || KeepsConstantsInGpuOnlyRegions());
             // Kernel calls are made without m_region_mutex, which the GPU thread takes: mapping can
             // wait on the guest page table lock. Released regions go back first, so their memory
             // can back this one.
@@ -695,10 +699,13 @@ private:
             }
             auto backing = back_whole ? AllocateGpuOnlyBacking(size, true, false) : std::nullopt;
             std::scoped_lock lk{m_region_mutex};
-            if ((w[7] & SparseRegionFlag) == 0) {
+            if ((w[7] & SparseRegionFlag) == 0 && !client_tiles) {
                 m_gpu_only_ranges[start] = size; // kept out of 216, however it is backed
             }
-            if (lazy_sparse) {
+            if (client_tiles) {
+                LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] uses client tile backing",
+                         start, last);
+            } else if (lazy_sparse) {
                 // Title 1's terrain texture arrays and layer pools (170 MB-5.8 GB, mostly empty):
                 // backed whole, they ran the pool dry and the later ones got no memory at all.
                 // The region gets a device range of its own, unbacked pages read zero, and
@@ -1088,6 +1095,16 @@ private:
         return process != nullptr && process->GetProgramId() == 0x0400D1D02399A000ULL;
     }
 
+    // EDEN_NX2_GPU_MAP_FLAG_PROBE: unset = on for The Duskbloods only (dusk-v2.5 ran with =1), 1 = on,
+    // 0 = off (server-backed GPU-only regions, upstream).
+    bool UsesClientTileBacking() const {
+        static const int probe = [] {
+            const char* value = std::getenv("EDEN_NX2_GPU_MAP_FLAG_PROBE");
+            return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
+        }();
+        return probe == -1 ? KeepsConstantsInGpuOnlyRegions() : probe == 1;
+    }
+
     static bool LazyGpuOnlyRegions() {
         static const bool lazy = [] {
             const char* value = std::getenv("EDEN_NX2_GPU_ONLY_LAZY");
@@ -1336,7 +1353,11 @@ private:
         LOG_DEBUG(Service, "nx2:gpu 216 map [{:#x}, +{:#x}] -> memory {} offset {:#x} kind {:#x}",
                   gpu_address, size, request.memory_handle, request.offset, request.kind);
         if (region == nullptr) {
-            registry.MapAt(gpu_address, cpu_address, size);
+            if (UsesClientTileBacking()) {
+                registry.MapAt(request.memory_handle, request.offset, gpu_address, cpu_address, size);
+            } else {
+                registry.MapAt(gpu_address, cpu_address, size);
+            }
             return;
         }
         if (!region->tiles) {
@@ -2037,7 +2058,10 @@ private:
         constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
         // Ocarina waited ~12 ms a frame on its previous frame's fence here (#161).
         constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
-        int frames_ahead = frames_ahead_setting;
+        // The debug server's perf_flip frames_ahead overrides it from the next present on.
+        const int live_frames_ahead =
+            VideoCommon::Nx2Perf::g_frames_ahead.load(std::memory_order_relaxed);
+        int frames_ahead = live_frames_ahead >= 0 ? live_frames_ahead : frames_ahead_setting;
         const u64 app_program_id = system.GetApplicationProcessProgramID();
         if (frames_ahead == -1 && app_program_id == DonkeyKongBananzaProgramId) {
             frames_ahead = 0;

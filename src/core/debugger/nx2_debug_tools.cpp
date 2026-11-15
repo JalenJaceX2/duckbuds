@@ -32,7 +32,9 @@
 #include "core/memory.h"
 #include "hid_core/hid_core.h"
 #include "video_core/gpu.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/renderer_base.h"
 
 namespace Core::Nx2Debug {
@@ -79,6 +81,7 @@ struct ToolState {
     u64 screenshots{};
     u64 samples{};
     u64 gpu_reads{};
+    u64 draw_lists{};
     std::atomic<bool> stopping{};
 };
 
@@ -206,6 +209,10 @@ json Status(ToolState& state, const json& params) {
         {"dump_dir", state.dump_directory.generic_string()},
         {"log_filter", state.log_filter},
         {"rejected", HexList(VideoCore::Nx2Debug::RejectedHashes())},
+        {"dlss", [] {
+             std::scoped_lock lock{VideoCommon::Nx2Perf::g_dlss_stats_mutex};
+             return VideoCommon::Nx2Perf::g_dlss_stats;
+         }()},
     };
 }
 
@@ -476,6 +483,341 @@ json RejectShaders(ToolState&, const json& params) {
     return result;
 }
 
+json DrawFilterJson(const VideoCore::Nx2Debug::DrawFilter& filter) {
+    return {{"range", {filter.range_begin, filter.range_end}},
+            {"vs", HexList(filter.vs)},
+            {"ps", HexList(filter.ps)},
+            {"lines", filter.lines},
+            {"rt0", HexAddress(filter.rt0)}};
+}
+
+/// Replaces the draw filter: {range: [a, b]?, vs: [hash]?, ps: [hash]?, lines?, rt0?} or
+/// {spec: "<EDEN_NX2_DRAW_SKIP text>"}; {} clears it. Skips only the draw calls, at the next frame.
+json DrawSkip(ToolState&, const json& params) {
+    if (!IsVulkan()) {
+        throw std::runtime_error{"draw_skip needs the Vulkan renderer"};
+    }
+    VideoCore::Nx2Debug::DrawFilter filter;
+    if (params.contains("spec")) {
+        try {
+            filter = VideoCore::Nx2Debug::ParseDrawFilter(params.at("spec").get<std::string>());
+        } catch (const std::invalid_argument& error) {
+            throw std::runtime_error{error.what()};
+        }
+    }
+    if (const json& range = params.value("range", json::array()); !range.empty()) {
+        if (!range.is_array() || range.size() != 2) {
+            throw std::runtime_error{"range must be [first, end) as two draw indices"};
+        }
+        filter.range_begin = range[0].get<u32>();
+        filter.range_end = range[1].get<u32>();
+    }
+    for (const json& hash : params.value("vs", json::array())) {
+        filter.vs.push_back(ParseShaderHash(hash.get<std::string>()));
+    }
+    for (const json& hash : params.value("ps", json::array())) {
+        filter.ps.push_back(ParseShaderHash(hash.get<std::string>()));
+    }
+    filter.lines |= params.value("lines", false);
+    if (params.contains("rt0")) {
+        filter.rt0 = AddressParam(params, "rt0");
+    }
+    const u64 generation = VideoCore::Nx2Debug::SetDrawFilter(filter);
+    const int timeout = Param<int>(params, "timeout_s", 5, 0, 60);
+    const bool applied =
+        VideoCore::Nx2Debug::WaitDrawFilterApplied(generation, std::chrono::seconds{timeout});
+    json result = {{"filter", DrawFilterJson(filter)}, {"active", !filter.Empty()}, {"applied", applied}};
+    if (!applied) {
+        result["note"] = "no frame was presented yet; the filter applies at the next frame end";
+    }
+    return result;
+}
+
+// Live optimisation switches (perf_sites / perf_slow / perf_flip): Nx2Perf::LiveState, applied
+// by the rasterizer at the next frame end.
+namespace Perf = VideoCommon::Nx2Perf;
+
+/// What the slow path of each site costs, roughly (for spacing screenshots after a flip).
+constexpr std::array<std::string_view, Perf::SiteNames.size()> SiteCosts{
+    "low",    "low",  "medium", "medium", "low",  "low",    "low",    "low",  "high",
+    "medium", "low",  "medium", "high",   "medium", "low", "high", "high (new pipelines)", "medium",
+};
+
+json LiveJson(const Perf::LiveState& live) {
+    json sites = json::array();
+    const u32 slow = live.Effective();
+    for (size_t i = 0; i < Perf::SiteNames.size(); ++i) {
+        sites.push_back({{"name", Perf::SiteNames[i]},
+                         {"state", (slow >> i & 1) != 0 ? "slow" : "fast"},
+                         {"named", (live.named >> i & 1) != 0},
+                         {"live", true},
+                         {"cost", SiteCosts[i]}});
+    }
+    json pieces = json::object();
+    for (size_t i = 0; i < VideoCommon::BackX::DuskPieceNames.size(); ++i) {
+        pieces[std::string{VideoCommon::BackX::DuskPieceNames[i]}] =
+            (live.dusk_off >> i & 1) != 0 ? "old" : "upstream";
+    }
+    const auto control = [](int value) -> json {
+        return value < 0 ? json("default") : json(value);
+    };
+    return {
+        {"verify", live.verify},
+        {"sites", std::move(sites)},
+        {"backx", std::move(pieces)},
+        {"inline_defer", (slow >> static_cast<u32>(Perf::Site::InlineDefer) & 1) == 0 ? 1 : 0},
+        {"uboreuse", control(live.uboreuse)},
+        {"frames_ahead", control(live.frames_ahead)},
+        {"fence_batch", control(live.fence_batch)},
+        {"sync_submit", control(live.sync_submit)},
+        {"alias", [&] {
+             json alias = json::object();
+             for (size_t i = 0; i < Perf::AliasNames.size(); ++i) {
+                 alias[std::string{Perf::AliasNames[i]}] = (live.alias >> i & 1) != 0 ? 1 : 0;
+             }
+             alias["alias_sync_always"] = control(live.alias_sync);
+             return alias;
+         }()},
+        {"alias_stats", [] {
+             json stats = json::object();
+             for (size_t i = 0; i < Perf::AliasStatNames.size(); ++i) {
+                 stats[std::string{Perf::AliasStatNames[i]}] =
+                     Perf::g_alias_stats_last[i].load(std::memory_order_relaxed);
+             }
+             return stats;
+         }()},
+        {"start_time_only",
+         {"state_blocks: the split front decides whether it sends register blocks when it starts "
+          "(the back's handling of them is live)",
+          "EDEN_NX2_SPLIT, EDEN_NX2_HOSTTIMING_PRIO and every switch not listed here"}},
+    };
+}
+
+/// Queues `live` for the next frame end and waits (timeout_s, default 5) until it is applied.
+json ApplyLiveParams(ToolState& state, const json& params, const Perf::LiveState& live) {
+    if (!IsVulkan()) {
+        throw std::runtime_error{"live switches need the Vulkan renderer (applied at its frame end)"};
+    }
+    const u64 request = Perf::RequestLive(live);
+    const auto timeout = std::chrono::seconds{Param<int>(params, "timeout_s", 5, 0, 60)};
+    const auto begin = std::chrono::steady_clock::now();
+    while (Perf::g_live_applied.load(std::memory_order_acquire) < request &&
+           std::chrono::steady_clock::now() - begin < timeout &&
+           !state.stopping.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(10ms);
+    }
+    const bool applied = Perf::g_live_applied.load(std::memory_order_acquire) >= request;
+    json result = LiveJson(applied ? Perf::CurrentLive() : live);
+    result["applied"] = applied;
+    result["request"] = request;
+    result["frame"] = Perf::g_live_applied_frame.load(std::memory_order_relaxed);
+    result["presents"] = g_nx2_present_count.load(std::memory_order_relaxed);
+    if (!applied) {
+        result["note"] = "no frame end yet; the change applies at the next one";
+    }
+    return result;
+}
+
+u32 SiteBit(std::string_view name) {
+    for (size_t i = 0; i < Perf::SiteNames.size(); ++i) {
+        if (Perf::SiteNames[i] == name) {
+            return 1u << i;
+        }
+    }
+    throw std::runtime_error{"unknown site \"" + std::string{name} + "\" (see perf_sites)"};
+}
+
+/// Every Nx2Perf site, fast or slow now, and the other live controls.
+json PerfSites(ToolState&, const json&) {
+    json result = LiveJson(Perf::CurrentLive());
+    result["pending"] = Perf::g_live_requested.load(std::memory_order_relaxed) !=
+                        Perf::g_live_applied.load(std::memory_order_relaxed);
+    result["frame"] = Perf::g_live_applied_frame.load(std::memory_order_relaxed);
+    return result;
+}
+
+/// {sites: [name, ...] | "all" | [], verify?: bool (default false)}: replaces the slow set
+/// (inline_defer included; [] is everything fast, the normal state).
+json PerfSlow(ToolState& state, const json& params) {
+    Perf::LiveState live = Perf::TargetLive();
+    const json sites = params.value("sites", json::array());
+    if (sites.is_string()) {
+        if (sites.get<std::string>() != "all") {
+            throw std::runtime_error{"sites must be a list of names, \"all\" or []"};
+        }
+        live.named = (1u << Perf::SiteNames.size()) - 1;
+    } else if (sites.is_array()) {
+        live.named = 0;
+        for (const json& name : sites) {
+            live.named |= SiteBit(name.get<std::string>());
+        }
+    } else {
+        throw std::runtime_error{"sites must be a list of names, \"all\" or []"};
+    }
+    live.verify = params.value("verify", false);
+    return ApplyLiveParams(state, params, live);
+}
+
+/// {control, value}: inline_defer 0|1, uboreuse / frames_ahead / fence_batch / sync_submit
+/// 0|1|"default", backx.<piece> or backx (all pieces) "old"|"upstream", verify true|false.
+json PerfFlip(ToolState& state, const json& params) {
+    Perf::LiveState live = Perf::TargetLive();
+    const std::string control = params.at("control").get<std::string>();
+    const json& value = params.at("value");
+    const auto number = [&]() -> int {
+        if (value.is_string() && value.get<std::string>() == "default") {
+            return -1;
+        }
+        const int number = value.is_boolean() ? (value.get<bool>() ? 1 : 0) : value.get<int>();
+        if (number != 0 && number != 1) {
+            throw std::runtime_error{"value must be 0, 1 or \"default\""};
+        }
+        return number;
+    };
+    if (control == "inline_defer") {
+        const u32 bit = 1u << static_cast<u32>(Perf::Site::InlineDefer);
+        live.named = number() == 0 ? live.named | bit : live.named & ~bit;
+    } else if (control == "uboreuse") {
+        live.uboreuse = number();
+    } else if (control == "frames_ahead") {
+        live.frames_ahead = number();
+    } else if (control == "fence_batch") {
+        live.fence_batch = number();
+    } else if (control == "sync_submit") {
+        live.sync_submit = number();
+    } else if (control == "verify") {
+        live.verify = number() == 1;
+    } else if (control == "alias_sync_always") {
+        live.alias_sync = number(); // "default": The Duskbloods' images of at most 16x16
+    } else if (const auto alias_it = std::ranges::find(Perf::AliasNames, control);
+               alias_it != Perf::AliasNames.end()) {
+        const u32 bit = 1u << static_cast<u32>(alias_it - Perf::AliasNames.begin());
+        live.alias = number() == 1 ? live.alias | bit : live.alias & ~bit;
+    } else if (control == "backx" || control.starts_with("backx.")) {
+        const std::string text = value.get<std::string>();
+        if (text != "old" && text != "upstream") {
+            throw std::runtime_error{"backx values are \"old\" or \"upstream\""};
+        }
+        u32 bits = (1u << VideoCommon::BackX::DuskPieceNames.size()) - 1;
+        if (control != "backx") {
+            const std::string_view piece = std::string_view{control}.substr(6);
+            const auto& names = VideoCommon::BackX::DuskPieceNames;
+            const auto it = std::ranges::find(names, piece);
+            if (it == names.end()) {
+                throw std::runtime_error{"unknown back piece \"" + std::string{piece} + "\""};
+            }
+            bits = 1u << static_cast<u32>(it - names.begin());
+        }
+        live.dusk_off = text == "old" ? live.dusk_off | bits : live.dusk_off & ~bits;
+    } else {
+        throw std::runtime_error{"unknown control \"" + control +
+                                 "\": inline_defer, uboreuse, frames_ahead, fence_batch, "
+                                 "sync_submit, verify, backx, backx.<piece>, alias_sync_always, "
+                                 "alias_full_resolve, alias_resync_upload, alias_diag"};
+    }
+    return ApplyLiveParams(state, params, live);
+}
+
+/// The graphics draws of the next whole frame with their shaders and state; with save (default)
+/// also written as drawlist-<session>-<n>.json to the dump directory.
+json DrawList(ToolState& state, const json& params) {
+    if (!IsVulkan()) {
+        throw std::runtime_error{"draw_list needs the Vulkan renderer"};
+    }
+    const u64 id = ++state.draw_lists;
+    const int timeout = Param<int>(params, "timeout_s", 10, 1, 60);
+    VideoCore::Nx2Debug::RequestDrawList(id);
+    const auto draws = VideoCore::Nx2Debug::WaitDrawList(id, std::chrono::seconds{timeout});
+    if (!draws) {
+        VideoCore::Nx2Debug::CancelDrawList(id);
+        throw std::runtime_error{
+            fmt::format("no whole frame was presented within {} s (paused or loading?)", timeout)};
+    }
+    const auto hex = [](u64 value) { return fmt::format("{:016x}", value); };
+    json list = json::array();
+    size_t skipped = 0;
+    for (const auto& draw : *draws) {
+        skipped += draw.skipped ? 1 : 0;
+        json programs = json::array();
+        json hashes = json::array();
+        for (size_t stage = 0; stage < draw.programs.size(); ++stage) {
+            programs.push_back(HexAddress(draw.programs[stage]));
+            hashes.push_back(hex(draw.shader_hashes[stage]));
+        }
+        json targets = json::array();
+        for (u32 target = 0; target < (std::min)(draw.rt_count, 8U); ++target) {
+            targets.push_back({{"address", HexAddress(draw.rt[target])},
+                               {"format", fmt::format("{:#x}", draw.rt_format[target])}});
+        }
+        json streams = json::array();
+        for (size_t binding = 0; binding < draw.stream_address.size(); ++binding) {
+            if (draw.stream_address[binding] != 0) {
+                streams.push_back({{"binding", binding},
+                                   {"address", HexAddress(draw.stream_address[binding])},
+                                   {"stride", draw.stream_stride[binding]}});
+            }
+        }
+        json entry = {
+            {"index", draw.index},
+            {"topology", draw.topology},
+            {"indexed", draw.indexed},
+            {"indirect", draw.indirect},
+            {"skipped", draw.skipped},
+            {"count", draw.count},
+            {"first", draw.first},
+            {"instances", draw.instances},
+            {"vs", hex(draw.shader_hashes[1])},
+            {"ps", hex(draw.shader_hashes[5])},
+            {"vs_address", HexAddress(draw.programs[1])},
+            {"ps_address", HexAddress(draw.programs[5])},
+            {"programs", std::move(programs)},
+            {"shader_hashes", std::move(hashes)},
+            {"rt0", HexAddress(draw.rt[0])},
+            {"targets", std::move(targets)},
+            {"rt_size", {draw.rt_width, draw.rt_height}},
+            {"depth", {{"address", HexAddress(draw.zeta)},
+                       {"format", fmt::format("{:#x}", draw.zeta_format)},
+                       {"enabled", draw.zeta_enable},
+                       {"test", draw.depth_test},
+                       {"write", draw.depth_write},
+                       {"func", fmt::format("{:#x}", draw.depth_func)}}},
+            {"blend", {{"enable_mask", draw.blend_enable},
+                       {"per_target", draw.blend_per_target},
+                       {"rt0", draw.blend0}}},
+            {"color_mask0", fmt::format("{:#x}", draw.color_mask0)},
+            {"cull", {{"enabled", draw.cull}, {"face", fmt::format("{:#x}", draw.cull_face)}}},
+            {"line_width", draw.line_width},
+            {"viewport0", draw.viewport0},
+            {"streams", std::move(streams)},
+        };
+        if (draw.indexed) {
+            entry["index_buffer"] = {{"address", HexAddress(draw.index_address)},
+                                     {"format", draw.index_format}};
+        }
+        list.push_back(std::move(entry));
+    }
+    json result = {{"draws_total", draws->size()},
+                   {"skipped", skipped},
+                   {"topologies",
+                    "0 points, 1 lines, 2 line loop, 3 line strip, 4 triangles, 5 strip, 6 fan, "
+                    "7 quads, 10/11 line adjacency, 12/13 triangle adjacency, 14 patches"}};
+    if (params.value("save", true)) {
+        std::filesystem::create_directories(state.dump_directory);
+        const auto path =
+            state.dump_directory / fmt::format("drawlist-{}-{:03}.json", state.session, id);
+        std::ofstream file{path};
+        file << json{{"draws", list}}.dump(1);
+        if (!file) {
+            throw std::runtime_error{fmt::format("cannot write {}", path.generic_string())};
+        }
+        result["path"] = path.generic_string();
+    }
+    if (params.value("inline", true)) {
+        result["draws"] = std::move(list);
+    }
+    return result;
+}
+
 json SampleThreads(ToolState& state, const json& params) {
     const std::string threads = params.value("threads", std::string{"GPU,GPUBack"});
     const double seconds = Param<double>(params, "seconds", 10.0, 1.0, 60.0);
@@ -699,6 +1041,11 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
         {"log_filter", handler(LogFilter)},
         {"capture_frame", handler(CaptureFrame)},
         {"reject_shaders", handler(RejectShaders)},
+        {"draw_skip", handler(DrawSkip)},
+        {"draw_list", handler(DrawList)},
+        {"perf_sites", handler(PerfSites)},
+        {"perf_slow", handler(PerfSlow)},
+        {"perf_flip", handler(PerfFlip)},
         {"sample", handler(SampleThreads)},
         {"speed_limit", handler(SpeedLimit)},
         {"host_timing", handler(HostTiming)},

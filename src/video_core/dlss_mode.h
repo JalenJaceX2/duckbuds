@@ -49,6 +49,7 @@ struct Selection {
     std::optional<Quality> mode;
     std::optional<Range> requested_range;
     bool fallback{};
+    Range range{}; ///< The chosen mode's render size range
 };
 
 template <typename Query>
@@ -57,14 +58,14 @@ Selection Select(Quality requested, Extent render, Extent output, Query&& query)
     if (requested != Quality::Automatic) {
         requested_range = query(requested);
         if (requested_range && Fits(render, output, requested, *requested_range)) {
-            return {requested, requested_range, false};
+            return {requested, requested_range, false, *requested_range};
         }
     }
     const auto preferred = Preferred(render, output);
     for (const auto mode : {preferred, Quality::Quality, Quality::Balanced, Quality::Performance,
                             Quality::UltraPerformance, Quality::Native}) {
         if (const auto range = query(mode); range && Fits(render, output, mode, *range)) {
-            return {mode, requested_range, requested != Quality::Automatic};
+            return {mode, requested_range, requested != Quality::Automatic, *range};
         }
     }
     return {std::nullopt, requested_range, requested != Quality::Automatic};

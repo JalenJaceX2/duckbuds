@@ -254,7 +254,7 @@ public:
     bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
                          ImageView& motion_vectors, ImageView& depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale);
+                         std::array<f32, 2> motion_scale, std::array<u32, 2> max_render_size);
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
 
@@ -277,9 +277,11 @@ public:
     bool UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageView& input_color,
                          ImageView& motion_vectors, ImageView& depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool reset);
+                         std::array<f32, 2> motion_scale, bool reset,
+                         std::array<u32, 2> max_render_size);
     std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;
     bool dlss_unsupported{};
+    bool temporal_dlss{}; ///< The last TemporalUpscale was meant for DLSS
 #endif
 
     /// TemporalUpscale's history: its previous result (images[current]) and the image the next

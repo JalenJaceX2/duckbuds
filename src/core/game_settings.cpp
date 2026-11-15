@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -130,8 +131,12 @@ void LoadOverrides(std::uint64_t program_id, const VideoCore::RendererBase& rend
         case TitleID::DuskbloodsNetworkTest:
             // The game reads values its GPU passes wrote (the tone pass's exposure among them)
             // back on the CPU. Without reactive flushing it reads stale ones and the whole picture
-            // brightens and darkens every few frames.
-            Settings::values.force_reactive_flushing = true;
+            // brightens and darkens every few frames. EDEN_NX2_DUSK_REACTIVE=0 leaves it to the
+            // setting (FPS A/B tests).
+            if (const char* const value = std::getenv("EDEN_NX2_DUSK_REACTIVE");
+                !(value && value[0] == '0')) {
+                Settings::values.force_reactive_flushing = true;
+            }
             break;
         default:
             break;

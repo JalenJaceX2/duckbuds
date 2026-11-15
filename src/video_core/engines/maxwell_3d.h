@@ -25,8 +25,8 @@
 #include "video_core/engines/engine_upload.h"
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
+#include "video_core/nx2_backx.h"
 #include "video_core/nx2_fast_draw.h"
-#include "video_core/nx2_list_grid.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -3226,9 +3226,6 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
-    /// List-fed grid macros (nx2_list_grid.h): the markers of the data RAM, which the compute
-    /// engine shares and stores them in (KeplerCompute::FrontTakeListGrid).
-    Nx2ListGrid::GridMarker grid_marker;
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3470,14 +3467,32 @@ private:
     // model). Read per engine, not at static initialization, which runs before the frontend
     // loads nx2_switches.txt.
     const bool trace_first_method_writes = std::getenv("EDEN_NX2_3D_METHODS") != nullptr;
-    // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY, read per engine like the switch above. Every
+    // EDEN_NX2_SKIP_SAME and EDEN_NX2_PERF_VERIFY/_SLOW, read per engine like the switch above. Every
     // method checks them, so they are members rather than function statics (MSVC reads a
     // thread-local to check a static's initialization on every call).
     const bool skip_same_value_writes = [] {
         const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
         return value == nullptr || value[0] != '0';
     }();
-    const bool perf_verify = VideoCommon::Nx2Perf::Verify();
+    // Read live at each call (one relaxed atomic load; the debug server's perf_slow/perf_flip
+    // change them at frame ends): every choice is per method, both paths leave the same state.
+    static bool perf_slow_method() {
+        return VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodFast);
+    }
+    /// #1095's direct state register write in CallMethod. EDEN_NX2_DUSK_BACKX=off turns it off
+    /// for The Duskbloods: CallMethodFast, as before #1095.
+    static bool direct_state_write() {
+        return !VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::DirectStateWrite);
+    }
+    static bool perf_slow_cb_batch() {
+        return VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::MethodCbBatch);
+    }
+    // The Duskbloods' pre-#1585 path too. Live for the back's WriteStateRegisters (blocks applied
+    // one write at a time); the front decides whether to send blocks when it starts (Front).
+    static bool perf_slow_state_blocks() {
+        return VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::StateBlocks) ||
+               VideoCommon::BackX::DuskOff(VideoCommon::BackX::DuskPiece::StateBlocks);
+    }
     const bool reg_block_verify = [] {
         const char* value = std::getenv("EDEN_NX2_REG_BLOCK_VERIFY");
         return value != nullptr && value[0] == '1';

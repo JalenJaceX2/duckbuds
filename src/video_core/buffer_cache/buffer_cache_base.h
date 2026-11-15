@@ -12,13 +12,13 @@
 #include <bit>
 #include <chrono>
 #include <functional>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <optional>
 #include <source_location>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -360,37 +360,6 @@ public:
 
     bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
 
-    /// List-fed grid macros (nx2_list_grid.h): an inline write whose words at the `patches`'
-    /// offsets are markers. It is uploaded at once, not left to a later invalidation that would
-    /// upload guest memory's markers over the copies. Then `copy(buffer, offset, patch)` records
-    /// the host GPU's copy of the patch's kept word over it; those words are GPU-written from now
-    /// on, and registered to their list until another write reaches them (Nx2KeptWordList).
-    template <typename Patch, typename Copy>
-    void Nx2InlineKeptWords(DAddr dest_address, std::span<const u8> data,
-                            std::span<const Patch> patches, Copy&& copy) {
-        InlineMemoryImplementation(dest_address, data.size(), data);
-        if (nx2_kept_words.size() >= 0x10000) {
-            nx2_kept_words.clear(); // Only the QMD reads' fallback to the host GPU's words then
-        }
-        for (const Patch& patch : patches) {
-            const DAddr address = dest_address + patch.offset;
-            const BufferId buffer_id = FindBuffer(address, sizeof(u32), false);
-            Buffer& buffer = slot_buffers[buffer_id];
-            const u32 offset = buffer.Offset(address);
-            copy(buffer, offset, patch);
-            // As a3acb026c1 does for indirect arguments: no later upload is reordered ahead.
-            buffer.MarkUsage(offset, sizeof(u32));
-            MarkWrittenBuffer(buffer_id, address, sizeof(u32));
-            nx2_kept_words[address] = {patch.keep_id, patch.index};
-        }
-    }
-    /// The list and word Nx2InlineKeptWords last patched at `device_addr`, unless a CPU, inline,
-    /// DMA or storage write reached the word since.
-    [[nodiscard]] std::optional<std::pair<u64, u32>> Nx2KeptWordList(DAddr device_addr) const {
-        const auto it = nx2_kept_words.find(device_addr);
-        return it != nx2_kept_words.end() ? std::optional{it->second} : std::nullopt;
-    }
-
     void BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr, u32 size);
 
     void DisableGraphicsUniformBuffer(size_t stage, u32 index);
@@ -402,6 +371,15 @@ public:
     void BindHostGeometryBuffers(bool is_indexed);
 
     void BindHostStageBuffers(size_t stage);
+
+    /// Traces the storage buffers of the next draw's stages (The Duskbloods' ribbon pipeline
+    /// with the debug server or EDEN_NX2_DUSK_RIBBON=diag): bound ranges, whether their pages were
+    /// uploaded or clean, GPU-written or not, and SSBO 0's first 64 guest bytes.
+    void Nx2SsboDiagBegin(bool on) {
+        nx2_ssbo_diag = on;
+        nx2_ssbo_diag_text.clear();
+        nx2_ssbo_diag_shape.clear();
+    }
 
     void BindHostComputeBuffers();
 
@@ -799,18 +777,6 @@ private:
 
     /// Re-dirties repacked vertex buffers whose source data was written since they were bound.
     void RefreshRepackedVertexBuffers();
-
-    void Nx2ForgetKeptWords(DAddr device_addr, u64 size) {
-        if (nx2_kept_words.empty()) {
-            return;
-        }
-        auto it = nx2_kept_words.lower_bound(device_addr & ~DAddr{3});
-        while (it != nx2_kept_words.end() && it->first < device_addr + size) {
-            it = nx2_kept_words.erase(it);
-        }
-    }
-    /// Nx2InlineKeptWords' patched words: keep id and word index by device address.
-    std::map<DAddr, std::pair<u64, u32>> nx2_kept_words;
 
     void InlineMemoryImplementation(DAddr dest_address, size_t copy_size,
                                     std::span<const u8> inlined_buffer);
@@ -1232,6 +1198,14 @@ private:
     std::vector<std::pair<u64, Nx2Staging>> nx2_retired_list_copies;
     boost::container::small_vector<std::pair<BufferId, DAddr>, 8> nx2_list_copy_requests;
     bool nx2_collect_list_copies{};
+
+    // Nx2SsboDiagBegin: the storage buffers of one traced pipeline's draw, logged at its fragment
+    // stage when their shape changes.
+    bool nx2_ssbo_diag{};
+    std::string nx2_ssbo_diag_text;
+    std::string nx2_ssbo_diag_shape;
+    std::string nx2_ssbo_diag_last_shape;
+    u32 nx2_ssbo_diag_lines{};
 };
 
 } // namespace VideoCommon

@@ -17,7 +17,6 @@
 #include "common/assert.h"
 #include "common/dkb_frame_trace.h"
 #include "common/logging.h"
-#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
@@ -79,9 +78,7 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
     }
 }
 
-KeplerCompute::~KeplerCompute() {
-    Nx2ListGrid::ReleaseSlots(this);
-}
+KeplerCompute::~KeplerCompute() = default;
 
 void KeplerCompute::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     rasterizer = rasterizer_;
@@ -354,29 +351,6 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 if (VideoCommon::ListMacroTrace::g_enabled) {
                     VideoCommon::ListMacroTrace::NoteQmd(address, descriptor);
                 }
-                // Grid markers (nx2_list_grid.h): each word's list is the one the back patched at
-                // its address and still keeps. Any other marker (its slot reused, the word
-                // written since) takes the real words its upload patched in on the host GPU.
-                qmd_grid_lists = {};
-                bool unknown = false;
-                for (u32 i = 0; i < 3; ++i) {
-                    const u32 word = descriptor[12 + i];
-                    if (!Nx2ListGrid::IsMarker(word)) {
-                        continue;
-                    }
-                    const auto device = memory_manager.GpuToCpuAddress(address + (12 + i) * 4);
-                    const auto list =
-                        device ? rasterizer->Nx2FindKeptWord(*device, word) : std::nullopt;
-                    qmd_grid_lists[i] = list.value_or(0);
-                    unknown = unknown || !list;
-                }
-                if (const auto grid = memory_manager.GpuToCpuAddress(address + 12 * sizeof(u32));
-                    unknown && grid) {
-                    rasterizer->FlushRegion(*grid, 3 * sizeof(u32));
-                    memory_manager.ReadBlockUnsafe(address + 12 * sizeof(u32), descriptor.data() + 12,
-                                                   3 * sizeof(u32));
-                    qmd_grid_lists = {};
-                }
                 if (static u32 logged{}; (descriptor[53] & (1U << 23)) && logged < 8) {
                     ++logged;
                     LOG_INFO(HW_GPU, "Native QMD {:#x} releases: {:08x} | {:08x} | {:08x}", address,
@@ -573,43 +547,9 @@ void KeplerCompute::CallMultiMethod(Core::System& system, u32 method, const u32*
 
 bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& qmd) {
     launch_description = {};
-    std::array<u32, 3> grid{qmd[12], qmd[13], qmd[14]};
-    kept_grid.reset();
-    SCOPE_EXIT {
-        kept_grid.reset();
-    };
-    // Markers of a list-fed grid macro (nx2_list_grid.h), their lists checked by the QMD read
-    // (qmd_grid_lists): a list's three, in order, dispatch from its kept words; any other mix
-    // gets them read back.
-    if (const auto source = Nx2ListGrid::QmdGridSource(grid[0], grid[1], grid[2]);
-        source.kind != Nx2ListGrid::GridKind::Direct) {
-        const auto& lists = qmd_grid_lists;
-        if (source.kind == Nx2ListGrid::GridKind::Indirect && lists[0] != 0 &&
-            lists[0] == lists[1] && lists[1] == lists[2]) {
-            kept_grid = lists[0];
-            grid = {1, 1, 1};
-        } else {
-            for (u32 i = 0; i < 3; ++i) {
-                u32& word = grid[i];
-                if (!Nx2ListGrid::IsMarker(word)) {
-                    continue;
-                }
-                std::array<u32, 3> words{};
-                if (lists[i] == 0 || !rasterizer->Nx2ReadKeptListWords(lists[i], words)) {
-                    // Unreachable unless a marker reached memory unpatched (the guard admits
-                    // only patched destinations): never dispatched on.
-                    LOG_ERROR(HW_GPU, "List-fed grid: QMD grid word {:#x} names no kept list",
-                              word);
-                    word = 0;
-                    continue;
-                }
-                word = words[Nx2ListGrid::MarkerIndex(word)];
-            }
-        }
-    }
-    launch_description.grid_dim_x.Assign(grid[0]);
-    launch_description.grid_dim_y.Assign(grid[1] & 0xffff);
-    launch_description.grid_dim_z.Assign(grid[2] & 0xffff);
+    launch_description.grid_dim_x.Assign(qmd[12]);
+    launch_description.grid_dim_y.Assign(qmd[13] & 0xffff);
+    launch_description.grid_dim_z.Assign(qmd[14] & 0xffff);
     launch_description.shared_alloc.Assign(qmd[17] & 0x3ffff);
     launch_description.block_dim_x.Assign(qmd[18] >> 16);
     launch_description.block_dim_y.Assign(qmd[19] & 0xffff);
@@ -854,6 +794,7 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
         dlss_chain.active = true;
         dlss_chain.rejected = 0;
         dlss_chain.dispatches = 0;
+        dlss_chain.skipped_this_eval = false;
         dlss_chain.pending.clear();
     }
     if (!dlss_chain.active) {
@@ -867,11 +808,23 @@ bool KeplerCompute::ProcessGameDlss(u64 program_id, u64 native_key) {
     const bool replacement = dlss_chain.failure != VideoCore::GameDlssReason::None ||
                              GameDlssBlocker() != VideoCore::GameDlssReason::None;
     if (dlss_chain.output_pass) {
-        return replacement && FinishDlssEvaluation();
+        // When this evaluation skipped passes for a replacement that then failed, the game's
+        // output pass would read inputs not written this frame; it is skipped too, so the last
+        // output stays one more frame. replacement_drew is now false, so the next evaluation
+        // runs the whole network.
+        return (replacement && FinishDlssEvaluation()) || dlss_chain.skipped_this_eval;
     }
-    return dlss_chain.failure != VideoCore::GameDlssReason::None &&
-           native_key != passes->prepass &&
-           dlss_chain.programs.contains(native_key);
+    // Only The Duskbloods skips the network while the replacement draws; Fire Emblem keeps
+    // running it until the network fails its checks.
+    const bool replacement_will_draw = dlss_chain.render_region && replacement &&
+                                       dlss_chain.replacement_drew && fe_upscale_jitter.Has();
+    const bool failed = dlss_chain.failure != VideoCore::GameDlssReason::None;
+    const bool skip = (failed || replacement_will_draw) && native_key != passes->prepass &&
+                      dlss_chain.programs.contains(native_key);
+    if (skip && !failed) {
+        dlss_chain.skipped_this_eval = true;
+    }
+    return skip;
 }
 
 // The game's own DLSS network (its translated programs) is shown once every pass of an
@@ -1077,9 +1030,11 @@ bool KeplerCompute::FinishDlssEvaluation() {
         dlss_motion_vectors.reset();
         dlss_depth.reset();
         (void)fe_upscale_jitter.Take();
+        dlss_chain.replacement_drew = false;
         return false;
     }
-    return TryFireEmblemUpscale();
+    dlss_chain.replacement_drew = TryFireEmblemUpscale();
+    return dlss_chain.replacement_drew;
 }
 
 // Logs the images a rejected program's handles (constant bank 0, bytes 0x80-0x11c) point to, so a
@@ -1314,6 +1269,15 @@ void KeplerCompute::RememberDlssMotionVectors() {
         dlss_depth = *depth;
     } else {
         dlss_depth.reset();
+        static bool logged{};
+        if (dlss_chain.render_region && !std::exchange(logged, true)) {
+            LOG_INFO(HW_GPU, "Duskbloods prepass depth (+{:#x}) not taken: {}", depth_offset,
+                     depth ? fmt::format("{:#x} {}x{} format {:#x} type {}", depth->Address(),
+                                         depth->Width(), depth->Height(),
+                                         static_cast<u32>(depth->format.Value()),
+                                         static_cast<u32>(depth->r_type.Value()))
+                           : std::string{"unreadable"});
+        }
     }
 }
 
@@ -1431,31 +1395,182 @@ bool KeplerCompute::ScaleDlssRenderRegion(GPUVAddr constants,
         result.addr_lower = static_cast<u32>(tic.Address());
         return result;
     };
+    // Only The Duskbloods renders a region (CapturedPasses), so what follows is its own.
+    // EDEN_NX2_DUSK_JITTER=output (default) takes the jitter from this pass's constants, x at
+    // +0x38c and y at +0x388 in render pixels; =prepass keeps the first pass's +0x1b0.
+    static const bool output_jitter = [] {
+        const char* const value = std::getenv("EDEN_NX2_DUSK_JITTER");
+        return !(value && std::string_view{value} == "prepass");
+    }();
+    // EDEN_NX2_DUSK_MV=siko (default): the velocity is in render heights on both axes, so x is
+    // scaled by the height too; =upstream scales each axis by its own render size.
+    static const bool siko_motion = [] {
+        const char* const value = std::getenv("EDEN_NX2_DUSK_MV");
+        return !(value && std::string_view{value} == "upstream");
+    }();
+    const std::array<f32, 2> pass_jitter{
+        std::bit_cast<f32>(memory_manager.Read<u32>(constants + 0x38c)),
+        std::bit_cast<f32>(memory_manager.Read<u32>(constants + 0x388))};
+    // Not range checked as tightly as the first pass's (siko's resolve takes it as is); only
+    // values no jitter can have are dropped.
+    const bool pass_jitter_valid = std::isfinite(pass_jitter[0]) && std::isfinite(pass_jitter[1]) &&
+                                   std::abs(pass_jitter[0]) <= 1.0f &&
+                                   std::abs(pass_jitter[1]) <= 1.0f;
+    std::optional<std::array<f32, 2>> used_jitter;
+    if (output_jitter && pass_jitter_valid) {
+        used_jitter = pass_jitter;
+    } else if (jitter) {
+        used_jitter = jitter->offset;
+    }
+    static u32 jitter_logged{};
+    if (jitter_logged < 4) {
+        ++jitter_logged;
+        LOG_INFO(HW_GPU, "Duskbloods jitter: prepass {} output {:.4f},{:.4f}{} using {}",
+                 jitter ? fmt::format("{:.4f},{:.4f}", jitter->offset[0], jitter->offset[1])
+                        : std::string{"none"},
+                 pass_jitter[0], pass_jitter[1], pass_jitter_valid ? "" : " (invalid)",
+                 !used_jitter                                ? "none"
+                 : output_jitter && pass_jitter_valid        ? "output"
+                                                             : "prepass");
+    }
+    // EDEN_NX2_DUSK_INPUTS=draw (default): the motion vectors and depth are the velocity render
+    // target and the depth target its draws used, as siko's v31 feeds FSR (the prepass's depth is
+    // not D32 float, so FSR never ran on it); =prepass keeps the first pass's +0x290 and +0x288.
+    static const bool draw_inputs = [] {
+        const char* const value = std::getenv("EDEN_NX2_DUSK_INPUTS");
+        return !(value && std::string_view{value} == "prepass");
+    }();
+    const auto tracked = draw_inputs ? rasterizer->TakeDuskDrawTargets() : std::nullopt;
+    // v31's checks: the velocity is the colour's size (R16G16 float as tracked) with a depth.
+    const bool tracked_valid = tracked && tracked->depth != 0 &&
+                               tracked->velocity.width == input->Width() &&
+                               tracked->velocity.height == input->Height();
     // Without this evaluation's jitter or usable motion vectors (a rejected pass clears them), the
     // region is still scaled, without history, rather than leaving the network's output.
-    const bool use_history = jitter && motion && width <= motion->Width() &&
-                             height <= motion->Height() &&
-                             (!depth || (width <= depth->Width() && height <= depth->Height()));
-    Fermi2D::Surface motion_surface{};
-    if (use_history) {
-        motion_surface = surface(*motion);
-        motion_surface.format = Tegra::RenderTargetFormat::R16G16_FLOAT;
-    }
+    const bool prepass_history =
+        used_jitter && motion && width <= motion->Width() && height <= motion->Height() &&
+        (!depth || (width <= depth->Width() && height <= depth->Height()));
     // The game's motion vectors point from the previous position to the current one (a rightward
     // pan gives negative x while the scene moves left), the reverse of what the upscale expects.
-    const std::array<f32, 2> motion_scale =
-        use_history ? std::array{-1.0f, -1.0f} : std::array{0.0f, 0.0f};
-    const bool done = rasterizer->AccelerateTemporalUpscale(
-        surface(*input), surface(*output), motion_surface,
-        use_history && depth ? &*depth : nullptr,
-        jitter ? jitter->offset : std::array{0.0f, 0.0f}, motion_scale, use_history,
-        std::array{width, height});
+    // The runtime multiplies the scale by the render size.
+    const f32 motion_x =
+        siko_motion ? -static_cast<f32>(height) / static_cast<f32>(width) : -1.0f;
+    const auto upscale = [&](bool from_draws) {
+        const bool use_history = from_draws ? used_jitter.has_value() : prepass_history;
+        Fermi2D::Surface motion_surface{};
+        if (use_history && from_draws) {
+            motion_surface = tracked->velocity;
+        } else if (use_history) {
+            motion_surface = surface(*motion);
+            motion_surface.format = Tegra::RenderTargetFormat::R16G16_FLOAT;
+        }
+        const std::array<f32, 2> motion_scale =
+            use_history ? std::array{motion_x, -1.0f} : std::array{0.0f, 0.0f};
+        static u32 last_source = ~0U;
+        static u32 sources_logged{};
+        constexpr std::array<const char*, 3> source_names{"none", "draw", "prepass"};
+        const u32 source_index = !use_history ? 0U : from_draws ? 1U : 2U;
+        const char* const source = source_names[source_index];
+        if (source_index != last_source && sources_logged < 4) {
+            last_source = source_index;
+            ++sources_logged;
+            const auto describe = [](const std::optional<Texture::TICEntry>& tic) {
+                return tic ? fmt::format("{:#x} {}x{} format {:#x} type {}", tic->Address(),
+                                         tic->Width(), tic->Height(),
+                                         static_cast<u32>(tic->format.Value()),
+                                         static_cast<u32>(tic->r_type.Value()))
+                           : std::string{"none"};
+            };
+            LOG_INFO(HW_GPU,
+                     "Duskbloods inputs: using {} (EDEN_NX2_DUSK_INPUTS={}); tracked: velocity {}, "
+                     "depth {}; prepass: motion (+0x290) {}, depth (+0x288) {}; render {}x{}, "
+                     "output {}x{}, motion scale {:.4f},{:.4f}",
+                     source, draw_inputs ? "draw" : "prepass",
+                     tracked ? fmt::format("{:#x} {}x{} R16G16_FLOAT",
+                                           tracked->velocity.Address(), tracked->velocity.width,
+                                           tracked->velocity.height)
+                             : std::string{"none"},
+                     tracked && tracked->depth
+                         ? fmt::format("{:#x} {}x{} depth format {:#x}", tracked->depth,
+                                       tracked->depth_width, tracked->depth_height,
+                                       tracked->depth_format)
+                         : std::string{"none"},
+                     describe(motion), describe(depth), width, height, output->Width(),
+                     output->Height(), motion_scale[0], motion_scale[1]);
+        }
+        return rasterizer->AccelerateTemporalUpscale(
+            surface(*input), surface(*output), motion_surface,
+            use_history && !from_draws && depth ? &*depth : nullptr,
+            used_jitter.value_or(std::array{0.0f, 0.0f}), motion_scale, use_history,
+            std::array{width, height}, use_history && from_draws);
+    };
+    bool done = false;
+    if (tracked_valid) {
+        done = upscale(true);
+        if (!done) {
+            // Never reuse targets the upscale declined; this frame takes the prepass inputs.
+            rasterizer->DropDuskDrawTargets();
+            static u32 declines{};
+            if (declines++ < 4) {
+                LOG_WARNING(HW_GPU, "Duskbloods: upscale declined the drawn velocity/depth; "
+                                    "using the prepass inputs");
+            }
+        }
+    }
+    if (!done) {
+        done = upscale(false);
+    }
+    if (done) {
+        // The output pass also fills the RGBA16F images at +0x350 and +0x330 (read by the
+        // reflections and the next frame); it is skipped, so fill them with the result.
+        const Fermi2D::Config copy{
+            .operation = Fermi2D::Operation::SrcCopy,
+            .filter = Fermi2D::Filter::Point,
+            .must_accelerate = true,
+            .dst_x0 = 0,
+            .dst_y0 = 0,
+            .dst_x1 = static_cast<s32>(output->Width()),
+            .dst_y1 = static_cast<s32>(output->Height()),
+            .src_x0 = 0,
+            .src_y0 = 0,
+            .src_x1 = static_cast<s32>(output->Width()),
+            .src_y1 = static_cast<s32>(output->Height()),
+        };
+        for (const u32 offset : {0x350U, 0x330U}) {
+            const auto history = ConstBuffer0Image(offset);
+            if (!history || history->format != Texture::TextureFormat::R16G16B16A16 ||
+                history->r_type != Texture::ComponentType::FLOAT || history->Address() == 0 ||
+                !history->IsBlockLinear() ||
+                history->Address() == output->Address() ||
+                history->Address() == input->Address() || history->Width() != output->Width() ||
+                history->Height() != output->Height()) {
+                static bool warned{};
+                if (!std::exchange(warned, true)) {
+                    LOG_WARNING(HW_GPU, "Duskbloods: history image at +{:#x} unexpected ({}); "
+                                        "not filled", offset,
+                                history ? fmt::format("format {:#x} {}x{}",
+                                                      static_cast<u32>(history->format.Value()),
+                                                      history->Width(), history->Height())
+                                        : std::string{"unreadable"});
+                }
+                continue;
+            }
+            auto destination = surface(*history);
+            destination.format = Tegra::RenderTargetFormat::R16G16B16A16_FLOAT;
+            (void)rasterizer->AccelerateSurfaceCopy(surface(*output), destination, copy);
+        }
+    }
+    // Dynamic resolution changes the width often; only the first changes are logged.
+    constexpr u32 max_width_logs = 8;
     static u32 last_width{};
-    if (width != last_width) {
+    static u32 width_logs{};
+    if (width != last_width && width_logs < max_width_logs) {
         last_width = width;
-        LOG_INFO(HW_GPU, "DLSS replacement: {} region {}x{} of {}x{} to {}x{}",
+        ++width_logs;
+        LOG_INFO(HW_GPU, "DLSS replacement: {} region {}x{} of {}x{} to {}x{}{}",
                  done ? "scaled" : "could not scale", width, height, input->Width(),
-                 input->Height(), output->Width(), output->Height());
+                 input->Height(), output->Width(), output->Height(),
+                 width_logs == max_width_logs ? " (further region changes are not logged)" : "");
     }
     return done;
 }
@@ -1564,14 +1679,6 @@ Texture::TSCEntry KeplerCompute::GetTSCEntry(u32 tsc_index) const {
 // Split GPU thread with macros on its front half (gpu_split.h, EDEN_NX2_SPLIT=2): the front
 // runs compute macros against its own copy of the native registers (which hold the last value
 // written to each, on the back too) and loads and binds the compute macro code itself.
-struct KeplerCompute::FrontMacro {
-    const MacroEngine* engine{};
-    u64 generation{};
-    u32 start{};
-    u64 hash{};
-    std::optional<Nx2ListGrid::GridCells> cells; ///< An HleMacros entry's store words
-};
-
 struct KeplerCompute::FrontState {
     std::array<u32, 0x1000> registers{};
     std::optional<u32> executing_macro;
@@ -1579,11 +1686,6 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
-    std::vector<FrontMacro> macros; ///< FrontMacroInfo's, by engine, code generation and start
-    Nx2ListGrid::UploadState upload;
-    std::vector<u64> upload_lists; ///< Lists whose markers the upload still on its way carries
-    /// The running call's markers into upload data (FrontGuardListGrid), by emit.
-    std::vector<Nx2ListGrid::UploadMarker> upload_markers;
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -1592,11 +1694,6 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
         split.Drain(VideoCommon::DrainSite::FrontStart);
         front = std::make_unique<FrontState>();
         front->registers = native_registers;
-        // Data the upload took before is unknown here: a marker into it isn't patched.
-        for (const u32 method : {0x60U, 0x61U, 0x62U, 0x63U, 0x6cU}) {
-            front->upload.Apply(method, native_registers[method]);
-        }
-        front->upload.offset = front->upload.Size();
         front->executing_macro = native_executing_macro;
         front->parameters = std::move(native_parameters);
         native_parameters.clear();
@@ -1611,18 +1708,6 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
 
 // As Maxwell3D::ReleaseFront: the split stopped, the engine runs its macros again.
 void KeplerCompute::ReleaseFront() {
-    // The engine's macros run unguarded from now on: markers get their real words.
-    if (grid_marker != nullptr && grid_marker->set) {
-        if (native_data_ram) {
-            Nx2ListGrid::ResolveCells(*grid_marker, *native_data_ram);
-        }
-        for (u32 i = 0; i < 3; ++i) {
-            u32& value = native_registers[Nx2ListGrid::QmdGridRegister + i];
-            if (Nx2ListGrid::IsMarker(value) && grid_marker->Find(value) != nullptr) {
-                value = Nx2ListGrid::ResolveWord(*grid_marker, value).value_or(0);
-            }
-        }
-    }
     native_executing_macro = front->executing_macro;
     native_parameters = std::move(front->parameters);
     native_compute_uploaded = front->compute_uploaded;
@@ -1639,27 +1724,6 @@ void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
         fs.compute_uploaded = true;
     }
     fs.registers[method] = argument;
-    if (method == Nx2ListGrid::ExecUploadMethod) {
-        fs.upload_lists.clear();
-    } else if (method == Nx2ListGrid::DataUploadMethod && grid_marker != nullptr &&
-               Nx2ListGrid::IsMarker(argument)) {
-        if (const auto* const list = grid_marker->Find(argument)) {
-            fs.upload_lists.push_back(list->keep_id);
-        }
-    } else if (method == 0x107 && grid_marker != nullptr) {
-        // The inline QMD ProcessNativeMethod writes: its grid words are the grid registers'.
-        const GPUVAddr qmd = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
-        for (u32 i = 0; i < 3; ++i) {
-            const u32 word = fs.registers[Nx2ListGrid::QmdGridRegister + i];
-            if (Nx2ListGrid::IsMarker(word)) {
-                FrontExpectKeptWord(qmd + (12 + i) * sizeof(u32), word);
-            }
-        }
-    }
-    fs.upload.Apply(method, argument);
-    if (method == Nx2ListGrid::DataUploadMethod && !fs.upload.InFlight()) {
-        fs.upload_lists.clear();
-    }
     switch (method) {
     case 0x45:
         FrontMacroEngine(fs).ClearCode(argument);
@@ -1756,268 +1820,6 @@ void KeplerCompute::FrontNoteReport(VideoCommon::GpuSplit& split, const FrontSta
     }
 }
 
-const KeplerCompute::FrontMacro& KeplerCompute::FrontMacroInfo(FrontState& fs,
-                                                               const MacroEngine& engine,
-                                                               u32 start) {
-    const auto known = std::ranges::find_if(fs.macros, [&](const FrontMacro& entry) {
-        return entry.engine == &engine && entry.generation == engine.native_code_generation &&
-               entry.start == start;
-    });
-    if (known != fs.macros.end()) {
-        return *known;
-    }
-    if (fs.macros.size() >= 256) {
-        fs.macros.clear();
-    }
-    const std::span<const u32> code{engine.native_code};
-    const u64 hash = TuringMacroInterpreter::CodeHash(
-        code, start, TuringMacroInterpreter::AnalyzeEffects(code, start));
-    const auto cells = Nx2ListGrid::RecognizeHleMacro(code, start, hash);
-    if (cells) {
-        LOG_INFO(HW_GPU,
-                 "List-fed grid: compute macro {:016x} at {:#x} stores its parameters in data RAM "
-                 "words {:#x}, {:#x}, {:#x}; its lists are taken unread",
-                 hash, start, (*cells)[0], (*cells)[1], (*cells)[2]);
-    } else if (Nx2ListGrid::FindHleMacro(hash) != nullptr) {
-        LOG_WARNING(HW_GPU,
-                    "List-fed grid: compute macro {:016x} at {:#x} does not store its parameters "
-                    "as its entry says; its lists are read",
-                    hash, start);
-    }
-    fs.macros.push_back({&engine, engine.native_code_generation, start, hash, cells});
-    return fs.macros.back();
-}
-
-std::optional<u64> KeplerCompute::FrontClaimListGrid(VideoCommon::GpuSplit& split, u32 method) {
-    auto& fs = Front(split);
-    // The three words must be the whole call.
-    if (fs.executing_macro || !fs.parameters.empty() || method < 0xe00 ||
-        method >= fs.registers.size() || (method & 1) != 0 || grid_marker == nullptr ||
-        rasterizer == nullptr || !rasterizer->Nx2ListGridSupported()) {
-        return std::nullopt;
-    }
-    const auto positions = FrontMacroPositions(fs);
-    if (positions.empty()) {
-        return std::nullopt;
-    }
-    const u32 start = positions[((method - 0xe00) / 2) % positions.size()];
-    if (!FrontMacroInfo(fs, FrontMacroEngine(fs), start).cells) {
-        return std::nullopt;
-    }
-    const u64 keep_id = Nx2ListGrid::NextKeepId();
-    const Nx2ListGrid::SlotOwner owner{
-        keep_id,
-        [](void* self, u64 evicted) {
-            return static_cast<KeplerCompute*>(self)->FrontEvictList(evicted);
-        },
-        this};
-    if (!Nx2ListGrid::ClaimSlot(owner)) {
-        return std::nullopt;
-    }
-    return keep_id;
-}
-
-bool KeplerCompute::FrontEvictList(u64 keep_id) {
-    namespace ListGrid = Nx2ListGrid;
-    // Without a front, ReleaseFront resolved the markers.
-    if (!front || grid_marker == nullptr) {
-        return true;
-    }
-    auto& fs = *front;
-    // Its markers are in upload data the back patches once the upload is complete.
-    if (std::ranges::find(fs.upload_lists, keep_id) != fs.upload_lists.end()) {
-        return false;
-    }
-    ListGrid::KeptList* const list = grid_marker->Find(ListGrid::Marker(keep_id, 0));
-    if (list == nullptr || list->keep_id != keep_id) {
-        return true;
-    }
-    auto& data_ram = native_data_ram ? *native_data_ram
-                                     : *FrontMacroEngine(fs).native_interpreter.active_dram;
-    std::array<bool, 3> forced = grid_marker->keep_id == keep_id ? grid_marker->Marked(data_ram)
-                                                                 : std::array<bool, 3>{};
-    ListGrid::EvictFromRam(*grid_marker, data_ram, keep_id);
-    for (u32 i = 0; i < 3; ++i) {
-        const u32 address = ListGrid::QmdGridRegister + i;
-        const u32 value = fs.registers[address];
-        if (ListGrid::IsMarker(value) && grid_marker->Find(value) == list) {
-            const u32 word = ListGrid::ResolveWord(*grid_marker, value).value_or(0);
-            FrontApply(fs, address, word);
-            VideoCommon::GpuSplit::Get().MacroWrite(this, address, word);
-            forced[ListGrid::MarkerIndex(value)] = true;
-        }
-    }
-    if (ListGrid::g_verify && list->verified) {
-        for (u32 i = 0; i < 3; ++i) {
-            if (!forced[i]) {
-                continue;
-            }
-            ListGrid::NoteVerify(
-                ListGrid::Check::Forced, list->hash, list->resolved && list->words[i] == list->real[i],
-                fmt::format("list {} word {} resolved as {:#x} before its slot was reused, the "
-                            "real word is {:#x}",
-                            keep_id, i, list->words[i], list->real[i]));
-        }
-    }
-    return true;
-}
-
-void KeplerCompute::FrontTakeListGrid(VideoCommon::GpuSplit& split, u32 method, u64 keep_id,
-                                      GPUVAddr address, const Nx2ListGrid::ListReader& reader,
-                                      std::span<const u32> real) {
-    namespace ListGrid = Nx2ListGrid;
-    auto& fs = Front(split);
-    const auto positions = FrontMacroPositions(fs);
-    const u32 start = positions[((method - 0xe00) / 2) % positions.size()];
-    auto& macro = FrontMacroEngine(fs);
-    const FrontMacro& info = FrontMacroInfo(fs, macro, start);
-    if (native_data_ram) {
-        macro.native_interpreter.active_dram = native_data_ram;
-    }
-    auto& data_ram = *macro.native_interpreter.active_dram;
-    // As the macro, with a marker for each word.
-    ListGrid::KeptList list{
-        .keep_id = keep_id, .address = address, .hash = info.hash, .reader = reader};
-    if (real.size() == list.real.size()) {
-        list.verified = true;
-        std::ranges::copy(real, list.real.begin());
-    }
-    for (u32 i = 0; i < 3; ++i) {
-        data_ram[(*info.cells)[i]] = ListGrid::Marker(keep_id, i);
-    }
-    grid_marker->cells = *info.cells;
-    grid_marker->keep_id = keep_id;
-    grid_marker->set = true;
-    grid_marker->Remember(list);
-    // At the list's place in the stream, the back keeps a copy of the words. It writes no guest
-    // memory.
-    const u64 hash = info.hash;
-    if (list.verified) {
-        split.DeferWords(
-            [this, keep_id, address, hash](std::span<const u32> words) {
-                rasterizer->Nx2KeepListWords(keep_id, address, hash, words);
-            },
-            real, VideoCommon::GpuSplit::Writes::Noted);
-    } else {
-        split.Defer(
-            [this, keep_id, address, hash] {
-                rasterizer->Nx2KeepListWords(keep_id, address, hash, {});
-            },
-            0, VideoCommon::GpuSplit::Writes::Noted);
-    }
-}
-
-void KeplerCompute::FrontExpectKeptWord(GPUVAddr address, u32 marker) {
-    const auto* const list = grid_marker->Find(marker);
-    if (list == nullptr) {
-        return;
-    }
-    VideoCommon::GpuSplit::Get().Defer(
-        [this, address, keep_id = list->keep_id, index = Nx2ListGrid::MarkerIndex(marker)] {
-            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                rasterizer->Nx2ExpectKeptWord(*device, keep_id, index);
-            }
-        },
-        0, VideoCommon::GpuSplit::Writes::Noted);
-}
-
-void KeplerCompute::FrontGuardListGrid(VideoCommon::GpuSplit& split, FrontState& fs,
-                                       MacroEngine& macro, u32 start) {
-    namespace ListGrid = Nx2ListGrid;
-    auto& data_ram = *macro.native_interpreter.active_dram;
-    // Markers reach registers only as moves into the QMD grid registers (Admit).
-    const auto marker_register = [this](u32 address, u32 value) {
-        return address - ListGrid::QmdGridRegister < 3 && ListGrid::IsMarker(value) &&
-               grid_marker->Find(value) != nullptr;
-    };
-    const auto marked = grid_marker->Marked(data_ram);
-    bool live = marked[0] || marked[1] || marked[2];
-    for (u32 i = 0; i < 3 && !live; ++i) {
-        live = marker_register(ListGrid::QmdGridRegister + i,
-                               fs.registers[ListGrid::QmdGridRegister + i]);
-    }
-    if (!live) {
-        return;
-    }
-    const auto read = [&fs](u32 address) {
-        return address < fs.registers.size() ? fs.registers[address] : 0U;
-    };
-    const std::span<const u32> code{macro.native_code};
-    const auto result = ListGrid::DryRun(code, start, fs.parameters, data_ram, grid_marker->cells,
-                                         marked, read, marker_register);
-    const auto admission = ListGrid::Admit(result, fs.upload);
-    if (admission == ListGrid::Admission::Unaffected) {
-        return;
-    }
-    if (admission == ListGrid::Admission::Moves) {
-        // The back patches exactly the upload words the markers go to (PlanPatches), told as
-        // the call writes each (FrontRunMacro).
-        fs.upload_markers = ListGrid::UploadMarkerWords(result, fs.upload);
-        if (ListGrid::g_verify) {
-            // The same call on the real words, where every list's were read the old way.
-            const auto real_word = [this](u32 marker) -> std::optional<u32> {
-                const ListGrid::KeptList* const list = grid_marker->Find(marker);
-                if (list == nullptr || !list->verified) {
-                    return std::nullopt;
-                }
-                return list->real[ListGrid::MarkerIndex(marker)];
-            };
-            bool known = true;
-            auto real_ram = std::make_unique<ListGrid::DataRam>(data_ram);
-            for (u32 i = 0; i < 3; ++i) {
-                if (marked[i]) {
-                    const auto word = real_word(data_ram[grid_marker->cells[i]]);
-                    known = known && word.has_value();
-                    (*real_ram)[grid_marker->cells[i]] = word.value_or(0);
-                }
-            }
-            const auto real_read = [&](u32 address) {
-                const u32 value = read(address);
-                if (!marker_register(address, value)) {
-                    return value;
-                }
-                const auto word = real_word(value);
-                known = known && word.has_value();
-                return word.value_or(0);
-            };
-            const auto real = ListGrid::DryRun(code, start, fs.parameters, *real_ram,
-                                               grid_marker->cells, {}, real_read,
-                                               [](u32, u32) { return false; });
-            if (known) {
-                // An admitted call stores no marker in the data RAM (Admit): its data RAM
-                // writes compare as they are.
-                const bool match =
-                    real.completed &&
-                    ListGrid::MatchesRealRun(result.emits, real.emits, real_word) &&
-                    result.data_ram_writes == real.data_ram_writes;
-                ListGrid::NoteVerify(ListGrid::Check::Reader,
-                                     FrontMacroInfo(fs, macro, start).hash, match,
-                                     fmt::format("compute macro at {:#x}: {} writes on the markers, "
-                                                 "{} on the real words",
-                                                 start, result.emits.size(), real.emits.size()));
-            }
-        }
-        return;
-    }
-    if (static u32 logged{}; logged < 16) {
-        ++logged;
-        LOG_INFO(HW_GPU,
-                 "List-fed grid: compute macro {:016x} at {:#x} gets the real words: {}",
-                 FrontMacroInfo(fs, macro, start).hash, start,
-                 result.reason.empty() ? std::string_view{"a marker goes elsewhere"}
-                                       : result.reason);
-    }
-    ListGrid::ResolveCells(*grid_marker, data_ram);
-    for (u32 i = 0; i < 3; ++i) {
-        const u32 address = ListGrid::QmdGridRegister + i;
-        if (marker_register(address, fs.registers[address])) {
-            const u32 value = ListGrid::ResolveWord(*grid_marker, fs.registers[address]).value_or(0);
-            FrontApply(fs, address, value);
-            split.MacroWrite(this, address, value);
-        }
-    }
-}
-
 void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split,
                                          u32 method, const u32* base_start, u32 amount,
                                          u32 methods_pending, const GPUVAddr* segment) {
@@ -2051,10 +1853,6 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
     if (native_data_ram) {
         macro.native_interpreter.active_dram = native_data_ram;
     }
-    fs.upload_markers.clear();
-    if (grid_marker != nullptr && grid_marker->set) {
-        FrontGuardListGrid(split, fs, macro, start);
-    }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Macro};
     namespace ListTrace = VideoCommon::ListMacroTrace;
     ListTrace::Call* const trace =
@@ -2069,15 +1867,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         ListTrace::NoteRead(trace, address, value);
         return value;
     };
-    std::size_t emitted = 0;
-    std::size_t next_marker = 0;
     const auto emit = [&](u32 address, u32 value) {
-        if (next_marker < fs.upload_markers.size() &&
-            fs.upload_markers[next_marker].emit == emitted) {
-            const auto& marker = fs.upload_markers[next_marker++];
-            FrontExpectKeptWord(marker.address, marker.marker);
-        }
-        ++emitted;
         if (address >= 0xe00) {
             return false;
         }

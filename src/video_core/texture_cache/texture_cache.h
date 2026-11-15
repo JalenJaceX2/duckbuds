@@ -31,6 +31,7 @@
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/render_trace.h"
 #include "video_core/texture_cache/conversion.h"
@@ -173,17 +174,27 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         if (True(image.flags & ImageFlagBits::IsDecoding)) {
             return false;
         }
-        const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+        // Badly overlapping images are written back only in The Duskbloods (#1542 is unmerged):
+        // other titles drop them without a write-back, as build 177 does.
+        const bool must_download =
+            IsDownloadable(image) && (False(image.flags & ImageFlagBits::BadOverlap) ||
+                                      Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL);
         if ((!aggressive_mode && !evict_old_costly && True(image.flags & ImageFlagBits::CostlyLoad)) ||
             (!high_priority_mode && must_download)) {
             return false;
         }
         if (must_download) {
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
-            image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);
+            WriteBackImage(image);
+            // An image that overlaps others badly shares memory with them. Dropped without a
+            // write-back, the next image made over that memory loads whatever an older image left
+            // there: The Duskbloods' HUD layer came back as its character portraits. The overlaps
+            // drawn after it are written back again over it, oldest first, so each part of the
+            // memory ends with its newest data.
+            if (True(image.flags & ImageFlagBits::BadOverlap)) {
+                for (const ImageId overlap_id : NewerGpuOverlaps(image)) {
+                    WriteBackImage(slot_images[overlap_id]);
+                }
+            }
             ++gc_download_deletes;
             ClearStaleImage(image);
         } else {
@@ -1281,6 +1292,40 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
 }
 
 template <class P>
+boost::container::small_vector<ImageId, 8> TextureCache<P>::NewerGpuOverlaps(
+    const ImageBase& image) const {
+    // Writing an overlap back can overwrite the images newer than it that overlap it in turn, so
+    // those follow too, through the whole chain.
+    boost::container::small_vector<ImageId, 8> newer;
+    boost::container::small_vector<const ImageBase*, 8> pending{&image};
+    while (!pending.empty()) {
+        const ImageBase& written = *pending.back();
+        pending.pop_back();
+        for (const ImageId overlap_id : written.overlapping_images) {
+            const ImageBase& overlap = slot_images[overlap_id];
+            if (overlap.modification_tick <= written.modification_tick ||
+                !IsDownloadable(overlap) || std::ranges::find(newer, overlap_id) != newer.end()) {
+                continue;
+            }
+            newer.push_back(overlap_id);
+            pending.push_back(&overlap);
+        }
+    }
+    std::ranges::sort(newer, {}, [this](ImageId id) { return slot_images[id].modification_tick; });
+    return newer;
+}
+
+template <class P>
+void TextureCache<P>::WriteBackImage(Image& image) {
+    auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+    const auto copies = FullDownloadCopies(image.info);
+    image.DownloadMemory(map, copies);
+    runtime.Finish();
+    SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
+                 swizzle_data_buffer);
+}
+
+template <class P>
 bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
     if (!image.IsSafeGpuCopy() || True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels))) {
         return false;
@@ -1677,7 +1722,8 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
                                       const Tegra::Texture::TICEntry* depth,
                                       std::array<f32, 2> jitter, std::array<f32, 2> motion_scale,
                                       bool use_history,
-                                      std::optional<std::array<u32, 2>> render_region) {
+                                      std::optional<std::array<u32, 2>> render_region,
+                                      const std::pair<ImageInfo, GPUVAddr>* depth_target) {
     if constexpr (FRAMEBUFFER_BLITS) {
         return false;
     } else {
@@ -1705,9 +1751,13 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
             FindOrInsertImage(motion_info, motion_surface.Address(), RelaxedOptions{});
         // The depth only feeds NVIDIA DLSS and FSR 3.1 (looked up only when they can run); without
         // it the stand-in runs.
+        // A depth target (The Duskbloods, tracked from its draws) instead of a texture.
         ImageId depth_id{};
-        if (use_history && depth && motion_id && runtime.WantsTemporalUpscaleDepth()) {
-            depth_id = FindOrInsertImage(ImageInfo(*depth), depth->Address(), RelaxedOptions{});
+        const GPUVAddr depth_address =
+            depth_target ? depth_target->second : depth ? depth->Address() : GPUVAddr{};
+        if (use_history && depth_address && motion_id && runtime.WantsTemporalUpscaleDepth()) {
+            depth_id = FindOrInsertImage(depth_target ? depth_target->first : ImageInfo(*depth),
+                                         depth_address, RelaxedOptions{});
             if (!depth_id) {
                 return false;
             }
@@ -1722,10 +1772,27 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         PrepareImage(dst_id, true, false);
         if (depth_id) {
             PrepareImage(depth_id, false, false);
-            if (slot_images[depth_id].info.num_samples != 1 ||
-                slot_images[depth_id].info.format != PixelFormat::D32_FLOAT) {
+            // A tracked depth target may also be one of the formats siko's v31 takes.
+            const PixelFormat depth_format = slot_images[depth_id].info.format;
+            const bool depth_format_ok =
+                depth_format == PixelFormat::D32_FLOAT ||
+                (depth_target && (depth_format == PixelFormat::D24_UNORM_S8_UINT ||
+                                  depth_format == PixelFormat::X8_D24_UNORM ||
+                                  depth_format == PixelFormat::D32_FLOAT_S8_UINT));
+            if (slot_images[depth_id].info.num_samples != 1 || !depth_format_ok) {
                 return false;
             }
+        }
+        if (static bool logged{}; depth_target && !std::exchange(logged, true)) {
+            const auto describe = [&](ImageId id) {
+                const auto& info = slot_images[id].info;
+                return fmt::format("{}x{} format {}", info.size.width, info.size.height,
+                                   static_cast<u32>(info.format));
+            };
+            LOG_INFO(HW_GPU, "Duskbloods upscale images: color {}, motion {}, depth {}, output {}",
+                     describe(result->src_id), describe(motion_id),
+                     depth_id ? describe(depth_id) : std::string{"none"},
+                     describe(result->dst_id));
         }
         for (const ImageId id : {src_id, motion_id, dst_id}) {
             if (slot_images[id].info.num_samples != 1) {
@@ -1784,10 +1851,11 @@ bool TextureCache<P>::TemporalUpscale(const Tegra::Engines::Fermi2D::Surface& ds
         }
         ImageViewId depth_view{};
         if (depth_id) {
-            if (const std::optional base = slot_images[depth_id].TryFindBase(depth->Address())) {
+            if (const std::optional base = slot_images[depth_id].TryFindBase(depth_address)) {
                 const SubresourceRange range{.base = *base, .extent = {1, 1}};
                 depth_view = FindOrEmplaceImageView(
-                    depth_id, ImageViewInfo(ImageViewType::e2D, PixelFormat::D32_FLOAT, range));
+                    depth_id, ImageViewInfo(ImageViewType::e2D, slot_images[depth_id].info.format,
+                                            range));
             }
             if (!depth_view) {
                 return false;
@@ -2174,7 +2242,17 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
 
     // Made where a dropped GPU-written image left stale bytes (MarkStale): nothing to upload.
     // Pages the buffer cache wrote on the GPU may hold data written back since: upload those.
-    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && image.dirty_layers.empty() &&
+    // EDEN_NX2_UPLOAD_STALE (from open PR #1501): unset = upload anyway for The Duskbloods (as
+    // dusk-v2.5, before #818: the skip left leftover host memory in its new targets), 1 = upload
+    // for every title, 0 = skip (#818).
+    static const int upload_stale_env = [] {
+        const char* value = std::getenv("EDEN_NX2_UPLOAD_STALE");
+        return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
+    }();
+    const bool upload_stale =
+        upload_stale_env == -1 ? Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL
+                               : upload_stale_env == 1;
+    if (!upload_stale && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) && image.dirty_layers.empty() &&
         False(image.flags & (ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
                              ImageFlagBits::SparseTiles | ImageFlagBits::Unbacked)) &&
         stale_pages.IsAll(image.cpu_addr, image.guest_size_bytes)) {
@@ -3406,6 +3484,30 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         DeleteImage(copy_object.id);
     }
 
+    {
+        namespace Perf = VideoCommon::Nx2Perf;
+        const u32 width = new_image.info.size.width;
+        const u32 height = new_image.info.size.height;
+        if (!new_image.aliased_images.empty()) {
+            Perf::NoteAlias(Perf::AliasStat::CreatedAlias, width, height);
+        } else if (!join_bad_overlap_ids.empty()) {
+            Perf::NoteAlias(Perf::AliasStat::CreatedBad, width, height);
+        }
+        if (width <= 16 && height <= 16 && Perf::AliasOn(Perf::Alias::Diag) &&
+            (!new_image.aliased_images.empty() || !join_bad_overlap_ids.empty())) {
+            static u32 logged{};
+            if (logged++ < 64) {
+                LOG_INFO(HW_GPU,
+                         "Alias diag: {}x{} format {} at {:#x} ({} bytes, block {}x{}x{}): {} "
+                         "aliases, {} bad overlaps, {} joined",
+                         width, height, static_cast<u32>(new_image.info.format), gpu_addr,
+                         new_image.guest_size_bytes, new_image.info.block.width,
+                         new_image.info.block.height, new_image.info.block.depth,
+                         new_image.aliased_images.size(), join_bad_overlap_ids.size(),
+                         join_overlap_ids.size());
+            }
+        }
+    }
     RegisterImage(new_image_id);
     return new_image_id;
 }
@@ -3639,7 +3741,20 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     } else {
         base = image.TryFindBase(gpu_addr).value();
     }
-    const s32 layers = image.info.type == ImageType::e3D ? info.size.depth : info.resources.layers;
+    s32 layers = image.info.type == ImageType::e3D ? info.size.depth : info.resources.layers;
+    // The Duskbloods (as dusk-v2.5): layers come from the render target's own description. A 3D
+    // image can be bound as a layered (DefineArraySize) target, whose depth is in resources.layers,
+    // not size.depth; the game clears its 24-slice fog volumes one layer at a time this way.
+    // Other titles as build 177.
+    if (Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL) {
+        layers = static_cast<s32>(info.type == ImageType::e3D
+                                      ? info.size.depth
+                                      : static_cast<u32>(info.resources.layers));
+        if (image.info.type == ImageType::e3D) {
+            layers = (std::min)(layers,
+                                (std::max)(static_cast<s32>(image.info.size.depth) - base.layer, 1));
+        }
+    }
     if (RenderTrace::SampleFrame(frame_tick)) {
         LOG_DEBUG(HW_GPU,
                   "Render trace target match: docked={} requested={:#x} {}x{} layers={} format={} "
@@ -4227,12 +4342,22 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
 }
 
 template <class P>
-void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
+void TextureCache<P>::SynchronizeAliases(ImageId image_id, bool after_upload) {
+    namespace Perf = VideoCommon::Nx2Perf;
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
+    const u32 diag_width = image.info.size.width;
+    const u32 diag_height = image.info.size.height;
     // Nothing aliased was modified after this image: skip walking its (possibly long) alias list
     // for every draw that samples it (~7% of the GPU back thread in DK Bananza's open areas).
-    if (image.newest_alias_tick <= image.modification_tick) {
+    // The Duskbloods' tiny images (exposure and the like) skip the early-out by default, as before
+    // #858: an unverified precaution against the FSR 3.1 exposure flicker (alias_sync_always).
+    const int sync_always = Perf::AliasSync();
+    const bool walk_always =
+        sync_always > 0 || (sync_always < 0 && diag_width <= 16 && diag_height <= 16 &&
+                            Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL);
+    if (image.newest_alias_tick <= image.modification_tick && !after_upload && !walk_always) {
+        Perf::NoteAlias(Perf::AliasStat::Skipped, diag_width, diag_height);
         DEBUG_ASSERT(std::ranges::none_of(image.aliased_images, [&](const AliasedImage& alias) {
             return slot_images[alias.id].modification_tick > image.modification_tick;
         }));
@@ -4243,7 +4368,12 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     u64 most_recent_tick = image.modification_tick;
     for (const AliasedImage& aliased : image.aliased_images) {
         ImageBase& aliased_image = slot_images[aliased.id];
-        if (image.modification_tick < aliased_image.modification_tick) {
+        // alias_resync_upload: the upload just replaced what an alias of the same tick copied in.
+        const bool same_tick_gpu = after_upload &&
+                                   image.modification_tick == aliased_image.modification_tick &&
+                                   True(aliased_image.flags & ImageFlagBits::GpuModified) &&
+                                   False(aliased_image.flags & ImageFlagBits::CpuModified);
+        if (image.modification_tick < aliased_image.modification_tick || same_tick_gpu) {
             most_recent_tick = (std::max)(most_recent_tick, aliased_image.modification_tick);
             aliased_images.push_back(&aliased);
             any_rescaled |= True(aliased_image.flags & ImageFlagBits::Rescaled);
@@ -4253,8 +4383,10 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     if (aliased_images.empty()) {
         // Newer aliases were deleted since: skip the walk until one is modified again.
         image.newest_alias_tick = image.modification_tick;
+        Perf::NoteAlias(Perf::AliasStat::NoNewer, diag_width, diag_height);
         return;
     }
+    Perf::NoteAlias(Perf::AliasStat::Synced, diag_width, diag_height);
     const bool can_rescale = ImageCanRescale(image);
     if (any_rescaled) {
         if (can_rescale) {
@@ -4305,9 +4437,15 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             TrackImage(image, image_id);
         }
     } else {
+        const bool upload = True(image.flags & ImageFlagBits::CpuModified);
         RefreshContents(image, image_id);
         if (!image.aliased_images.empty()) {
-            SynchronizeAliases(image_id);
+            namespace Perf = VideoCommon::Nx2Perf;
+            if (upload) {
+                Perf::NoteAlias(Perf::AliasStat::Uploads, image.info.size.width,
+                                image.info.size.height);
+            }
+            SynchronizeAliases(image_id, upload && Perf::AliasOn(Perf::Alias::ResyncUpload));
         }
     }
     if (is_modification) {

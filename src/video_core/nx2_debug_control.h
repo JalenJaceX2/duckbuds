@@ -3,11 +3,14 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -48,6 +51,86 @@ struct RejectChange {
     /// Whether a hash left the list, so programs rejected before must be lowered again.
     bool unrejected;
 };
+
+/// Graphics draws the rasterizer leaves out (draw_skip, EDEN_NX2_DRAW_SKIP). A draw is skipped
+/// when any rule matches. Only the draw call itself is left out: pipeline, bindings, render pass
+/// and dynamic state are still set up, so later draws see the same state as without the filter.
+struct DrawFilter {
+    /// Draw indices within the frame (counted from 0 at each frame end): [range_begin, range_end).
+    u32 range_begin{};
+    u32 range_end{};
+    /// Shader hashes (frame dump "shaders", ShaderHashes()[1] and [5]) of the vertex and pixel
+    /// programs.
+    std::vector<u64> vs;
+    std::vector<u64> ps;
+    /// Line, line loop, line strip and line adjacency topologies.
+    bool lines{};
+    /// Colour target 0 at this GPU address (0: no rule).
+    u64 rt0{};
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return range_begin >= range_end && vs.empty() && ps.empty() && !lines && rt0 == 0;
+    }
+};
+
+/// Parses "range=a-b;ps=<hash>,...;vs=<hash>,...;lines=1;rt0=0x..." (EDEN_NX2_DRAW_SKIP). Throws
+/// std::invalid_argument on a malformed rule.
+[[nodiscard]] DrawFilter ParseDrawFilter(std::string_view text);
+
+/// Server thread: replaces the filter; the rasterizer takes it at the next frame end. Returns the
+/// generation to wait for.
+u64 SetDrawFilter(DrawFilter filter);
+[[nodiscard]] DrawFilter CurrentDrawFilter();
+/// Rasterizer thread: the pending filter change, once, with its generation.
+[[nodiscard]] std::optional<std::pair<u64, DrawFilter>> TakeDrawFilter();
+void NoteDrawFilterApplied(u64 generation);
+[[nodiscard]] bool WaitDrawFilterApplied(u64 generation, std::chrono::milliseconds timeout);
+
+/// One graphics draw of a draw_list frame, as the rasterizer saw it right before the draw call.
+struct DrawRecord {
+    u32 index{};
+    u32 topology{};
+    bool indexed{};
+    bool indirect{};
+    bool skipped{};
+    u32 count{};
+    u32 first{};
+    u32 instances{};
+    std::array<u64, 6> programs{};      ///< guest GPU address per stage (0: disabled)
+    std::array<u64, 6> shader_hashes{}; ///< ShaderHashes() per stage
+    u32 rt_count{};
+    std::array<u64, 8> rt{};
+    std::array<u32, 8> rt_format{};
+    u32 rt_width{};
+    u32 rt_height{};
+    u64 zeta{};
+    u32 zeta_format{};
+    bool zeta_enable{};
+    u32 blend_enable{}; ///< bit per colour target
+    bool blend_per_target{};
+    std::array<u32, 6> blend0{}; ///< target 0: color op, src, dst, alpha op, src, dst
+    u32 color_mask0{};
+    bool depth_test{};
+    bool depth_write{};
+    u32 depth_func{};
+    bool cull{};
+    u32 cull_face{};
+    float line_width{};
+    std::array<float, 6> viewport0{}; ///< scale x y z, translate x y z
+    std::array<u64, 4> stream_address{};
+    std::array<u32, 4> stream_stride{};
+    u64 index_address{};
+    u32 index_format{};
+};
+
+/// Server thread: asks for the draws of the next whole frame (frame end to frame end).
+void RequestDrawList(u64 id);
+void CancelDrawList(u64 id);
+[[nodiscard]] std::optional<std::vector<DrawRecord>> WaitDrawList(u64 id,
+                                                                  std::chrono::milliseconds timeout);
+/// Rasterizer thread.
+[[nodiscard]] std::optional<u64> TakeDrawList();
+void FinishDrawList(u64 id, std::vector<DrawRecord> draws);
 
 /// Opens a debug server session (clears requests and rejections) or ends it (wakes waiters).
 void BeginSession();

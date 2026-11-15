@@ -6,11 +6,14 @@
 #pragma once
 
 #include <array>
+#include <cstdlib>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include "common/container/unordered_map.h"
 
 #include "common/common_types.h"
+#include "common/settings.h"
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/shader_info.h"
 #include "shader_recompiler/stage.h"
@@ -82,6 +85,12 @@ public:
     /// raw 8-byte arguments in constant buffers, without the NVN descriptor layout.
     [[nodiscard]] virtual bool IsNativeProgram() const { return false; }
 
+    /// #1490 (unmerged): the native local stack region and the fp32 SignedZeroInfNanPreserve mode
+    /// on NVIDIA, for The Duskbloods' native programs only; other titles as build 177.
+    [[nodiscard]] bool UsesNativeLocalStack() const {
+        return IsNativeProgram() && Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL;
+    }
+
     /// Native programs: whether the 8-byte constant at (index, offset) is a mapped GPU address.
     /// Native argument tables mix pointers with scalars (sizes, strides).
     [[nodiscard]] virtual bool IsCbufStorageBufferPointer(u32, u32) { return true; }
@@ -116,6 +125,44 @@ public:
     [[nodiscard]] virtual u32 TextureBoundBuffer() const = 0;
 
     [[nodiscard]] virtual u32 LocalMemorySize() const = 0;
+
+    /// Ampere programs keep their call stack at the top of the 16 MiB local memory window and
+    /// grow it down, far beyond the local memory their header declares. A native program's local
+    /// array holds a spare word that stores outside the memory below are sent to, a region for
+    /// that stack (NATIVE_STACK_BYTES), then the declared memory. The spare word and the stack
+    /// come first so their places don't depend on the declared size: the two halves of a merged
+    /// VertexA/VertexB program share one array and map every address the same way.
+    static constexpr u32 LOCAL_WINDOW_BYTES = 0x1000000;
+    static constexpr u32 NATIVE_STACK_BYTES = 0x800;
+    static constexpr u32 NATIVE_STACK_BASE = 4;
+    static constexpr u32 NATIVE_DECLARED_BASE = NATIVE_STACK_BASE + NATIVE_STACK_BYTES;
+
+    /// Bytes of the program's local array: the declared local memory, and for native programs
+    /// also the spare word and the stack region before it.
+    [[nodiscard]] u32 LocalArraySize() const {
+        if (!UsesNativeLocalStack()) {
+            return LocalMemorySize();
+        }
+        if (UsesV25NativeStack()) {
+            return LocalMemorySize() + NATIVE_STACK_BYTES;
+        }
+        const u32 declared = (LocalMemorySize() + 3U) & ~3U;
+        return NATIVE_DECLARED_BASE + declared;
+    }
+
+    /// EDEN_NX2_DUSK_STACK=v25 (default) | upstream: The Duskbloods' native stack lowering.
+    /// v25 (dusk-v2.5, c7b75c47): the declared memory first, then NATIVE_STACK_BYTES; window
+    /// offsets in the upper half are folded onto that region (a deeper stack aliases the declared
+    /// memory), and bounds are only checked against the whole array. upstream: #1490's layout above
+    /// with per-access bounds (spare word). Translation runs every session (no translated code is
+    /// cached on disk), so switching never reuses the other variant's output.
+    [[nodiscard]] static bool UsesV25NativeStack() {
+        static const bool v25 = [] {
+            const char* value = std::getenv("EDEN_NX2_DUSK_STACK");
+            return value == nullptr || std::string_view{value} != "upstream";
+        }();
+        return v25;
+    }
 
     [[nodiscard]] virtual u32 SharedMemorySize() const = 0;
 

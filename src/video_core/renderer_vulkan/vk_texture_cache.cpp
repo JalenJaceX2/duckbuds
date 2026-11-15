@@ -1832,11 +1832,7 @@ bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
 
 bool TextureCacheRuntime::UsesNvidiaDlss() const {
 #ifdef EGLANTINE_STREAMLINE
-    static const bool force_fsr = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
-    }();
-    return !force_fsr && !dlss_unsupported && Streamline::IsDlssAvailable();
+    return !dlss_unsupported && Streamline::IsDlssAvailable() && Streamline::DlssWanted();
 #else
     return false;
 #endif
@@ -1856,7 +1852,8 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView& motion_vectors, ImageView& depth,
                                           std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale) {
+                                          std::array<f32, 2> motion_scale,
+                                          std::array<u32, 2> max_render_size) {
     if (!WantsTemporalUpscaleDepth()) {
         return false;
     }
@@ -1867,11 +1864,16 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
         fsr3_last_evaluation
             ? std::chrono::duration<f32, std::milli>(now - *fsr3_last_evaluation).count()
             : 1000.0f / 30.0f;
-    const bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f;
+    bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f;
     fsr3_last_evaluation = now;
 #ifdef EGLANTINE_STREAMLINE
+    // Switching between DLSS and FSR 3.1 (the status bar's upscaler button) starts the history
+    // again; both upscalers stay allocated, so switching back costs nothing more.
+    const bool dlss = UsesNvidiaDlss();
+    reset = reset || dlss != temporal_dlss;
+    temporal_dlss = dlss;
     if (UpscaleWithDlss(dst_framebuffer, input_color, motion_vectors, depth, render_size, jitter,
-                        motion_scale, reset)) {
+                        motion_scale, reset, max_render_size)) {
         return true;
     }
 #endif
@@ -1914,6 +1916,7 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
             .motion_vectors = motion_vectors.Handle(Shader::TextureType::Color2D),
             .render_size = {render_size[0], render_size[1]},
             .upscale_size = extent,
+            .max_render_size = {max_render_size[0], max_render_size[1]},
             .jitter = jitter,
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
@@ -1981,18 +1984,19 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView& motion_vectors, ImageView& depth,
                                           std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale, bool reset) {
-    // EDEN_NX2_DLSS_REPLACEMENT=fsr keeps FSR 3.1 for A/B runs.
-    static const bool force_fsr = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
-    }();
-    if (force_fsr || dlss_unsupported) {
+                                          std::array<f32, 2> motion_scale, bool reset,
+                                          std::array<u32, 2> max_render_size) {
+    // FSR 3.1 when DLSS is off (the setting, the upscaler button or EDEN_NX2_DLSS_REPLACEMENT=fsr).
+    if (dlss_unsupported || !Streamline::DlssWanted()) {
         return false;
     }
     if (!dlss_upscaler) {
-        // Off in the settings, or Streamline didn't start: it has said why.
+        // Streamline didn't start: it has said why, or DLSS was off when the game started.
         if (!Streamline::IsDlssAvailable()) {
+            if (Streamline::Requested()) {
+                StreamlineDlssUpscaler::NoteFallback(
+                    "Streamline did not start or attach (see the log above)");
+            }
             dlss_unsupported = true;
             return false;
         }
@@ -2002,6 +2006,7 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
         } catch (const vk::Exception& exception) {
             LOG_WARNING(Render_Vulkan, "NVIDIA DLSS unavailable ({}); using FSR 3.1",
                         exception.what());
+            StreamlineDlssUpscaler::NoteFallback(exception.what());
             dlss_unsupported = true;
             return false;
         }
@@ -2022,6 +2027,14 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
             .barrier_aspect = ImageAspectMask(view.format),
         };
     };
+    // An image's size on the host (after resolution scaling); the render size is a region of it.
+    const auto host_size = [&](const ImageView& view) {
+        const Image* const backing = view.BackingImage();
+        return backing && backing->IsRescaled()
+                   ? VkExtent2D{resolution.ScaleUp(view.size.width),
+                                resolution.ScaleUp(view.size.height)}
+                   : VkExtent2D{view.size.width, view.size.height};
+    };
     const bool native_resolution =
         Settings::GetNvidiaDlssRuntimeSettings().quality == Settings::NvidiaDlssQuality::Native;
     const VkExtent2D extent = native_resolution ? VkExtent2D{render_size[0], render_size[1]}
@@ -2041,12 +2054,17 @@ bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageVie
             .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
                                     motion_scale[1] * static_cast<f32>(render_size[1])},
             .reset = reset,
+            .depth_size = host_size(depth),
+            .color_size = {max_render_size[0], max_render_size[1]},
+            .motion_size = host_size(motion_vectors),
         });
     } catch (const vk::Exception& exception) {
         LOG_WARNING(Render_Vulkan, "NVIDIA DLSS evaluation unavailable ({}); using FSR 3.1",
                     exception.what());
+        StreamlineDlssUpscaler::NoteFallback(exception.what());
     }
     if (!upscaled) {
+        StreamlineDlssUpscaler::NoteFallback("evaluation failed (see the log above)");
         dlss_unsupported = true;
         return false;
     }
@@ -2111,12 +2129,20 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                         !same_size(motion_vectors))) {
         return false;
     }
+    // Only a tracked depth target (The Duskbloods) reaches here in a format other than D32_FLOAT.
+    const auto depth_format_ok = [](PixelFormat format) {
+        return format == PixelFormat::D32_FLOAT || format == PixelFormat::D24_UNORM_S8_UINT ||
+               format == PixelFormat::X8_D24_UNORM || format == PixelFormat::D32_FLOAT_S8_UINT;
+    };
     if (use_history && depth && (!plain(*depth) || !fits(*depth, render_size) ||
-                                depth->format != PixelFormat::D32_FLOAT || !same_size(*depth))) {
+                                !depth_format_ok(depth->format) || !same_size(*depth))) {
         return false;
     }
+    // A region of the input (The Duskbloods' dynamic resolution) is at most the input's size.
+    const std::array<u32, 2> max_render_size =
+        whole_input ? render_size : host_extent(input_color).value_or(render_size);
     if (use_history && depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
-                                 jitter, motion_scale)) {
+                                 jitter, motion_scale, max_render_size)) {
         return true;
     }
     const VkFormat format =
@@ -4730,7 +4756,22 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
 
     f32 min_lod = 0.0f;
     f32 max_lod = 0.25f;
-    if (tsc.mipmap_filter != TextureMipmapFilter::None) {
+    // EDEN_NX2_MIP_NONE_LODS (on for The Duskbloods when unset, =1 for every title, =0 off): a
+    // sampler without mipmap filtering still reads the level an explicit LOD selects, as on the
+    // console. The Duskbloods' bloom blurs level 1 of its mip chain with textureLod(..., 1.0)
+    // through such a sampler; clamped to level 0 it read a level nothing wrote (zeros, or stale
+    // NaNs that spread into black and purple blocks). Its LOD clamps then apply with nearest level
+    // selection, to implicit LODs too (so EDEN_NX2_FORCE_LOD0 below still applies).
+    static const int mip_none_lods_setting = [] {
+        const char* const value = std::getenv("EDEN_NX2_MIP_NONE_LODS");
+        return value == nullptr ? -1 : value[0] == '1' ? 1 : value[0] == '0' ? 0 : -1;
+    }();
+    constexpr u64 DuskbloodsNetworkTestProgramId = 0x0400D1D02399A000ULL;
+    const bool mip_none_lods = tsc.mipmap_filter == TextureMipmapFilter::None &&
+                               (mip_none_lods_setting >= 0 ? mip_none_lods_setting == 1
+                                                           : Settings::GetCurrentProgramID() ==
+                                                                 DuskbloodsNetworkTestProgramId);
+    if (tsc.mipmap_filter != TextureMipmapFilter::None || mip_none_lods) {
         min_lod = tsc.MinLod();
         max_lod = tsc.MaxLod();
         // EDEN_NX2_FORCE_LOD0: sample only the top mip level (debug aid for mip layout problems).

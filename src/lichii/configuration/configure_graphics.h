@@ -26,6 +26,7 @@ class QPushButton;
 class QEvent;
 class QObject;
 class QComboBox;
+class QCheckBox;
 
 namespace Settings {
 enum class NvdecEmulation : u32;
@@ -72,6 +73,7 @@ private:
     void UpdateAPILayout();
     void UpdateDeviceSelection(int device);
     void UpdateAmdFsr4Visibility();
+    void UpdateNvidiaDlssVisibility();
 
     void RetrieveVulkanDevices();
 
@@ -113,4 +115,7 @@ private:
     QComboBox* aspect_ratio_combobox;
     QComboBox* resolution_combobox;
     QWidget* amd_fsr4_group{}; ///< The FSR 4 setting and AmdFsr4Panel
+    QWidget* nvidia_dlss_group{}; ///< The NVIDIA DLSS setting and NvidiaDlssPanel
+    QCheckBox* dlss_checkbox{};
+    std::vector<QWidget*> nvidia_dlss_options; ///< DLSS quality and preset
 };

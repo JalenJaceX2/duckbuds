@@ -92,6 +92,8 @@ private:
     VkFormat swapchain_view_format{};
 
     Settings::ScalingFilter scaling_filter{};
+    /// Bilinear minifying the image (resolution scale above the window): area-sampled instead.
+    bool area_downscale{};
     std::unique_ptr<WindowAdaptPass> window_adapt{};
     std::list<Layer> layers{};
 

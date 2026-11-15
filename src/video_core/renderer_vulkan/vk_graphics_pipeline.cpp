@@ -10,6 +10,7 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -198,6 +199,19 @@ size_t NumAttachments(const FixedPipelineState& state) {
         }
     }
     return num;
+}
+
+/// The Duskbloods' tessellated ribbon pipeline (vs 716237219b1f36da / ps 0c32a6d83f88e18d), traced
+/// by BufferCache::Nx2SsboDiagBegin with the debug server or EDEN_NX2_DUSK_RIBBON=diag.
+bool TracesRibbonStorage(const std::array<u64, 6>& hashes) {
+    static const bool enabled = [] {
+        const char* const server = std::getenv("EDEN_NX2_DEBUG_SERVER");
+        const char* const ribbon = std::getenv("EDEN_NX2_DUSK_RIBBON");
+        return Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL &&
+               ((server != nullptr && *server != '\0') ||
+                (ribbon != nullptr && std::string_view{ribbon} == "diag"));
+    }();
+    return enabled && (hashes[1] == 0x716237219b1f36daULL || hashes[5] == 0x0c32a6d83f88e18dULL);
 }
 
 template <typename Spec>
@@ -1160,6 +1174,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
 
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        buffer_cache.Nx2SsboDiagBegin(TracesRibbonStorage(key.unique_hashes));
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }
@@ -1320,6 +1335,7 @@ bool GraphicsPipeline::ConfigureDelta(bool is_indexed) {
     }
     {
         Profile::Scope scope{Profile::Zone::UpdateBuffers};
+        buffer_cache.Nx2SsboDiagBegin(TracesRibbonStorage(key.unique_hashes));
         buffer_cache.UpdateGraphicsBuffers(is_indexed);
         buffer_cache.BindHostGeometryBuffers(is_indexed);
     }

@@ -372,6 +372,63 @@ QString GetTranslatedGameIconSize(size_t index) {
     return QCoreApplication::translate("MainWindow", default_game_icon_sizes[index].second);
 }
 
+// The upscaler button's choices in cycling order: FSR 3.1 (nullopt), then the DLSS modes.
+using DlssQuality = Settings::NvidiaDlssQuality;
+constexpr std::array<std::optional<DlssQuality>, 7> UPSCALERS{
+    std::nullopt,          DlssQuality::Automatic,   DlssQuality::Native,
+    DlssQuality::Quality,  DlssQuality::Balanced,    DlssQuality::Performance,
+    DlssQuality::UltraPerformance,
+};
+
+/// EDEN_NX2_DLSS_REPLACEMENT: "dlss" or "fsr" force that upscaler over the setting.
+const std::string& UpscalerEnv() {
+    static const std::string env = [] {
+        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return std::string{value ? value : ""};
+    }();
+    return env;
+}
+
+QString UpscalerName(std::optional<DlssQuality> choice) {
+    if (!choice) {
+        return QStringLiteral("FSR3");
+    }
+    switch (*choice) {
+    case DlssQuality::Automatic:
+        return QStringLiteral("DLSS AUTO");
+    case DlssQuality::Native:
+        return QStringLiteral("DLAA");
+    case DlssQuality::Quality:
+        return QStringLiteral("DLSS QUALITY");
+    case DlssQuality::Balanced:
+        return QStringLiteral("DLSS BALANCED");
+    case DlssQuality::Performance:
+        return QStringLiteral("DLSS PERF");
+    case DlssQuality::UltraPerformance:
+        return QStringLiteral("DLSS ULTRA PERF");
+    }
+    return QStringLiteral("DLSS");
+}
+
+std::optional<DlssQuality> SelectedUpscaler() {
+    const bool dlss = UpscalerEnv() == "dlss" ||
+                      (UpscalerEnv() != "fsr" && Settings::values.nvidia_dlss.GetValue());
+    return dlss ? std::optional{Settings::values.nvidia_dlss_quality.GetValue()} : std::nullopt;
+}
+
+bool UpscalerAllowed(std::optional<DlssQuality> choice) {
+    if (UpscalerEnv() == "fsr") {
+        return !choice;
+    }
+#ifdef EGLANTINE_STREAMLINE
+    // DLSS Frame Generation takes its camera from the DLSS evaluation.
+    if (Vulkan::Streamline::FrameGenActive()) {
+        return choice.has_value();
+    }
+#endif
+    return UpscalerEnv() != "dlss" || choice.has_value();
+}
+
 } // namespace
 
 #ifndef _WIN32
@@ -1128,6 +1185,30 @@ void MainWindow::InitializeWidgets() {
             });
     statusBar()->insertPermanentWidget(0, frame_gen_status_button);
 
+    // The upscaler in place of a game's DLSS: FSR 3.1 or NVIDIA DLSS in one of its modes.
+    upscaler_status_button = new QPushButton();
+    upscaler_status_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
+    upscaler_status_button->setFocusPolicy(Qt::NoFocus);
+    upscaler_status_button->setCheckable(true);
+    upscaler_status_button->setVisible(false);
+    connect(upscaler_status_button, &QPushButton::clicked, this, &MainWindow::OnCycleUpscaler);
+    upscaler_status_button->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(upscaler_status_button, &QPushButton::customContextMenuRequested,
+            [this](const QPoint& menu_location) {
+                QMenu context_menu;
+                const auto selected = SelectedUpscaler();
+                for (const auto& choice : UPSCALERS) {
+                    QAction* const action = context_menu.addAction(
+                        UpscalerName(choice), [this, choice] { SetUpscaler(choice); });
+                    action->setCheckable(true);
+                    action->setChecked(choice == selected);
+                    action->setEnabled(UpscalerAllowed(choice));
+                }
+                context_menu.exec(upscaler_status_button->mapToGlobal(menu_location));
+                upscaler_status_button->repaint();
+            });
+    statusBar()->insertPermanentWidget(0, upscaler_status_button);
+
 #ifdef HAS_RESHADE
     post_shader_status_button = new QPushButton();
     post_shader_status_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
@@ -1418,6 +1499,7 @@ void MainWindow::InitializeHotkeys() {
     connect_shortcut(QStringLiteral("Change Adapting Filter"), &MainWindow::OnToggleAdaptingFilter);
     connect_shortcut(QStringLiteral("Change Docked Mode"), &MainWindow::OnToggleDockedMode);
     connect_shortcut(QStringLiteral("Change GPU Mode"), &MainWindow::OnToggleGpuAccuracy);
+    connect_shortcut(QStringLiteral("Change Upscaler"), &MainWindow::OnCycleUpscaler);
     connect_shortcut(QStringLiteral("Audio Mute/Unmute"), &MainWindow::OnMute);
     connect_shortcut(QStringLiteral("Audio Volume Down"), &MainWindow::OnDecreaseVolume);
     connect_shortcut(QStringLiteral("Audio Volume Up"), &MainWindow::OnIncreaseVolume);
@@ -2643,6 +2725,9 @@ void MainWindow::OnEmulationStopped() {
     emu_speed_label->setVisible(false);
     game_fps_label->setVisible(false);
     dlss_status_label->setVisible(false);
+    upscaler_status_button->setVisible(false);
+    dlss_session = false;
+    upscaler_rtx = false;
     emu_frametime_label->setVisible(false);
     renderer_status_button->setEnabled(!UISettings::values.has_broken_vulkan);
     frame_gen_status_button->setEnabled(true);
@@ -5329,9 +5414,18 @@ void MainWindow::UpdateStatusBar() {
                                     .arg(mode_text(dlss.requested));
         }
     }
+    dlss_running = dlss.evaluations > dlss_evaluations;
+    dlss_session = dlss.streamline;
+    dlss_fallback = QString::fromStdString(dlss.fallback);
+    dlss_mode = dlss.mode;
+    upscaler_rtx =
+        QtCommon::system->GPU().Renderer().GetDeviceInfo().model.find("RTX") != std::string::npos;
     dlss_evaluations = dlss.evaluations;
+    UpdateUpscalerButton();
     dlss_status_label->setText(dlss_status_text);
-    dlss_status_label->setVisible(!dlss_status_text.isEmpty());
+    // The upscaler button shows the mode; the label's text stays for the performance overlay.
+    dlss_status_label->setVisible(!dlss_status_text.isEmpty() &&
+                                  !upscaler_status_button->isVisible());
 
     emit statsUpdated(results, shader_notify);
 
@@ -5542,6 +5636,82 @@ void MainWindow::UpdateFrameGenButton() {
             .arg(target_met, fallback));
 }
 
+void MainWindow::SetUpscaler(std::optional<Settings::NvidiaDlssQuality> choice) {
+    if (!UpscalerAllowed(choice)) {
+        return;
+    }
+    Settings::values.nvidia_dlss.SetValue(choice.has_value());
+    if (choice) {
+        Settings::values.nvidia_dlss_quality.SetValue(*choice);
+    }
+    // The renderer picks it up at its next upscale.
+    Settings::RefreshNvidiaDlssRuntimeSettings();
+    UpdateUpscalerButton();
+}
+
+void MainWindow::OnCycleUpscaler() {
+    if (!upscaler_status_button->isVisible()) {
+        return;
+    }
+    const auto it = std::ranges::find(UPSCALERS, SelectedUpscaler());
+    size_t index = it == UPSCALERS.end() ? 0 : static_cast<size_t>(it - UPSCALERS.begin());
+    for (size_t step = 1; step < UPSCALERS.size(); ++step) {
+        const auto& next = UPSCALERS[(index + step) % UPSCALERS.size()];
+        if (UpscalerAllowed(next)) {
+            SetUpscaler(next);
+            return;
+        }
+    }
+    UpdateUpscalerButton();
+}
+
+void MainWindow::UpdateUpscalerButton() {
+#ifdef EGLANTINE_STREAMLINE
+    // Only for RTX cards, or a session where Streamline runs; everyone else keeps FSR 3.1 as is.
+    const bool shown = emulation_running && (dlss_session || upscaler_rtx);
+#else
+    const bool shown = false;
+#endif
+    upscaler_status_button->setVisible(shown);
+    if (!shown) {
+        return;
+    }
+    const auto selected = SelectedUpscaler();
+    QString text = UpscalerName(selected);
+    QString tooltip;
+    if (UpscalerEnv() == "fsr") {
+        tooltip = tr("EDEN_NX2_DLSS_REPLACEMENT=fsr keeps FSR 3.1 this session.");
+    } else if (!selected) {
+        tooltip = dlss_session ? tr("FSR 3.1. Click or right-click to switch to NVIDIA DLSS.")
+                               : tr("FSR 3.1. NVIDIA DLSS starts with the next launch once you "
+                                    "pick one of its modes.");
+    } else if (!dlss_session) {
+        text = QStringLiteral("FSR3");
+        tooltip = tr("%1 is chosen, but NVIDIA Streamline is not running this session: DLSS "
+                     "starts with the next launch. If DLSS was already on at this launch, the log "
+                     "says why it did not start.")
+                      .arg(UpscalerName(selected));
+    } else if (!dlss_fallback.isEmpty()) {
+        text = QStringLiteral("FSR3");
+        tooltip = tr("NVIDIA DLSS fell back to FSR 3.1 this session: %1").arg(dlss_fallback);
+    } else {
+        if (dlss_running && *selected != DlssQuality::Automatic) {
+            text = UpscalerName(dlss_mode); // the mode that fits the game's render size
+        }
+        tooltip = dlss_running
+                      ? tr("NVIDIA DLSS is running, mode %1.").arg(UpscalerName(dlss_mode))
+                      : tr("NVIDIA DLSS is on; the game drew nothing to upscale in the last "
+                           "half second (menus, loading).");
+    }
+    if (UpscalerEnv() == "dlss") {
+        tooltip += tr(" EDEN_NX2_DLSS_REPLACEMENT=dlss keeps DLSS on.");
+    }
+    upscaler_status_button->setText(text);
+    upscaler_status_button->setToolTip(
+        tooltip + tr("\nClick: next upscaler. Right-click: pick one. Applies live."));
+    upscaler_status_button->setChecked(text != QStringLiteral("FSR3"));
+}
+
 void MainWindow::UpdateVolumeUI() {
     const auto volume_value = static_cast<int>(Settings::values.volume.GetValue());
     volume_slider->setValue(volume_value);
@@ -5563,6 +5733,7 @@ void MainWindow::UpdateStatusButtons() {
     UpdateFilterText();
     UpdateAAText();
     UpdateFrameGenButton();
+    UpdateUpscalerButton();
     UpdateVolumeUI();
 }
 

@@ -120,8 +120,6 @@ add_library(video_core STATIC
     nx2.h
     nx2_back_idle_trace.cpp
     nx2_back_idle_trace.h
-    nx2_list_grid.cpp
-    nx2_list_grid.h
     nx2_list_macro_trace.cpp
     nx2_list_macro_trace.h
     nx2_cmdpage_diag.h
@@ -634,10 +632,17 @@ endif()
 # NVIDIA DLSS through NVIDIA Streamline, in place of a game's DLSS (before FSR 3.1) when the
 # setting is on. Only Streamline's MIT-licensed headers are compiled in and nothing of NVIDIA's is
 # linked or copied: sl.interposer.dll and the DLSS plugins are loaded at run time from the user's PC.
-cmake_dependent_option(ENABLE_NVIDIA_DLSS "Enable NVIDIA DLSS through NVIDIA Streamline" ON
-                       "MSVC AND ARCHITECTURE_x86_64" OFF)
 set(EGLANTINE_STREAMLINE_SDK "" CACHE PATH
     "NVIDIA Streamline SDK directory for its headers (empty: download them)")
+# MinGW builds default to off unless the headers are already on disk, so an existing build
+# directory never starts downloading Streamline on its own.
+if (MSVC OR EGLANTINE_STREAMLINE_SDK)
+    set(NVIDIA_DLSS_DEFAULT ON)
+else()
+    set(NVIDIA_DLSS_DEFAULT OFF)
+endif()
+cmake_dependent_option(ENABLE_NVIDIA_DLSS "Enable NVIDIA DLSS through NVIDIA Streamline"
+                       ${NVIDIA_DLSS_DEFAULT} "WIN32 AND ARCHITECTURE_x86_64" OFF)
 if (ENABLE_NVIDIA_DLSS)
     if (EGLANTINE_STREAMLINE_SDK)
         set(STREAMLINE_INCLUDE_DIR "${EGLANTINE_STREAMLINE_SDK}/include")

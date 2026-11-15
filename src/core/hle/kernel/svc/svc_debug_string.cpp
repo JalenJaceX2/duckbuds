@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "core/core.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/svc.h"
 #include "core/memory.h"
@@ -21,7 +22,20 @@ Result OutputDebugString(Core::System& system, u64 address, u64 len) {
     R_SUCCEED_IF(len == 0);
     std::string msg_buffer(len, 0);
     GetCurrentMemory(system.Kernel()).ReadBlock(address, msg_buffer.data(), len);
-    LOG_INFO(Debug_Emulated, "{}", msg_buffer);
+    // The Duskbloods' fatal reason ('Allocate error heapName = M', DL_PANIC) likely comes here before
+    // its handler writes 0xdeadba.. to address 0. The default log filter (Debug:Error) hides Info,
+    // so such lines are logged as errors for that title.
+    const auto* const process = system.ApplicationProcess();
+    const bool fatal = process != nullptr && process->GetProgramId() == 0x0400D1D02399A000ULL &&
+                       (msg_buffer.find("PANIC") != std::string::npos ||
+                        msg_buffer.find("rror") != std::string::npos ||
+                        msg_buffer.find("bort") != std::string::npos ||
+                        msg_buffer.find("ssert") != std::string::npos);
+    if (fatal) {
+        LOG_ERROR(Debug_Emulated, "guest: {}", msg_buffer);
+    } else {
+        LOG_INFO(Debug_Emulated, "{}", msg_buffer);
+    }
     R_SUCCEED();
 }
 

@@ -28,6 +28,7 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/nx2_fast_draw.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 
@@ -267,17 +268,24 @@ private:
         // lock is taken once per burst instead of once per fence (the GPU thread, which holds
         // them for nearly every command, spun, slept and woke this thread for each one).
         // EDEN_NX2_FENCE_BATCH=0: one fence at a time (for comparisons).
-        static const size_t MaxBatch = [] {
+        // The debug server's perf_flip fence_batch overrides it from the next batch on.
+        static const bool start_batch = [] {
             const char* value = std::getenv("EDEN_NX2_FENCE_BATCH");
-            return value != nullptr && value[0] == '0' ? size_t{1} : size_t{64};
+            return !(value != nullptr && value[0] == '0');
         }();
+        static constexpr size_t MaxBatchSize = 64;
+        const auto max_batch = [] {
+            return VideoCommon::Nx2Perf::LiveOr(VideoCommon::Nx2Perf::g_fence_batch, start_batch)
+                       ? MaxBatchSize
+                       : size_t{1};
+        };
         struct Released {
             TFence fence;
             OperationList operations;
             u8 flushes;
         };
         std::vector<Released> batch;
-        batch.reserve(MaxBatch);
+        batch.reserve(MaxBatchSize);
         const auto take_front = [&] {
             batch.push_back({std::move(fences.front()), std::move(pending_operations.front()),
                              pending_flushes.front()});
@@ -302,8 +310,9 @@ private:
                 WaitFence(batch.front().fence);
             }
             {
+                const size_t batch_limit = max_batch();
                 std::unique_lock lock(guard);
-                while (batch.size() < MaxBatch && !fences.empty() &&
+                while (batch.size() < batch_limit && !fences.empty() &&
                        (fences.front()->IsStubbed() || IsFenceSignaled(fences.front()))) {
                     take_front();
                 }

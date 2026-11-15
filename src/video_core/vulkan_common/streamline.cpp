@@ -84,6 +84,7 @@ struct State {
     std::atomic<bool> frame_gen_available{};
     std::mutex frame_gen_reason_mutex;
     std::string frame_gen_reason;
+    bool requested{};
     bool started{};
     bool attached{};
 };
@@ -98,6 +99,8 @@ int LogLevel() {
     return value ? std::atoi(value) : 0;
 }
 
+std::atomic<u64> logged_problems{};
+
 void LogFromStreamline(sl::LogType type, const char* message) {
     std::string_view text{message ? message : ""};
     while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
@@ -105,9 +108,11 @@ void LogFromStreamline(sl::LogType type, const char* message) {
     }
     switch (type) {
     case sl::LogType::eError:
+        logged_problems.fetch_add(1, std::memory_order_relaxed);
         LOG_ERROR(Render_Vulkan, "Streamline: {}", text);
         break;
     case sl::LogType::eWarn:
+        logged_problems.fetch_add(1, std::memory_order_relaxed);
         LOG_WARNING(Render_Vulkan, "Streamline: {}", text);
         break;
     default:
@@ -536,12 +541,31 @@ bool FrameGenRequested() {
            }) == VideoCore::DlssgBlock::None;
 }
 
+bool Requested() {
+    return GetState().requested;
+}
+
+bool DlssWanted() {
+    // EDEN_NX2_DLSS_REPLACEMENT=dlss or fsr overrides the setting (and leaves it alone).
+    static const std::string env = [] {
+        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
+        return std::string{value ? value : ""};
+    }();
+    if (env == "dlss" || env == "fsr") {
+        return env == "dlss";
+    }
+    return Settings::GetNvidiaDlssRuntimeSettings().enabled;
+}
+
 bool Start(void* window) {
     State& state = GetState();
     if (state.started) {
         return true;
     }
-    if (!Settings::values.nvidia_dlss.GetValue()) {
+    // Nothing of NVIDIA's is loaded and no swapchain call is hooked unless DLSS is asked for when
+    // the game starts: the interposer hooks every present, so FSR 3.1 sessions keep it out.
+    state.requested = DlssWanted();
+    if (!state.requested) {
         return false;
     }
     SetFrameGenReason(state, "NVIDIA Streamline did not start; the log above says why");
@@ -853,6 +877,10 @@ void DisableFrameGen(std::string_view reason) {
 bool IsDlssAvailable() {
     const State& state = GetState();
     return state.started && state.attached;
+}
+
+u64 LoggedProblems() {
+    return logged_problems.load(std::memory_order_relaxed);
 }
 
 bool FrameGenSession() {

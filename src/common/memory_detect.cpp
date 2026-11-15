@@ -104,7 +104,15 @@ bool IsBelowSwitch2RamMinimum(HostRam ram) {
 ProcessMemoryUsage GetProcessMemoryUsage() {
     ProcessMemoryUsage usage{};
 #ifdef _WIN32
+#ifdef __MINGW32__
+    // mingw-w64's psapi.h has no PROCESS_MEMORY_COUNTERS_EX2 (Windows SDK 10.0.22000+).
+    struct : PROCESS_MEMORY_COUNTERS_EX {
+        SIZE_T PrivateWorkingSetSize;
+        ULONG64 SharedCommitUsage;
+    } counters{};
+#else
     PROCESS_MEMORY_COUNTERS_EX2 counters{};
+#endif
     counters.cb = sizeof(counters);
     if (GetProcessMemoryInfo(GetCurrentProcess(),
                              reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters),

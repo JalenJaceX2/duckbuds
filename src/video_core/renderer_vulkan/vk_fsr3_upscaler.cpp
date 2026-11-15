@@ -451,21 +451,26 @@ void Fsr3Upscaler::CreateResources(VkExtent2D render_size, VkExtent2D upscale_si
 }
 
 void Fsr3Upscaler::Upscale(const Inputs& in) {
-    if (!output.image || in.render_size.width != render_extent.width ||
-        in.render_size.height != render_extent.height ||
+    // Images at the largest render size, as the SDK's maxRenderSize (siko): a game with dynamic
+    // resolution (The Duskbloods) changes the render size every few frames, and recreating them
+    // each time reset the history and stalled.
+    const VkExtent2D max_size{(std::max)(in.render_size.width, in.max_render_size.width),
+                              (std::max)(in.render_size.height, in.max_render_size.height)};
+    if (!output.image || max_size.width != render_extent.width ||
+        max_size.height != render_extent.height ||
         in.upscale_size.width != upscale_extent.width ||
         in.upscale_size.height != upscale_extent.height) {
         if (output.image) {
             scheduler.Finish(); // the old images may still be in use
         }
-        CreateResources(in.render_size, in.upscale_size);
+        CreateResources(max_size, in.upscale_size);
     }
     const bool first = first_execution;
     const bool reset = in.reset || first;
     first_execution = false;
 
-    const s32 rw = static_cast<s32>(render_extent.width);
-    const s32 rh = static_cast<s32>(render_extent.height);
+    const s32 rw = static_cast<s32>(in.render_size.width);
+    const s32 rh = static_cast<s32>(in.render_size.height);
     const s32 uw = static_cast<s32>(upscale_extent.width);
     const s32 uh = static_cast<s32>(upscale_extent.height);
 
@@ -475,7 +480,8 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
     constants.previous_render_size = first ? constants.render_size : previous_render_size;
     constants.upscale_size = {uw, uh};
     constants.previous_upscale_size = first ? constants.upscale_size : previous_upscale_size;
-    constants.max_render_size = constants.render_size;
+    constants.max_render_size = {static_cast<s32>(render_extent.width),
+                                 static_cast<s32>(render_extent.height)};
     constants.max_upscale_size = constants.upscale_size;
     {
         const f32 near_plane = CAMERA_NEAR;
@@ -500,7 +506,7 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
     constants.downscale_factor = {static_cast<f32>(rw) / static_cast<f32>(uw),
                                   static_cast<f32>(rh) / static_cast<f32>(uh)};
     constants.motion_vector_jitter_cancellation = {0.0f, 0.0f};
-    const s32 phase_count = JitterPhaseCount(render_extent.width, upscale_extent.width);
+    const s32 phase_count = JitterPhaseCount(in.render_size.width, upscale_extent.width);
     if (reset || jitter_phase_count == 0.0f) {
         jitter_phase_count = static_cast<f32>(phase_count);
     } else if (static_cast<f32>(phase_count) > jitter_phase_count) {
@@ -525,16 +531,16 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
     previous_jitter = in.jitter;
 
     // ffxSpdSetup over the whole render area.
-    const u32 spd_groups_x = (render_extent.width - 1) / 64 + 1;
-    const u32 spd_groups_y = (render_extent.height - 1) / 64 + 1;
+    const u32 spd_groups_x = (in.render_size.width - 1) / 64 + 1;
+    const u32 spd_groups_y = (in.render_size.height - 1) / 64 + 1;
     const SpdConstants spd{
         .mips = static_cast<u32>((std::min)(
             std::floor(std::log2(static_cast<f32>(
-                (std::max)(render_extent.width, render_extent.height)))),
+                (std::max)(in.render_size.width, in.render_size.height)))),
             12.0f)),
         .num_work_groups = spd_groups_x * spd_groups_y,
         .work_group_offset = {0, 0},
-        .render_size = {render_extent.width, render_extent.height},
+        .render_size = {in.render_size.width, in.render_size.height},
     };
     RcasConstants rcas{};
     FSR::FsrRcasCon(rcas.config.data(), 2.0f - 2.0f * std::clamp(in.sharpness, 0.0f, 1.0f));

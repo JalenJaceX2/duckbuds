@@ -2766,7 +2766,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         if (defer_emission) {
             deferred_runtime_infos[stage_index] = runtime_info;
-            if (VideoCommon::Nx2Perf::Verify()) {
+            if (VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::AsyncPipelinesSpirv)) {
                 reference_spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, binding);
             }
         } else {
@@ -3146,7 +3146,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     const u64 ir_bytes = emit_pools ? IrBytes(std::span(&program, 1)) : 0;
     if (auto ir_reservation = emit_pools ? queued_ir.TryReserve(ir_bytes) : nullptr) {
         auto job = std::make_shared<DeferredCompute>();
-        if (VideoCommon::Nx2Perf::Verify()) {
+        if (VideoCommon::Nx2Perf::Slow(VideoCommon::Nx2Perf::Site::AsyncPipelinesSpirv)) {
             job->reference_spirv = EmitComputeShader(profile, program, key.unique_hash);
         }
         job->reservation = std::move(ir_reservation);
