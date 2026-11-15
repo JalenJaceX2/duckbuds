@@ -15,7 +15,7 @@
 <summary><b>English: open the guide</b></summary>
 
 **This is a fork of [zortos293/Lichii](https://github.com/zortos293/Lichii) (nx2, build 177), tuned to run *The Duskbloods Network Test* (program `0400D1D02399A000`) on Windows PCs with an NVIDIA GPU and an Intel CPU.**
-It pairs with the [playDB-CNT](https://github.com/sikoGD/playDB-CNT) launcher by sikoGD, which provides the local network-test servers the game needs to get in-game. The launcher (1.3.2) is included in the zip.
+It pairs with the [playDB-CNT](https://github.com/sikoGD/playDB-CNT) launcher by sikoGD, which provides the local network-test servers the game needs to get in-game. The launcher (1.4.0) is included in the zip.
 
 > Not affiliated with Nintendo, FromSoftware or the upstream projects. No games, keys or firmware are included. Use only files you have legally dumped yourself.
 
@@ -30,7 +30,7 @@ It pairs with the [playDB-CNT](https://github.com/sikoGD/playDB-CNT) launcher by
   - Bot Match crashes (the game's heap ran out)
   - red "laser" lines and brightness flicker in the hub
   - jagged, pixelated HUD and text when the internal resolution is above 1x (the window downscale now averages pixels)
-- **Launcher playDB-CNT 1.3.2** included; offline mode works.
+- **Launcher playDB-CNT 1.4.0** included; offline mode works. The zip was updated on 2026-11-15 (v3 first shipped with 1.3.2). New in 1.4.0: named CPU players in Bot Match, an **Allow in firewall** button and a lobby report while hosting.
 
 ## Performance
 
@@ -73,24 +73,29 @@ You need:
 - Your own `prod.keys` and `title.keys`
 - Your own Switch 2 firmware dump (tested with 23.0.1)
 - Your own dump of *The Duskbloods Network Test*
-- The **[playDB-CNT launcher](https://github.com/sikoGD/playDB-CNT)** (`Play.Duskbloods.exe`, included in the zip). Follow its README for its own setup.
+- The **[playDB-CNT launcher](https://github.com/sikoGD/playDB-CNT)** (`Play.Duskbloods.exe`, included in the zip). See [Launcher setup](#launcher-setup) below.
 
 Steps:
 
 1. **Extract** `Lichii-Duskbloods.zip` to a folder with a short path, e.g. `C:\Games\Lichii-Duskbloods\`. Keep the `user` folder next to `lichii.exe`: it makes the emulator portable and already holds the tuned settings.
 2. **Keys:** copy `prod.keys` and `title.keys` into `user\keys\`. Or start `lichii.exe` and use **Tools > Install Decryption Keys**.
-3. **Firmware:** start `lichii.exe`, then **Tools > Install Firmware > From Folder** (or **From ZIP**) and pick your firmware dump. Close the emulator afterwards.
-4. **Launcher:** set up [playDB-CNT](https://github.com/sikoGD/playDB-CNT) as its README describes. Then edit its `launcher_settings.json` so `emulator` points to this `lichii.exe`:
-   ```json
-   {
-     "emulator": "C:\\Games\\Lichii-Duskbloods\\lichii.exe",
-     "game": "C:\\Games\\THE DUSKBLOODS NETWORK TEST VER"
-   }
-   ```
-   Use double backslashes. `game` is your game dump folder.
-5. **Play:** run `Play.Duskbloods.exe` and press **Play**. Always start the game through the launcher: started directly, the online check fails.
+3. **Firmware and first start:** start `lichii.exe`, then **Tools > Install Firmware > From Folder** (or **From ZIP**) and pick your firmware dump. Close the emulator afterwards. This first start also writes the emulator's full settings, which the launcher needs.
+4. **Launcher:** set it up as described in [Launcher setup](#launcher-setup) below.
+5. **Play:** press **Start game** in `Play.Duskbloods.exe`. Always start the game through the launcher: started any other way, the game has no servers and stops at an online connection message.
 
 The first minutes stutter while shaders compile; this improves with each session.
+
+## Launcher setup
+
+`Play.Duskbloods.exe` (playDB-CNT 1.4.0) sits in the zip next to `lichii.exe`. You set everything in its window. It saves your choices to `launcher_settings.json` by itself when you press **Start game**, so do not edit that file by hand. No admin rights, hosts file or certificate steps are needed.
+
+1. Run `Play.Duskbloods.exe`.
+2. **Setup tab > Game:** press **Folder** and pick the unpacked `THE DUSKBLOODS NETWORK TEST VER` folder (the one with `base\exefs\main`), or **Browse** for a `.nup` file. It must say *The Duskbloods network test found*. A game folder in or next to the Lichii folder is found automatically.
+3. **Setup tab > Emulator:** choose `Lichii - <folder name>` (this `lichii.exe`; it is selected automatically when the launcher sits next to it). No red *No Duskbloods online support* note may show. Do not press any **Patch** button: this build has the online support built in.
+4. **Online tab:** keep **Just me** (the default). **Host a room** and **Join a room** are online tests with friends, and their matches do not start yet.
+5. Press **Start game** and keep the launcher open while you play.
+
+*Just me* needs no firewall change: everything stays on 127.0.0.1. To host or join a room, press **Allow in firewall** in the Online tab once (new in 1.4.0).
 
 ## NVIDIA DLSS (optional)
 
@@ -126,6 +131,14 @@ If DLSS cannot start, the emulator falls back to FSR 3.1.
 
 ## Troubleshooting
 
+- **Stuck at the title menu, or the game says it must be online:** check these in order.
+  1. Start the game with **Start game** in `Play.Duskbloods.exe`. Started from `lichii.exe`, its game list or your own shortcut, the game has no servers.
+  2. First start right after extracting? Close the game and press **Start game** again. Still stuck: start `lichii.exe` alone once, close it, then use the launcher.
+  3. In `lichii.exe`, open **Emulation > Configure > Network** and turn **off** "Redirect host names to a server you run" (Host redirect). When it is on, it replaces the launcher's servers.
+  4. In the launcher's **Online** tab, choose **Just me**.
+  5. Look for red lines in the launcher's log: missing keys, *Port 18443 is still in use*, or *No Duskbloods online support*.
+  6. Edited `launcher_settings.json` by hand? Delete it (it is next to `Play.Duskbloods.exe`) and choose the game and emulator again in the window. A broken file is ignored without a warning.
+  7. Still stuck: press **Open logs** in the launcher and send the newest folder in `user\duskbloods_test\runs\` (`emulator.log`, `server.log`, `frontdoor.log`).
 - **Stuck on "checking save data" or network errors:** start through `Play.Duskbloods.exe`, not `lichii.exe` directly.
 - **Error 2153-0513 at boot:** a save got corrupted, e.g. by force-closing during a save. Move the game's save folder under `user\nand\user\save\` aside and start again.
 - **Black screen after loading:** close and relaunch. A rare hang has been seen once.
@@ -153,7 +166,7 @@ Special thanks to **Siko** ([sikoGD](https://github.com/sikoGD)), author of the 
 <div dir="rtl">
 
 **هذا المشروع نسخة معدّلة (fork) من [zortos293/Lichii](https://github.com/zortos293/Lichii) (nx2، الإصدار 177)، ومحسّنة لتشغيل *The Duskbloods Network Test* (رقم البرنامج `0400D1D02399A000`) على أجهزة Windows بكرت شاشة NVIDIA ومعالج Intel.**
-يعمل مع المشغّل [playDB-CNT](https://github.com/sikoGD/playDB-CNT) من sikoGD، والذي يوفّر خوادم الشبكة المحلية التي تحتاجها اللعبة للدخول. المشغّل (الإصدار 1.3.2) موجود داخل الملف المضغوط.
+يعمل مع المشغّل [playDB-CNT](https://github.com/sikoGD/playDB-CNT) من sikoGD، والذي يوفّر خوادم الشبكة المحلية التي تحتاجها اللعبة للدخول. المشغّل (الإصدار 1.4.0) موجود داخل الملف المضغوط.
 
 > المشروع غير تابع لـ Nintendo أو FromSoftware أو المشاريع الأصلية. لا يتضمن أي ألعاب أو مفاتيح أو firmware. استخدم فقط ملفات استخرجتها بنفسك بطريقة قانونية.
 
@@ -168,7 +181,7 @@ Special thanks to **Siko** ([sikoGD](https://github.com/sikoGD)), author of the 
   - انهيار اللعبة في Bot Match (نفاد ذاكرة اللعبة)
   - الخطوط الحمراء ("الليزر") ووميض الإضاءة في الـ hub
   - تشوّه وتكسّر الواجهة والنصوص عند رفع الدقة الداخلية فوق 1x (تصغير الصورة للنافذة يأخذ الآن متوسط البكسلات)
-- **مشغّل playDB-CNT الإصدار 1.3.2** مرفق، ووضع اللعب دون اتصال (offline) يعمل.
+- **مشغّل playDB-CNT الإصدار 1.4.0** مرفق، ووضع اللعب دون اتصال (offline) يعمل. حُدِّث الملف المضغوط في 2026-11-15 (صدر الإصدار الثالث أولًا مع 1.3.2). الجديد في 1.4.0: أسماء لشخصيات الكمبيوتر في Bot Match، وزر **Allow in firewall**، وتقرير عن الغرفة في السجلّ أثناء الاستضافة.
 
 ## الأداء
 
@@ -211,31 +224,29 @@ Special thanks to **Siko** ([sikoGD](https://github.com/sikoGD)), author of the 
 - ملفّي `prod.keys` و`title.keys` الخاصين بك
 - نسخة firmware خاصة بك من Switch 2 (تمّت التجربة على 23.0.1)
 - نسختك من *The Duskbloods Network Test*
-- **[مشغّل playDB-CNT](https://github.com/sikoGD/playDB-CNT)** ‏(`Play.Duskbloods.exe`، موجود داخل الملف المضغوط)، مع اتباع الشرح في صفحته لإعداده
+- **[مشغّل playDB-CNT](https://github.com/sikoGD/playDB-CNT)** ‏(`Play.Duskbloods.exe`، موجود داخل الملف المضغوط). طريقة إعداده في قسم [إعداد المشغّل](#إعداد-المشغّل) بالأسفل
 
 الخطوات:
 
 1. **فكّ الضغط** عن `Lichii-Duskbloods.zip` في مجلد بمسار قصير، مثل `C:\Games\Lichii-Duskbloods\`. أبقِ مجلد `user` بجانب `lichii.exe`: فهو يجعل المحاكي محمولًا ويحتوي على الإعدادات المحسّنة.
 2. **المفاتيح:** انسخ `prod.keys` و`title.keys` إلى `user\keys\`، أو شغّل `lichii.exe` واختر **Tools > Install Decryption Keys**.
-3. **الـ Firmware:** شغّل `lichii.exe`، ثم اختر **Tools > Install Firmware > From Folder** (أو **From ZIP**) وحدّد ملفات الـ firmware. ثم أغلق المحاكي.
-4. **المشغّل:** جهّز [playDB-CNT](https://github.com/sikoGD/playDB-CNT) كما في شرحه، ثم عدّل ملف `launcher_settings.json` بحيث يشير `emulator` إلى `lichii.exe`:
-
-<div dir="ltr">
-
-```json
-{
-  "emulator": "C:\\Games\\Lichii-Duskbloods\\lichii.exe",
-  "game": "C:\\Games\\THE DUSKBLOODS NETWORK TEST VER"
-}
-```
-
-</div>
-
-   استخدم شرطتين مائلتين `\\`. القيمة `game` هي مجلد اللعبة.
-
-5. **اللعب:** شغّل `Play.Duskbloods.exe` واضغط **Play**. شغّل اللعبة دائمًا من المشغّل، لأن تشغيلها مباشرة يُفشل فحص الاتصال.
+3. **الـ Firmware وأول تشغيل:** شغّل `lichii.exe`، ثم اختر **Tools > Install Firmware > From Folder** (أو **From ZIP**) وحدّد ملفات الـ firmware، ثم أغلق المحاكي. هذا التشغيل الأول يكتب أيضًا كل إعدادات المحاكي، والمشغّل يحتاج إليها.
+4. **المشغّل:** جهّزه كما في قسم [إعداد المشغّل](#إعداد-المشغّل) بالأسفل.
+5. **اللعب:** اضغط **Start game** في `Play.Duskbloods.exe`. شغّل اللعبة دائمًا من المشغّل، فإذا شغّلتها بأي طريقة أخرى لن تجد أي خوادم، وستتوقف عند رسالة تطلب الاتصال بالإنترنت.
 
 في الدقائق الأولى قد يحدث تقطيع بسيط أثناء تجهيز الـ shaders، ويتحسّن ذلك مع كل جلسة.
+
+## إعداد المشغّل
+
+المشغّل `Play.Duskbloods.exe` ‏(playDB-CNT 1.4.0) موجود في الملف المضغوط بجانب `lichii.exe`، وكل إعداداته تتم من نافذته. هو يحفظ اختياراتك بنفسه في `launcher_settings.json` عند الضغط على **Start game**، فلا تعدّل هذا الملف يدويًا. لا تحتاج إلى صلاحيات المسؤول (admin)، ولا إلى تعديل ملف hosts أو تثبيت أي شهادات.
+
+1. شغّل `Play.Duskbloods.exe`.
+2. **تبويب Setup > Game:** اضغط **Folder** واختر مجلد اللعبة `THE DUSKBLOODS NETWORK TEST VER` (الذي يحتوي على `base\exefs\main`)، أو اضغط **Browse** لاختيار ملف `.nup`. يجب أن تظهر العبارة *The Duskbloods network test found*. إذا كان مجلد اللعبة داخل مجلد Lichii أو بجانبه، يجده المشغّل تلقائيًا.
+3. **تبويب Setup > Emulator:** اختر `Lichii - <اسم المجلد>` (أي `lichii.exe` هذا، ويُختار تلقائيًا إذا كان المشغّل بجانبه). يجب ألّا تظهر الملاحظة الحمراء *No Duskbloods online support*. لا تضغط أي زر **Patch**، فهذه النسخة تدعم الاتصال أصلًا.
+4. **تبويب Online:** اترك **Just me** (الخيار الافتراضي). أما **Host a room** و**Join a room** فهما لتجارب اللعب مع الأصدقاء، والمباريات فيهما لا تبدأ بعد.
+5. اضغط **Start game**، وأبقِ المشغّل مفتوحًا أثناء اللعب.
+
+وضع *Just me* لا يحتاج أي تغيير في جدار الحماية (Firewall)، فكل شيء يبقى على 127.0.0.1. لاستضافة غرفة أو الانضمام إليها، اضغط **Allow in firewall** في تبويب Online مرة واحدة (جديد في 1.4.0).
 
 ## NVIDIA DLSS (اختياري)
 
@@ -271,6 +282,14 @@ Special thanks to **Siko** ([sikoGD](https://github.com/sikoGD)), author of the 
 
 ## حل المشاكل
 
+- **التوقف عند قائمة البداية، أو تقول اللعبة إنها تحتاج اتصالًا بالإنترنت:** تحقّق من هذه النقاط بالترتيب.
+  1. شغّل اللعبة بزر **Start game** في `Play.Duskbloods.exe`. إذا شغّلتها من `lichii.exe` أو من قائمة ألعابه أو من اختصار خاص بك، فلن تجد اللعبة أي خوادم.
+  2. أول تشغيل بعد فكّ الضغط مباشرة؟ أغلق اللعبة واضغط **Start game** مرة أخرى. إذا استمرت المشكلة، شغّل `lichii.exe` وحده مرة واحدة ثم أغلقه، ثم استخدم المشغّل.
+  3. في `lichii.exe` افتح **Emulation > Configure > Network** وأوقف خيار "Redirect host names to a server you run" ‏(Host redirect). عندما يكون مفعّلًا، يحلّ محلّ خوادم المشغّل.
+  4. في تبويب **Online** في المشغّل، اختر **Just me**.
+  5. ابحث عن أسطر حمراء في سجلّ المشغّل: مفاتيح ناقصة، أو *Port 18443 is still in use*، أو *No Duskbloods online support*.
+  6. عدّلت `launcher_settings.json` يدويًا؟ احذفه (هو بجانب `Play.Duskbloods.exe`) واختر اللعبة والمحاكي من جديد في النافذة، فالمشغّل يتجاهل الملف التالف دون أي تنبيه.
+  7. ما زالت المشكلة قائمة؟ اضغط **Open logs** في المشغّل وأرسل أحدث مجلد داخل `user\duskbloods_test\runs\` (`emulator.log` و`server.log` و`frontdoor.log`).
 - **التوقف عند "checking save data" أو أخطاء الشبكة:** شغّل اللعبة من `Play.Duskbloods.exe` وليس من `lichii.exe` مباشرة.
 - **الخطأ 2153-0513 عند التشغيل:** ملف الحفظ تلف، مثلًا بسبب إغلاق اللعبة بالقوة أثناء الحفظ. انقل مجلد حفظ اللعبة داخل `user\nand\user\save\` إلى مكان آخر وأعد التشغيل.
 - **شاشة سوداء بعد التحميل:** أغلق اللعبة وأعد تشغيلها (حدث تعليق نادر مرة واحدة).
