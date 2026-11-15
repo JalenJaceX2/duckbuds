@@ -46,8 +46,6 @@ Measured by the maintainer in actual play:
 | Peak | **~60 fps** |
 | Heaviest area | **36+ fps** (13-16 fps before this fork's optimizations) |
 
-NVIDIA DLSS is not benchmarked yet. The emulator is mostly CPU-bound in this game, so a faster CPU helps more than a faster GPU.
-
 ## What this fork changes
 
 | Area | Fix |
