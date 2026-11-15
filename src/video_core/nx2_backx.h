@@ -89,7 +89,7 @@ static_assert(DuskOffMask(true, "on", "") == 0);
 static_assert(DuskOffMask(true, "", "") == 0);
 static_assert(DuskOffMask(true, "off", "") == (1u << 9) - 1);
 static_assert(DuskOffMask(true, "off", " state_blocks ,gather_skip\r") ==
-              ((1u << 9) - 1 & ~(1u << 7) & ~1u));
+              (((1u << 9) - 1) & ~(1u << 7) & ~1u));
 
 /// Nx2Perf::g_dusk_off: set by ReadSwitch (CreateGPU runs after the program id is known, before
 /// any GPU thread), then by the debug server's perf_flip at frame ends.
