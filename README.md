@@ -101,7 +101,7 @@ For NVIDIA RTX cards only. Without it, the emulator uses AMD FSR 3.1, which work
 
 1. **Get NVIDIA's files** (not included in the zip): open **Emulation > Configure > Graphics**, tick **NVIDIA DLSS** and press **Download from NVIDIA** in its panel. Or copy `sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll` and `nvngx_dlss.dll` from the NVIDIA Streamline SDK 2.14.16 into `user\streamline\`.
 2. **Turn it on:** tick **NVIDIA DLSS** and restart the emulator once. The first time, DLSS starts with the next launch.
-3. **Switch live:** in game, click the upscaler button in the status bar (or press **F7**) to cycle between FSR3 and the DLSS modes: Auto, DLAA, Quality, Balanced, Performance, Ultra Performance. Right-click the button to pick one.
+3. **Switch live:** in game, click the upscaler button in the status bar (or press **F7**) to cycle between FSR3 and the DLSS modes: Auto, Quality, Balanced, Performance, Ultra Performance. Right-click the button to pick one(I recommend Quality with Nvidia's Default model preset).
 
 If DLSS cannot start, the emulator falls back to FSR 3.1.
 
