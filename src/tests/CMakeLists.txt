@@ -16,6 +16,8 @@ add_executable(tests
     video_core/back_idle_trace.cpp
     video_core/list_macro_trace.cpp
     video_core/host_mip_limits.cpp
+    video_core/writeback_ranges.cpp
+    video_core/writeback_switches.cpp
     video_core/gpu_timestamp.cpp
     video_core/semaphore_waiters.cpp
     video_core/hdr_output.cpp
@@ -86,6 +88,7 @@ add_executable(tests
     video_core/texture_alias_ticks.cpp
     video_core/sampled_views.cpp
     video_core/texture_handles.cpp
+    video_core/phi_identity_operand.cpp
     video_core/ampere_selevet_modes.cpp
     video_core/ampere_selevet_spills.cpp
     video_core/blit_dither.cpp
@@ -141,6 +144,7 @@ add_executable(tests
     video_core/x8d24_conversion.cpp
     video_core/ampere_ported_half_compare.cpp
     video_core/ampere_geometry_capture.cpp
+    video_core/ampere_duskbloods_forms.cpp
     video_core/ampere_geometry_exit.cpp
     video_core/ampere_geometry_lowering.cpp
     video_core/ampere_ported_conversions.cpp
