@@ -77,6 +77,7 @@ add_executable(tests
     core/vfs_vector.cpp
     core/kip_ini.cpp
     core/ncz_cache.cpp
+    core/kip_truncated.cpp
     core/ncz_decompressor.cpp
     core/ncz_io_guards.cpp
     core/ncz_container.cpp
