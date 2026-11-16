@@ -55,6 +55,15 @@ namespace VideoCommon {
     return enabled;
 }
 
+/// EDEN_NX2_TC_TRACE=1: log every image the cache creates, uploads and deletes.
+[[nodiscard]] inline bool TextureCacheTrace() {
+    static const bool enabled = [] {
+        const char* const v = std::getenv("EDEN_NX2_TC_TRACE");
+        return v != nullptr && v[0] == '1';
+    }();
+    return enabled;
+}
+
 using Tegra::Texture::TICEntry;
 using Tegra::Texture::TSCEntry;
 using VideoCore::Surface::GetFormatType;
@@ -150,13 +159,15 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     bool high_priority_mode = false;
     bool aggressive_mode = false;
     bool evict_old_costly = false;
+    bool evict_bad_overlaps = false;
+    u64 mode_age = 0;
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
     const auto Configure = [&](bool allow_aggressive) {
         high_priority_mode = out_of_memory || total_used_memory >= expected_memory;
         aggressive_mode =
             allow_aggressive && (out_of_memory || total_used_memory >= critical_memory);
-        const u64 mode_age = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
+        mode_age = aggressive_mode ? 10ULL : high_priority_mode ? 25ULL : 50ULL;
         // EDEN_NX2_TC_MIN_AGE=<frames>: keep images used more recently while there is room
         // (thrash tests).
         static const u64 min_age = [] {
@@ -167,44 +178,12 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             EvictionAge(mode_age, min_age, total_used_memory, retention_limit, out_of_memory);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
-    // GPU-written images that overlap others without fitting them (BadOverlap) were dropped
-    // without a download, their pages marked stale. The Duskbloods renders its characters'
-    // small detail maps that way, into regions other images sample: once the sampling image
-    // was made again, the outfit, blade or enemy drew zeros (black) or, before the image
-    // loaded stale pages, leftover host memory (rainbow noise). Download them, all with one
-    // wait, oldest modification first so the newest data wins where they overlap.
-    // EDEN_NX2_GC_DOWNLOAD_OVERLAPS (on for The Duskbloods, =1 every title, =0 off).
-    using DownloadMap = decltype(runtime.DownloadStagingBuffer(size_t{}));
-    struct OverlapDownload {
-        u64 tick;
-        GPUVAddr gpu_addr;
-        DAddr cpu_addr;
-        u64 size;
-        ImageInfo info;
-        boost::container::small_vector<BufferImageCopy, 16> copies;
-        DownloadMap map;
-        KeepRanges keep;
-        WritebackRanges::TickedRanges keep_ticks;
-        size_t address_space;
-    };
-    std::vector<OverlapDownload> overlap_downloads;
-    static const int download_overlaps_setting =
-        WritebackSwitches::SwitchSetting("EDEN_NX2_GC_DOWNLOAD_OVERLAPS");
-    // Staging maps that release themselves when destroyed (OpenGL) cannot wait in a vector.
-    // Not const, here and below: with OpenGL both would be constant expressions, which the
-    // lambda below must then not capture (-Wunused-lambda-capture), while Vulkan's must be.
-    bool download_overlaps = std::is_trivially_destructible_v<DownloadMap> &&
-                             WritebackSwitches::DuskbloodsDefault(download_overlaps_setting);
-    // EDEN_NX2_GC_DOWNLOAD_ASYNC (on unless =0): the collector does not wait for its
-    // write-backs (each wait was 5-10 ms, several a second in combat); they reach guest memory
-    // when the GPU is done with them.
-    bool async_downloads = download_overlaps && AsyncOverlapDownloadsEnabled();
-    KeepRanges keep;
-    WritebackRanges::TickedRanges keep_ticks;
-    const auto CanEvict = [this, &high_priority_mode, &aggressive_mode,
-                           &evict_old_costly](ImageId image_id, bool* out_must_download = nullptr) {
+    const auto CanEvict = [this, &high_priority_mode, &aggressive_mode, &evict_old_costly,
+                           &evict_bad_overlaps](ImageId image_id,
+                                                bool* out_must_download = nullptr) {
         const auto& image = slot_images[image_id];
-        if (True(image.flags & ImageFlagBits::IsDecoding)) {
+        if (True(image.flags & ImageFlagBits::IsDecoding) ||
+            (evict_bad_overlaps && False(image.flags & ImageFlagBits::BadOverlap))) {
             return false;
         }
         const bool must_download =
@@ -379,6 +358,16 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
     };
     Configure(false);
+    // Images newer ones partly overwrote (BadOverlap: their bytes belong to the newer images, so
+    // they are dropped without a download) get the mode's age, not the retention floor. Ocarina
+    // allocates each frame's render targets at shifting offsets of a transient heap: in the
+    // Skulltula House about 9 a frame, kept 150 frames, filled 16 GB of a 24 GB card (#1755).
+    // Same pass as kraibse 662af0bfaf's EDEN_NX2_TC_STALE_AGE, at the mode's age.
+    if (ticks_to_destroy > mode_age) {
+        evict_bad_overlaps = true;
+        Collect(mode_age);
+        evict_bad_overlaps = false;
+    }
     static const u64 old_age = [] {
         const char* value = std::getenv("EDEN_NX2_TC_OLD_AGE");
         return value != nullptr ? std::strtoull(value, nullptr, 10) : 1800ULL;
@@ -3260,10 +3249,34 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
-    if (!UploadInChunks(image)) {
+    using TraceClock = std::chrono::steady_clock;
+    const bool tc_trace = TextureCacheTrace();
+    const auto trace_begin = tc_trace ? TraceClock::now() : TraceClock::time_point{};
+    const u64 trace_faults = tc_trace ? Common::GetProcessPageFaults() : 0;
+    auto trace_staged = trace_begin;
+    upload_trace = {};
+    const bool chunked = UploadInChunks(image);
+    if (!chunked) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+        if (tc_trace) {
+            trace_staged = TraceClock::now();
+        }
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
+    }
+    if (tc_trace) {
+        using Ms = std::chrono::duration<double, std::milli>;
+        LOG_WARNING(HW_GPU,
+                    "TCTRACE upload gpu={:#x} fmt={} {}x{}x{} lv={} ly={} guest={}KiB host={}KiB "
+                    "ms={:.2f} staging={:.2f} read={:.2f} untile={:.2f} faults={} chunked={} "
+                    "frame={}",
+                    image.gpu_addr, static_cast<u32>(image.info.format), image.info.size.width,
+                    image.info.size.height, image.info.size.depth, image.info.resources.levels,
+                    image.info.resources.layers, image.guest_size_bytes / 1024,
+                    MapSizeBytes(image) / 1024, Ms(TraceClock::now() - trace_begin).count(),
+                    Ms(trace_staged - trace_begin).count(), upload_trace.read_ms,
+                    upload_trace.untile_ms, Common::GetProcessPageFaults() - trace_faults, chunked,
+                    frame_tick);
     }
     // The host GPU has its own copy now and the guest rarely reads this memory again: TickFrame
     // marks it cold, so the OS pages it out before anything else when it needs RAM (title 1
@@ -3496,6 +3509,18 @@ std::vector<u32> TextureCache<P>::BindSparseLayers(Image& image, std::span<const
 template <class P>
 void TextureCache<P>::UploadLayers(Image& image, std::span<const u32> layers) {
     if constexpr (requires { &Runtime::AccelerateImageUploadLayers; }) {
+        // At most 32 MiB of layers per staging buffer, as UploadInChunks: all of a sparse array's
+        // bound layers at once took a 128 MiB one an 8 GB laptop had no memory for (#262).
+        constexpr u64 ChunkBytes = 32_MiB;
+        const size_t chunk_layers = static_cast<size_t>(
+            (std::max<u64>)(1, ChunkBytes / (std::max<u64>)(image.info.layer_stride, 1)));
+        if (layers.size() > chunk_layers) {
+            for (size_t first = 0; first < layers.size(); first += chunk_layers) {
+                UploadLayers(image, layers.subspan(first, (std::min)(chunk_layers,
+                                                                     layers.size() - first)));
+            }
+            return;
+        }
         if (False(image.flags & ImageFlagBits::AcceleratedUpload)) {
             // Plain formats: each layer unswizzled on its own into its layer of the image.
             ImageInfo layer_info = image.info;
@@ -3577,17 +3602,30 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         return;
     }
 
+    using TraceClock = std::chrono::steady_clock;
+    const bool tc_trace = TextureCacheTrace();
+    const auto read_begin = tc_trace ? TraceClock::now() : TraceClock::time_point{};
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(
         *gpu_memory, gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+    const auto untile_begin = tc_trace ? TraceClock::now() : TraceClock::time_point{};
+    const auto trace_untile = [&] {
+        if (tc_trace) {
+            using Ms = std::chrono::duration<double, std::milli>;
+            upload_trace.read_ms = Ms(untile_begin - read_begin).count();
+            upload_trace.untile_ms = Ms(TraceClock::now() - untile_begin).count();
+        }
+    };
     if (True(image.flags & ImageFlagBits::Converted)) {
         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
         auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
                                     unswizzle_data_buffer, &unswizzle_worker);
         ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);
+        trace_untile();
         image.UploadMemory(staging, copies);
     } else {
         const auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data,
                                           mapped_span, &unswizzle_worker);
+        trace_untile();
         image.UploadMemory(staging, copies);
     }
 }
@@ -4063,11 +4101,7 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                  gpu_addr, info.size.width, info.size.height, info.size.depth, info.resources.levels,
                  static_cast<u32>(info.format), info.block.width, info.block.height, info.block.depth);
     }
-    // EDEN_NX2_TC_TRACE=1: log every image the cache creates (time, format, size, joins) and deletes
-    static const bool tc_trace = [] {
-        const char* const v = std::getenv("EDEN_NX2_TC_TRACE");
-        return v != nullptr && v[0] == '1';
-    }();
+    const bool tc_trace = TextureCacheTrace();
     const auto tc_t0 = tc_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const ImageId image_id = JoinImages(storage_info, gpu_addr, *cpu_addr);
     if (!image_id) {
@@ -5090,11 +5124,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ++images_deleted;
     ++churn.deleted;
     {
-        static const bool tc_trace = [] {
-            const char* const v = std::getenv("EDEN_NX2_TC_TRACE");
-            return v != nullptr && v[0] == '1';
-        }();
-        if (tc_trace) {
+        if (TextureCacheTrace()) {
             LOG_WARNING(HW_GPU,
                         "TCTRACE delete id={} gpu={:#x} fmt={} {}x{}x{} guest={}KiB immediate={} "
                         "reason={} frame={}",

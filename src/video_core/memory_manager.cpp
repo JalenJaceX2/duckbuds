@@ -1062,27 +1062,13 @@ bool MemoryManager::SubmappedRangeFromRuns(
 }
 
 // GetSubmappedRange and GetSubmappedDeviceRange answer from the map-time runs instead of walking
-// the range page by page, as MaxContinuousRange does: the texture cache, the buffer cache and
-// fast draws ask them for every image, buffer and draw they set up. EDEN_NX2_PERF_VERIFY=1 also
-// walks the pages, logs any difference and returns the walk's answer.
+// the range page by page, as MaxContinuousRange does: the buffer cache's virtual ranges, fast draws
+// and sparse images ask them for the ranges they bind.
 boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
 MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> result{};
     if (!SubmappedRangeFromRuns<true>(gpu_addr, size, result)) {
         GetSubmappedRangeImpl<true>(gpu_addr, size, result);
-        return result;
-    }
-    if (VideoCommon::Nx2Perf::Verify()) {
-        boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> walked{};
-        GetSubmappedRangeImpl<true>(gpu_addr, size, walked);
-        static std::atomic<u32> logged{};
-        if (walked != result && logged.fetch_add(1, std::memory_order_relaxed) < 64) {
-            LOG_ERROR(
-                HW_GPU,
-                "Nx2Perf mapping runs: GetSubmappedRange({:#x}, {:#x}) = {} segments, walk {}",
-                gpu_addr, size, result.size(), walked.size());
-        }
-        return walked;
     }
     return result;
 }
@@ -1096,19 +1082,23 @@ MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) cons
     size = (std::min<u64>)(size, address_space_size - gpu_addr);
     if (!SubmappedRangeFromRuns<false>(gpu_addr, size, result)) {
         GetSubmappedRangeImpl<false>(gpu_addr, size, result);
-        return result;
     }
-    if (VideoCommon::Nx2Perf::Verify()) {
-        boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> walked{};
-        GetSubmappedRangeImpl<false>(gpu_addr, size, walked);
-        static std::atomic<u32> logged{};
-        if (walked != result && logged.fetch_add(1, std::memory_order_relaxed) < 64) {
-            LOG_ERROR(HW_GPU,
-                      "Nx2Perf mapping runs: GetSubmappedDeviceRange({:#x}, {:#x}) = {} segments, "
-                      "walk {}",
-                      gpu_addr, size, result.size(), walked.size());
-        }
-        return walked;
+    return result;
+}
+
+boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
+MemoryManager::GetSubmappedRangeUncached(GPUVAddr gpu_addr, std::size_t size) const {
+    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> result{};
+    GetSubmappedRangeImpl<true>(gpu_addr, size, result);
+    return result;
+}
+
+boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
+MemoryManager::GetSubmappedDeviceRangeUncached(GPUVAddr gpu_addr, std::size_t size) const {
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> result{};
+    if (IsWithinGPUAddressRange(gpu_addr)) {
+        GetSubmappedRangeImpl<false>(
+            gpu_addr, (std::min<u64>)(size, address_space_size - gpu_addr), result);
     }
     return result;
 }
