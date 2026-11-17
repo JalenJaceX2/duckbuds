@@ -131,6 +131,9 @@ public:
                          std::source_location caller = std::source_location::current()) const;
     void WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
 
+    /// A download for a guest read not yet in guest memory would land over this write later.
+    void FinishReadsBefore(DAddr dev_addr, std::size_t size, bool unsafe) const;
+
     /// Reads `count` consecutive words as Read<u32> would (Switch 2 syncpoint shim included),
     /// without a translation per word.
     void ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_t count,
@@ -260,8 +263,6 @@ private:
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe,
                        std::source_location caller) const;
-    /// A download for a guest read not yet in guest memory would land over this write later.
-    void FinishReadsBefore(DAddr dev_addr, std::size_t size, bool unsafe) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
 
     [[nodiscard]] std::size_t PageEntryIndex(GPUVAddr gpu_addr, bool is_big_page) const {
