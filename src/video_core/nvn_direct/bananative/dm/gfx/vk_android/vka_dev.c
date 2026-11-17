@@ -227,6 +227,8 @@ static int init_once(void) {
     V.host_import = !V.placed && x_host && vk.vkGetMemoryHostPointerPropertiesEXT && pemh.minImportedHostPointerAlignment;
     if (V.host_import) V.placed_align = pemh.minImportedHostPointerAlignment > 4096 ? pemh.minImportedHostPointerAlignment : 4096;
     if (V.host_import) vka_mem_import_choose(x_dmabuf);
+    // Lichii: with no way to show the GPU the guest's pools nothing renders: the replay does not start, and the game runs on GPU emulation instead (Core::NvnHook::DirectFailed)
+    if (!V.placed && !V.host_import) { VRED("no VK_EXT_map_memory_placed or VK_EXT_external_memory_host: the GPU sees no memory pool, so the replay does not start"); return 0; }
     V.max_push = V.push_desc ? ppd.maxPushDescriptors : 0;
     if (V.mesh && !vk.vkCmdDrawMeshTasksEXT) V.mesh = V.task = 0;
     V.draw_indirect_count = f12.drawIndirectCount && vk.vkCmdDrawIndirectCount && vk.vkCmdDrawIndexedIndirectCount;
@@ -274,7 +276,6 @@ static int init_once(void) {
          "uniform alignment %llu (range %llu), storage alignment %llu, subgroups %u (%u-%u)",
          V.push_desc ? "yes" : "no", V.max_push, V.vin_dyn ? "yes" : "no", V.null_desc ? "yes" : "no", V.idx8 ? "yes" : "no", V.divisor ? "yes" : "no", V.logic_op ? "yes" : "no",
          V.dual_src ? "yes" : "no", V.geom ? "yes" : "no", V.tess ? "yes" : "no", (unsigned long long)V.ub_align, (unsigned long long)V.ub_range, (unsigned long long)V.sb_align, V.subgroup_size, V.subgroup_min, V.subgroup_max);
-    if (!V.placed && !V.host_import) VRED("no VK_EXT_map_memory_placed or VK_EXT_external_memory_host: the GPU sees no memory pool");
     if (!swap) VRED("no VK_KHR_swapchain: nothing is presented");
     vka_pso_start();   // Lichii: the pipeline cache, the prewarm and the compute pipelines made ahead from the start, not from the first pipeline
     return 1;
