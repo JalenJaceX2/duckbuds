@@ -35,6 +35,7 @@
 #include "core/loader/loader.h"
 #include "core/loader/nso.h"
 #include "core/memory/cheat_engine.h"
+#include "core/memory/dmnt_cheat_vm.h"
 
 namespace FileSys {
 namespace {
@@ -53,14 +54,19 @@ struct BuiltinPatchRecord {
     bool executable_padding = false;
 };
 
+struct BuiltinPatchState {
+    size_t offset;
+    size_t size;
+};
+
 struct BuiltinPatch {
     std::string_view name;
     u64 title_id;
     std::string_view module;
     std::string_view build_id;
     std::span<const BuiltinPatchRecord> records;
-    size_t state_offset = 0;
-    size_t state_size = 0;
+    // Zero-initialized BSS ranges the routines keep their state in.
+    std::span<const BuiltinPatchState> states{};
     // Another built-in this one contains; it is skipped once this one is applied.
     std::string_view replaces{};
     // Applies only with NVIDIA DLSS on at this quality in docked mode, and is not listed in
@@ -248,7 +254,7 @@ constexpr std::array<u8, 48> STEP_HITSTOP_ROUTINE{
     0x40, 0xB9, 0x46, 0x32, 0xCC, 0x17,
 };
 constexpr std::array<u8, 128> STEP_SHARED_ROUTINE{
-    0xE0, 0x07, 0xBF, 0xAD, 0xCE, 0x92, 0x00, 0xB0, 0xCE, 0x01, 0x3B, 0x91, 0x0F, 0x02,
+    0xE0, 0x07, 0xBF, 0xAD, 0xCE, 0x92, 0x00, 0x90, 0xCE, 0x41, 0x38, 0x91, 0x0F, 0x02,
     0x80, 0x52, 0xD0, 0x01, 0x40, 0xF9, 0x1F, 0x02, 0x0D, 0xEB, 0x40, 0x02, 0x00, 0x54,
     0x70, 0x01, 0x00, 0xB4, 0xCE, 0x41, 0x00, 0x91, 0xEF, 0x05, 0x00, 0x71, 0x41, 0xFF,
     0xFF, 0x54, 0xCE, 0x41, 0x04, 0xD1, 0xD0, 0x01, 0x40, 0xB9, 0x0F, 0x06, 0x00, 0x11,
@@ -263,15 +269,15 @@ constexpr std::array<u8, 4> STEP_AMBIENT_ORIGINAL{
     0x7A, 0x07, 0x00, 0x11,
 };
 constexpr std::array<u8, 4> STEP_AMBIENT_HOOK{
-    0x3B, 0x1C, 0xDC, 0x14,
+    0x93, 0x1C, 0xDC, 0x14,
 };
 // add x13, x28, x1, lsl #2 ; load raw step ; bl helper ; add w26, w27, w13 ; ldr s0, [x0, #0x18] ; b 0x53F918
 constexpr std::array<u8, 60> STEP_AMBIENT_ROUTINE{
     0xED, 0x3B, 0xBD, 0xA9, 0xEF, 0x43, 0x01, 0xA9, 0xFE, 0x13, 0x00, 0xF9, 0x8D, 0x0B,
     0x01, 0x8B, 0xCE, 0x81, 0x00, 0x90, 0xCE, 0x49, 0x44, 0xF9, 0xCE, 0x01, 0x40, 0xF9,
-    0xC0, 0x11, 0x40, 0xBD, 0xD8, 0xFF, 0xFF, 0x97, 0x7A, 0x03, 0x0D, 0x0B, 0x00, 0x18,
+    0xC0, 0x11, 0x40, 0xBD, 0x80, 0xFF, 0xFF, 0x97, 0x7A, 0x03, 0x0D, 0x0B, 0x00, 0x18,
     0x40, 0xBD, 0xFE, 0x13, 0x40, 0xF9, 0xEF, 0x43, 0x41, 0xA9, 0xED, 0x3B, 0xC3, 0xA8,
-    0xB8, 0xE3, 0x23, 0x17,
+    0x60, 0xE3, 0x23, 0x17,
 };
 
 // The character controller takes a tenth of its ground's velocity once the frame rate is over
@@ -295,13 +301,72 @@ constexpr std::array<u8, 4> GROUND_VELOCITY_NOP{
 // The routine replaces both fmul (0x261EB18 and 0x261EB1C) and returns to 0x261EB20, so the hook
 // guards both; the second instruction stays in place, unreached.
 constexpr std::array<u8, 8> TURN_SPEED_ORIGINAL{0x01, 0x08, 0x21, 0x1E, 0x00, 0x08, 0x28, 0x1E};
-constexpr std::array<u8, 8> TURN_SPEED_HOOK{0xCA, 0x9F, 0x58, 0x14, 0x00, 0x08, 0x28, 0x1E};
+constexpr std::array<u8, 8> TURN_SPEED_HOOK{0x21, 0xA0, 0x58, 0x14, 0x00, 0x08, 0x28, 0x1E};
 // fmov s1, #1.0 ; fcmp s8, s1 ; b.ge +0x10 ; fdiv s0, s0, s8 ; fneg s1, s0 ; b 0x261EB20 ;
 // ldr s1, [sp, #0xc] ; fmul s1, s0, s1 ; fmul s0, s0, s8 ; b 0x261EB20
 constexpr std::array<u8, 40> TURN_SPEED_ROUTINE{
     0x01, 0x10, 0x2E, 0x1E, 0x00, 0x21, 0x21, 0x1E, 0x8A, 0x00, 0x00, 0x54, 0x00, 0x18,
-    0x28, 0x1E, 0x01, 0x40, 0x21, 0x1E, 0x33, 0x60, 0xA7, 0x17, 0xE1, 0x0F, 0x40, 0xBD,
-    0x01, 0x08, 0x21, 0x1E, 0x00, 0x08, 0x28, 0x1E, 0x2F, 0x60, 0xA7, 0x17,
+    0x28, 0x1E, 0x01, 0x40, 0x21, 0x1E, 0xDC, 0x5F, 0xA7, 0x17, 0xE1, 0x0F, 0x40, 0xBD,
+    0x01, 0x08, 0x21, 0x1E, 0x00, 0x08, 0x28, 0x1E, 0xD8, 0x5F, 0xA7, 0x17,
+};
+// A movie player counts its updates with a picture shown (+0x2F8, one more each), and a cutscene
+// that plays a movie takes that count as its timeline frame: its voices, overlays and its end are
+// placed by it. The picture and the sound follow the clock, so at any other frame rate than 60 the
+// cues drift from them (sages' lines over each other at 30 or 120 fps, #1474, #1572). The count
+// takes whole ticks of the step through the shared helper instead, keyed by the counter's address.
+// Same site as Hookshot's movie frame count (issue 1742).
+constexpr std::array<u8, 4> MOVIE_FRAMES_ORIGINAL{0x08, 0x05, 0x00, 0x11}; // add w8, w8, #1
+constexpr std::array<u8, 4> MOVIE_FRAMES_HOOK{0xFF, 0xA8, 0x03, 0x14};     // b main+0x3C46BC4
+// add x13, x20, #0x2f8 ; load raw step ; bl helper ; add w8, w8, w13 ; b 0x3B5C7CC
+constexpr std::array<u8, 56> MOVIE_FRAMES_ROUTINE{
+    0xED, 0x3B, 0xBD, 0xA9, 0xEF, 0x43, 0x01, 0xA9, 0xFE, 0x13, 0x00, 0xF9, 0x8D, 0xE2,
+    0x0B, 0x91, 0xCE, 0x81, 0x00, 0x90, 0xCE, 0x49, 0x44, 0xF9, 0xCE, 0x01, 0x40, 0xF9,
+    0xC0, 0x11, 0x40, 0xBD, 0x67, 0xFF, 0xFF, 0x97, 0x08, 0x01, 0x0D, 0x0B, 0xFE, 0x13,
+    0x40, 0xF9, 0xEF, 0x43, 0x41, 0xA9, 0xED, 0x3B, 0xC3, 0xA8, 0xF5, 0x56, 0xFC, 0x17,
+};
+// Scarecrow's Song recording keeps each note's and gap's length in the elapsed counter that
+// playback (0x3293410 above) advances, and adds trunc(step) to it in two more places: while a note
+// or gap is held (0x3296B08) and when the last note is timed (0x32926C8). With FPS Unlock the step
+// sits around 1.0 at 60 fps and below it above 60, so the cut is often 0: lengths come out short or
+// zero, and the song stops after its first note (#1730). Both take whole ticks for that counter
+// from the shared helper instead. Hookshot found the two sites (f_832b6840 and f_832b2690).
+constexpr std::array<u8, 4> SCARECROW_CUT_ORIGINAL{0x08, 0x00, 0x39, 0x1E}; // fcvtzu w8, s0
+constexpr std::array<u8, 4> SCARECROW_RECORD_HOOK{0xEA, 0xBF, 0x26, 0x14};  // b main+0x3C46AB0
+constexpr std::array<u8, 4> SCARECROW_LAST_HOOK{0x04, 0xD1, 0x26, 0x14};    // b main+0x3C46AD8
+// mov x13, x9 ; bl helper ; mov w8, w13 ; b 0x3296B0C
+constexpr std::array<u8, 40> SCARECROW_RECORD_ROUTINE{
+    0xED, 0x3B, 0xBD, 0xA9, 0xEF, 0x43, 0x01, 0xA9, 0xFE, 0x13, 0x00, 0xF9, 0xED, 0x03,
+    0x09, 0xAA, 0xB0, 0xFF, 0xFF, 0x97, 0xE8, 0x03, 0x0D, 0x2A, 0xFE, 0x13, 0x40, 0xF9,
+    0xEF, 0x43, 0x41, 0xA9, 0xED, 0x3B, 0xC3, 0xA8, 0x0E, 0x40, 0xD9, 0x17,
+};
+// add x13, x20, #0x5fc ; bl helper ; mov w8, w13 ; b 0x32926CC
+constexpr std::array<u8, 40> SCARECROW_LAST_ROUTINE{
+    0xED, 0x3B, 0xBD, 0xA9, 0xEF, 0x43, 0x01, 0xA9, 0xFE, 0x13, 0x00, 0xF9, 0x8D, 0xF2,
+    0x17, 0x91, 0xA6, 0xFF, 0xFF, 0x97, 0xE8, 0x03, 0x0D, 0x2A, 0xFE, 0x13, 0x40, 0xF9,
+    0xEF, 0x43, 0x41, 0xA9, 0xED, 0x3B, 0xC3, 0xA8, 0xF4, 0x2E, 0xD9, 0x17,
+};
+// The cloth update (Havok cloth: clothes, hair, and the wind action's phase) gets its time step as
+// scale * 1/60, without the frame step, at four sites. Above 60 fps every frame still simulates
+// 1/60 s, so cloth and wind run fast (twice as fast at 120 fps). Each 1/60 load becomes a call
+// that returns min(step / 60, 1/60) (1/60 when the step is not positive), so 60 fps and below
+// keep the original value exactly.
+constexpr std::array<u8, 4> CLOTH_DT_ORIGINAL_A{0x00, 0x6D, 0x46, 0xBD}; // ldr s0, [x8, #0x66c]
+constexpr std::array<u8, 4> CLOTH_DT_ORIGINAL_B{0x00, 0x01, 0x27, 0x1E}; // fmov s0, w8
+constexpr std::array<u8, 4> CLOTH_DT_ORIGINAL_D{0x02, 0x6D, 0x46, 0xBD}; // ldr s2, [x8, #0x66c]
+constexpr std::array<u8, 4> CLOTH_DT_CALL_A{0xF5, 0x01, 0xEC, 0x94};     // bl main+0x3C46B00
+constexpr std::array<u8, 4> CLOTH_DT_CALL_B{0xBF, 0x6C, 0xE6, 0x94};     // bl main+0x3C46B00
+constexpr std::array<u8, 4> CLOTH_DT_CALL_C{0xD7, 0x98, 0x40, 0x94};     // bl main+0x3C46B00
+constexpr std::array<u8, 4> CLOTH_DT_CALL_D{0xA9, 0x92, 0x40, 0x94};     // bl main+0x3C46B30
+// x16 = step / 60 bits ; w17 = (bits - 1 < bits(1/60) - 1 ? bits : bits(1/60)) ; fmov s0|s2, w17
+constexpr std::array<u8, 48> CLOTH_DT_ROUTINE_S0{
+    0xD0, 0x81, 0x00, 0x90, 0x10, 0x4A, 0x44, 0xF9, 0x10, 0x02, 0x40, 0xF9, 0x11, 0x1A, 0x40, 0xB9,
+    0x10, 0x11, 0x91, 0x52, 0x10, 0x91, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51, 0x3F, 0x02, 0x10, 0x6B,
+    0x31, 0x32, 0x90, 0x1A, 0x31, 0x06, 0x00, 0x11, 0x20, 0x02, 0x27, 0x1E, 0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr std::array<u8, 48> CLOTH_DT_ROUTINE_S2{
+    0xD0, 0x81, 0x00, 0x90, 0x10, 0x4A, 0x44, 0xF9, 0x10, 0x02, 0x40, 0xF9, 0x11, 0x1A, 0x40, 0xB9,
+    0x10, 0x11, 0x91, 0x52, 0x10, 0x91, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51, 0x3F, 0x02, 0x10, 0x6B,
+    0x31, 0x32, 0x90, 0x1A, 0x31, 0x06, 0x00, 0x11, 0x22, 0x02, 0x27, 0x1E, 0xC0, 0x03, 0x5F, 0xD6,
 };
 constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x6E6CC4, DYNAMIC_FPS_CALL, DYNAMIC_FPS_ORIGINAL},
@@ -320,13 +385,34 @@ constexpr std::array FPS_UNLOCK_RECORDS{
     BuiltinPatchRecord{0x2F53268, STEP_HITSTOP_HOOK, STEP_HITSTOP_ORIGINAL},
     BuiltinPatchRecord{0x3C46950, STEP_HITSTOP_ROUTINE, {}, true},
     BuiltinPatchRecord{0x53F914, STEP_AMBIENT_HOOK, STEP_AMBIENT_ORIGINAL},
-    BuiltinPatchRecord{0x3C46A00, STEP_AMBIENT_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x3C46B60, STEP_AMBIENT_ROUTINE, {}, true},
     BuiltinPatchRecord{0x3C46980, STEP_SHARED_ROUTINE, {}, true},
     BuiltinPatchRecord{0x13A070, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_A},
     BuiltinPatchRecord{0x13D710, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_B},
     BuiltinPatchRecord{0x389AC2C, GROUND_VELOCITY_NOP, GROUND_VELOCITY_ORIGINAL_C},
     BuiltinPatchRecord{0x261EB18, TURN_SPEED_HOOK, TURN_SPEED_ORIGINAL},
-    BuiltinPatchRecord{0x3C46A40, TURN_SPEED_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x3C46B9C, TURN_SPEED_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x3B5C7C8, MOVIE_FRAMES_HOOK, MOVIE_FRAMES_ORIGINAL},
+    BuiltinPatchRecord{0x3C46BC4, MOVIE_FRAMES_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x3296B08, SCARECROW_RECORD_HOOK, SCARECROW_CUT_ORIGINAL},
+    BuiltinPatchRecord{0x3C46AB0, SCARECROW_RECORD_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x32926C8, SCARECROW_LAST_HOOK, SCARECROW_CUT_ORIGINAL},
+    BuiltinPatchRecord{0x3C46AD8, SCARECROW_LAST_ROUTINE, {}, true},
+    BuiltinPatchRecord{0x14632C, CLOTH_DT_CALL_A, CLOTH_DT_ORIGINAL_A},
+    BuiltinPatchRecord{0x2AB804, CLOTH_DT_CALL_B, CLOTH_DT_ORIGINAL_B},
+    BuiltinPatchRecord{0x2C207A4, CLOTH_DT_CALL_C, CLOTH_DT_ORIGINAL_A},
+    BuiltinPatchRecord{0x2C2208C, CLOTH_DT_CALL_D, CLOTH_DT_ORIGINAL_D},
+    BuiltinPatchRecord{0x3C46B00, CLOTH_DT_ROUTINE_S0, {}, true},
+    BuiltinPatchRecord{0x3C46B30, CLOTH_DT_ROUTINE_S2, {}, true},
+};
+
+// Dark's timer state at 0 and the water slots to 0x98.
+constexpr std::array DYNAMIC_FPS_STATES{BuiltinPatchState{0x4E9FE00, 0x98}};
+// Dynamic FPS's state and the sound gate at 0xA0, then the step counters on a page of their own:
+// cheats keep their flags at 0x4E9FF80..0x4E9FFB0 (#1873).
+constexpr std::array FPS_UNLOCK_STATES{
+    BuiltinPatchState{0x4E9FE00, 0xA8},
+    BuiltinPatchState{0x4E9EE00, 0x110},
 };
 
 constexpr std::array BUILTIN_PATCHES{
@@ -356,10 +442,7 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = FPS_UNLOCK_RECORDS,
-        .state_offset = 0x4E9FE00,
-        // Timer state at 0, the water slots to 0x98, the sound gate at 0xA0, the step counters
-        // from 0xB0.
-        .state_size = 0x1C0,
+        .states = FPS_UNLOCK_STATES,
         .replaces = "Dynamic FPS by Dark (built-in)",
     },
     BuiltinPatch{
@@ -368,8 +451,7 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = DYNAMIC_FPS_RECORDS,
-        .state_offset = 0x4E9FE00,
-        .state_size = 0x98,
+        .states = DYNAMIC_FPS_STATES,
     },
     // The NVIDIA DLSS quality lowers Ocarina's render resolution under Max Resolution, since DLSS
     // replaces the game's own 1440p -> 4K upscale and takes whatever the game renders.
@@ -515,6 +597,59 @@ LICHII_NO_INLINE std::optional<u64> GetParentApplicationId(const ContentProvider
     return provider == nullptr ? std::nullopt : provider->GetParentApplicationId(title_id);
 }
 } // Anonymous namespace
+
+std::vector<BuiltinCheatOverlap> FindBuiltinCheatOverlaps(
+    u64 title_id, std::span<const std::string_view> applied_patches,
+    std::span<const Core::Memory::CheatEntry> cheats) {
+    const auto stores =
+        Core::Memory::DmntCheatVm::MainStaticStores({cheats.begin(), cheats.end()});
+    std::vector<BuiltinCheatOverlap> overlaps;
+    for (std::size_t index = 0; index < cheats.size(); ++index) {
+        const auto& cheat = cheats[index];
+        std::vector<std::pair<u64, u64>> ranges;
+        for (const auto& store : stores) {
+            if (store.cheat == index) {
+                ranges.emplace_back(store.begin, store.end);
+            }
+        }
+        if (ranges.empty()) {
+            continue;
+        }
+        std::ranges::sort(ranges);
+        std::vector<std::pair<u64, u64>> merged;
+        for (const auto& range : ranges) {
+            if (!merged.empty() && range.first <= merged.back().second) {
+                merged.back().second = std::max(merged.back().second, range.second);
+            } else {
+                merged.push_back(range);
+            }
+        }
+        const std::string name{cheat.definition.readable_name.data(),
+                               strnlen(cheat.definition.readable_name.data(),
+                                       cheat.definition.readable_name.size())};
+        for (const auto& patch : BUILTIN_PATCHES) {
+            if (patch.title_id != title_id || patch.module != "main" ||
+                std::ranges::find(applied_patches, patch.name) == applied_patches.end()) {
+                continue;
+            }
+            const auto check = [&](u64 begin, u64 end, bool state) {
+                for (const auto& [cheat_begin, cheat_end] : merged) {
+                    if (cheat_begin < end && begin < cheat_end) {
+                        overlaps.push_back({name, patch.name, state, cheat_begin, cheat_end, begin,
+                                            end});
+                    }
+                }
+            };
+            for (const auto& record : patch.records) {
+                check(record.module_offset, record.module_offset + record.bytes.size(), false);
+            }
+            for (const auto& state : patch.states) {
+                check(state.offset, state.offset + state.size, true);
+            }
+        }
+    }
+    return overlaps;
+}
 
 PatchManager::PatchManager(u64 title_id_,
                            const Service::FileSystem::FileSystemController& fs_controller_,
@@ -832,6 +967,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
 
     const auto disabled = GetDisabledAddons();
     std::vector<std::string_view> replaced;
+    std::vector<std::string_view> applied;
     for (const auto& patch : BUILTIN_PATCHES) {
         if (patch.title_id != title_id || patch.module != name) {
             continue;
@@ -867,29 +1003,34 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
                    offset <= data.size() - sizeof(Loader::NSOHeader) &&
                    size <= data.size() - sizeof(Loader::NSOHeader) - offset;
         };
-        if (patch.state_size != 0) {
+        bool apply = true;
+        for (const auto& state : patch.states) {
             const auto& data = header.segments[2];
             const u64 bss_start = u64{data.location} + data.size;
             const u64 bss_end = bss_start + data.bss_size;
-            if (patch.state_offset < bss_start || patch.state_offset > bss_end ||
-                patch.state_size > bss_end - patch.state_offset ||
-                !fits(nso, patch.state_offset, patch.state_size) ||
-                !fits(out, patch.state_offset, patch.state_size)) {
-                LOG_WARNING(Loader, "    - Skipping \"{}\": timer state is outside BSS",
-                            patch.name);
-                continue;
+            if (state.offset < bss_start || state.offset > bss_end ||
+                state.size > bss_end - state.offset || !fits(nso, state.offset, state.size) ||
+                !fits(out, state.offset, state.size)) {
+                LOG_WARNING(Loader, "    - Skipping \"{}\": state at {}+{:#x} is outside BSS",
+                            patch.name, name, state.offset);
+                apply = false;
+                break;
             }
-            const size_t offset = sizeof(Loader::NSOHeader) + patch.state_offset;
-            if (!std::all_of(nso.begin() + offset, nso.begin() + offset + patch.state_size,
+            const size_t offset = sizeof(Loader::NSOHeader) + state.offset;
+            if (!std::all_of(nso.begin() + offset, nso.begin() + offset + state.size,
                              [](u8 byte) { return byte == 0; }) ||
-                !std::equal(nso.begin() + offset, nso.begin() + offset + patch.state_size,
+                !std::equal(nso.begin() + offset, nso.begin() + offset + state.size,
                             out.begin() + offset)) {
-                LOG_WARNING(Loader, "    - Skipping \"{}\": timer state is not zero-filled",
-                            patch.name);
-                continue;
+                LOG_WARNING(Loader,
+                            "    - Skipping \"{}\": state at {}+{:#x} is not zero-filled",
+                            patch.name, name, state.offset);
+                apply = false;
+                break;
             }
         }
-        bool apply = true;
+        if (!apply) {
+            continue;
+        }
         for (const auto& record : patch.records) {
             if (!fits(nso, record.module_offset, record.bytes.size()) ||
                 !fits(out, record.module_offset, record.bytes.size()) ||
@@ -939,11 +1080,25 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         }
         LOG_INFO(Loader, "    - Applying built-in patch \"{}\" ({} records) to {}", patch.name,
                  patch.records.size(), name);
+        applied.push_back(patch.name);
         if (!patch.replaces.empty()) {
             replaced.push_back(patch.replaces);
         }
         if (patch.dlss_quality) {
             Settings::SetAppliedOcarinaRenderScale(patch.dlss_quality);
+        }
+    }
+
+    if (!applied.empty()) {
+        for (const auto& overlap :
+             FindBuiltinCheatOverlaps(title_id, applied, CreateCheatList(header.build_id))) {
+            LOG_WARNING(Loader,
+                        "Cheat \"{}\" writes {}+{:#x}..{:#x}, which built-in patch \"{}\" uses "
+                        "for its {} at {}+{:#x}..{:#x}. The cheat still runs and overwrites it; "
+                        "turn one of them off if the game misbehaves",
+                        overlap.cheat, name, overlap.cheat_begin, overlap.cheat_end, overlap.patch,
+                        overlap.state ? "state" : "code", name, overlap.patch_begin,
+                        overlap.patch_end);
         }
     }
 
@@ -1538,13 +1693,19 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     const auto dlc_entries_with_origin =
         content_union->ListEntriesFilterOrigin(std::nullopt, TitleType::AOC, ContentRecordType::Data);
 
+    std::vector<u64> add_on_content;
+    add_on_content.reserve(dlc_entries_with_origin.size());
+    for (const auto& [slot, entry] : dlc_entries_with_origin) {
+        add_on_content.push_back(entry.title_id);
+    }
+    const u64 add_on_base = GetAddOnApplicationID(title_id, add_on_content);
+
     dlc_match.reserve(dlc_entries_with_origin.size());
     for (const auto& [slot, entry] : dlc_entries_with_origin) {
         const auto base_tid = GetBaseTitleID(entry.title_id);
-        const bool matches_base = base_tid == title_id;
-        if (!matches_base) {
+        if (base_tid != add_on_base) {
             LOG_DEBUG(Loader, "DLC {:016X} base {:016X} doesn't match title {:016X}",
-                      entry.title_id, base_tid, title_id);
+                      entry.title_id, base_tid, add_on_base);
             continue;
         }
 
