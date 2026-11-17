@@ -700,9 +700,8 @@ struct Values {
                                                          true,
                                                          true};
 
-    // Precache shaders before the game starts: the compute programs in the game files and the
-    // cached graphics pipelines the boot leaves for later are built on the loading screen, so the
-    // driver's cache holds them before the game first uses them.
+    // Precache shaders before the game starts: the compute programs in the game files are built on
+    // the loading screen, so the driver's cache holds them before the game first uses them.
     // Ask: the desktop app asks at launch while the game has no finished precache; where nothing
     // asks, as Off.
     SwitchableSetting<PrecacheShaders> precache_shaders{linkage,
@@ -1106,6 +1105,10 @@ struct Values {
                                             Category::Network};
     Setting<bool> online_redirect_loopback_only{linkage, false, "online_redirect_loopback_only",
                                                 Category::Network};
+    // Friend codes a profile made for a private server starts with
+    // (core/hle/service/sockets/online_profile.h). Not logged.
+    Setting<std::string> online_friends{linkage, std::string(), "online_friends",
+                                        Category::Network};
 
     // WebService
     Setting<std::string> web_api_url{linkage, "api.ynet-fun.xyz", "web_api_url",
