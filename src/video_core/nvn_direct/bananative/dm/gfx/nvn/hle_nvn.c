@@ -1650,7 +1650,12 @@ static uint8_t *vpool_reserve(pool_t *o) {   // → the reserved range, or NULL
     uint64_t len = o->size < (64ull << 30) ? o->size : 64ull << 30;
 #endif
     len = (len + (uint64_t)getpagesize() - 1) & ~((uint64_t)getpagesize() - 1);
+#if defined(_WIN32)   // Lichii: an alias region of the guest memory (nvn_direct_alias_pages maps into it there)
+    void *a = nvn_direct_alias_reserve(len);
+    if (!a) a = MAP_FAILED;
+#else
     void *a = mmap(NULL, len, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+#endif
     if (a == MAP_FAILED) { LOG("[RED] virtual pool %p: cannot reserve %#llx bytes of address space (errno %d)", (const void *)o, (unsigned long long)len, errno); return NULL; }
     struct vpool *v = calloc(1, sizeof *v);
     if (!v || !(v->pt = calloc((o->size + (2u << 20) - 1) >> 21, sizeof *v->pt))) die("sparse pool allocation failed");
@@ -1670,7 +1675,11 @@ static void vpool_drop(pool_t *o) {   // caller holds g_vp_mu
 #if !PLAT_APPLE
     mtl_pool_alias(v->base, v->len < v->size ? v->len : v->size, NULL);   // (the GPU's aliases go with the range: a pool reserved there later starts unmapped)
 #endif
+#if defined(_WIN32)
+    nvn_direct_alias_release(v->base);
+#else
     munmap(v->base, v->len);
+#endif
     for (uint64_t l = 0; l < (v->size + (2u << 20) - 1) >> 21; l++) free(v->pt[l]);
     for (int i = 0; i < g_nvp; i++) if (g_vp[i] == v) { memmove(&g_vp[i], &g_vp[i + 1], (size_t)(g_nvp - 1 - i) * sizeof *g_vp); g_nvp--; break; }
     free(v->pt); free(v); o->vp = NULL;
@@ -1721,7 +1730,11 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
 #if !PLAT_APPLE
         mtl_pool_alias((void *)to, r->size, NULL);
 #endif
+#if defined(_WIN32)
+        nvn_direct_alias_unmap((void *)to, r->size);
+#else
         if (mmap((void *)to, r->size, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) == MAP_FAILED) { LOG("[RED] virtual pool unmap %#lx+%#llx failed (errno %d)", (unsigned long)to, (unsigned long long)r->size, errno); return 0; }
+#endif
         vrun_set(v, (uint64_t)r->voff, (uint64_t)r->voff + r->size, 0); return 1;
     }
     uintptr_t from = (uintptr_t)ph->mem + (uintptr_t)r->poff;

@@ -253,6 +253,16 @@ typedef struct nvn_direct_memory {
     /// imported as udmabufs of it where the driver refuses host-pointer imports of it (amdgpu).
     int backing_fd;
     const uint8_t* backing_base;
+#if defined(_WIN32)
+    /// Windows, where there is no file to map: a virtual pool's host range (HostMemory's alias
+    /// regions), inaccessible until alias_map maps backing memory [backing_offset, backing_offset
+    /// + size) into it at address (0 on failure); alias_unmap makes pages inaccessible again and
+    /// alias_release gives the range back.
+    void* (*alias_reserve)(void* context, uint64_t size);
+    int (*alias_map)(void* context, void* address, uint64_t backing_offset, uint64_t size);
+    void (*alias_unmap)(void* context, void* address, uint64_t size);
+    void (*alias_release)(void* context, void* region);
+#endif
 } nvn_direct_memory;
 
 /// Takes the front end's slot table (the names of upstream's names.txt, in its order), the

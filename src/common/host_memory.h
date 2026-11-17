@@ -119,6 +119,24 @@ public:
     /// Takes down a view MapBackingView made, with its zero pages.
     void UnmapBackingView(u8* view, size_t length);
 
+#ifdef _WIN32
+    /// Windows: a host range of its own of `length` bytes for MapAlias, inaccessible until
+    /// mapped (Linux maps the memfd into a range with mmap instead). nullptr (logged) without
+    /// fastmem or on failure. Given back with ReleaseAliasRegion.
+    [[nodiscard]] u8* ReserveAliasRegion(size_t length);
+
+    /// Windows: backing memory [host_offset, host_offset + length) mapped read-write at address,
+    /// in a region ReserveAliasRegion made, in place of what was mapped there. Page aligned.
+    /// false (logged) on failure: the range is then inaccessible.
+    bool MapAlias(u8* address, size_t host_offset, size_t length);
+
+    /// Windows: [address, address + length) of an alias region inaccessible again.
+    void UnmapAlias(u8* address, size_t length);
+
+    /// Windows: takes down a region ReserveAliasRegion made, with everything mapped in it.
+    void ReleaseAliasRegion(u8* region);
+#endif
+
     [[nodiscard]] size_t BackingSize() const noexcept {
         return backing_size;
     }

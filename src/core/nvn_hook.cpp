@@ -408,6 +408,23 @@ void* Backing(void* context, u64 address) {
     return state.process->GetMemory().GetPointerSilent(address);
 }
 
+#ifdef _WIN32
+/// nvn_direct_memory's alias calls: HostMemory's alias regions.
+void* AliasReserve(void* context, u64 size) {
+    return static_cast<State*>(context)->host_memory->ReserveAliasRegion(size);
+}
+int AliasMap(void* context, void* address, u64 backing_offset, u64 size) {
+    return static_cast<State*>(context)->host_memory->MapAlias(static_cast<u8*>(address),
+                                                               backing_offset, size);
+}
+void AliasUnmap(void* context, void* address, u64 size) {
+    static_cast<State*>(context)->host_memory->UnmapAlias(static_cast<u8*>(address), size);
+}
+void AliasRelease(void* context, void* region) {
+    static_cast<State*>(context)->host_memory->ReleaseAliasRegion(static_cast<u8*>(region));
+}
+#endif
+
 /// The guest's x0-x7 and the low halves of v0-v7.
 void ReadArguments(Dynarmic::A64::Jit& jit, std::array<u64, 8>& x, std::array<u64, 8>& v) {
     for (size_t i = 0; i < 8; ++i) {
@@ -439,7 +456,14 @@ bool DirectEntry(State& state, u64 pc, Dynarmic::A64::Jit& jit, Core::Memory::Me
                                           .backing = Backing,
                                           .context = &state,
                                           .backing_fd = state.host_memory->BackingFd(),
-                                          .backing_base = state.host_memory->BackingBasePointer()};
+                                          .backing_base = state.host_memory->BackingBasePointer(),
+#ifdef _WIN32
+                                          .alias_reserve = AliasReserve,
+                                          .alias_map = AliasMap,
+                                          .alias_unmap = AliasUnmap,
+                                          .alias_release = AliasRelease,
+#endif
+            };
             nvn_direct_init(page_table.GetImpl().fastmem_arena,
                             u64{1} << page_table.GetAddressSpaceWidth(), &views,
                             state.process->IsSwitch2(), state.sdk_major);

@@ -33,6 +33,13 @@ int nvn_direct_backing_file(uint64_t address, uint64_t* offset);
 /// its physical pool's. Pages with no guest memory behind them are made inaccessible. Returns
 /// those pages' bytes.
 uint64_t nvn_direct_alias_pages(void* to, uint64_t host, uint64_t size);
+#if defined(_WIN32)
+/// A virtual pool's range for nvn_direct_alias_pages (nvn_direct_memory's alias_reserve; NULL on
+/// failure), its pages made inaccessible again, and the range given back.
+void* nvn_direct_alias_reserve(uint64_t size);
+void nvn_direct_alias_unmap(void* at, uint64_t size);
+void nvn_direct_alias_release(void* range);
+#endif
 /// Where the host writes a value into guest memory at host (an arena pointer or the game's
 /// address): its backing memory, which write tracking never protects. Anything else (a host
 /// segment): unchanged. The value must not cross a page.
