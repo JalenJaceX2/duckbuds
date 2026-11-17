@@ -504,14 +504,18 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
         }
         ctx.AddCapability(spv::Capability::DemoteToHelperInvocation);
     }
-    if (info.stores[IR::Attribute::ViewportIndex] && profile.support_multi_viewport) {
+    // A mesh program emulated as compute stores its Layer and ViewportIndex in its output buffer.
+    const bool stores_viewport_layer{!ctx.runtime_info.mesh_as_compute};
+    if (info.stores[IR::Attribute::ViewportIndex] && profile.support_multi_viewport &&
+        stores_viewport_layer) {
         ctx.AddCapability(spv::Capability::MultiViewport);
     }
     if (info.stores[IR::Attribute::ViewportMask] && profile.support_viewport_mask) {
         ctx.AddExtension("SPV_NV_viewport_array2");
         ctx.AddCapability(spv::Capability::ShaderViewportMaskNV);
     }
-    if (info.stores[IR::Attribute::Layer] || info.stores[IR::Attribute::ViewportIndex]) {
+    if ((info.stores[IR::Attribute::Layer] || info.stores[IR::Attribute::ViewportIndex]) &&
+        stores_viewport_layer) {
         if (profile.support_viewport_index_layer_non_geometry && ctx.stage != Stage::Geometry) {
             ctx.AddExtension("SPV_EXT_shader_viewport_index_layer");
             ctx.AddCapability(spv::Capability::ShaderViewportIndexLayerEXT);
@@ -600,7 +604,13 @@ void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
                     ++phi_index;
                 }
                 IR::Inst* phi = phi_instructions[phi_index];
-                return { ctx.Def(phi->Arg(phi_arg)), parent };
+                const Id value{ctx.Def(phi->Arg(phi_arg))};
+                if (!Sirit::ValidId(value)) {
+                    // An operand removed from the program: SPIR-V with ID 0 can bring the
+                    // driver down, a failed pipeline only skips its work.
+                    throw LogicError("Phi operand {} has no definition", phi_arg);
+                }
+                return { value, parent };
             });
         }
 

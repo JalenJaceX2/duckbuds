@@ -218,9 +218,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
               "the NVIDIA app has downloaded it; Lichii does not ship NVIDIA's files. Use the "
-              "download button below.\nFire Emblem: Fortune's Weave also needs "
-              "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
-              "remains active.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
+              "download button below.\nIn Fire Emblem: Fortune's Weave it replaces the game's "
+              "DLSS while \"Use the game's own DLSS\" is off.\nIn The Legend of Zelda: Ocarina of Time it replaces the game's "
               "upscaler at 1x resolution scale.\nThe window adapting filter (the FSR 1, Bilinear "
               "and similar button in the status bar) is separate and runs after DLSS. While DLSS "
               "runs, the status bar shows DLSS, its mode and its preset. If DLSS fails, it stays "
@@ -431,6 +430,15 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, mkw_30fps, tr("Mario Kart World: 30 FPS mode"),
            tr("Forces the game to use its native 30 FPS mode at normal game speed. "
               "Takes effect after restarting the game."));
+    INSERT(Settings, mkw_60fps, tr("Mario Kart World: 60 FPS mode"),
+           tr("Forces the game's 60 FPS mode everywhere, not only in cutscenes. The game "
+              "advances one 60 FPS step per frame, so it never runs fast. Takes effect after "
+              "restarting the game and takes precedence over the 30 FPS mode."));
+    INSERT(Settings, mkw_60fps_fallback, tr("Mario Kart World: drop to 30 FPS when slow"),
+           tr("Only applies with the 60 FPS mode. When your PC can't hold 60 FPS, the game "
+              "switches to its 30 FPS mode and keeps normal speed, then tries 60 again every few "
+              "seconds. Turn it off to stay at 60 FPS, where slow frames play in slow motion. "
+              "Takes effect after restarting the game."));
     INSERT(Settings, mkw_dynamic_fps, tr("Mario Kart World: dynamic FPS (experimental)"),
            tr("Lets the game adjust between 30 and 60 FPS using whole-frame timing to maintain "
               "normal game speed. Takes effect after restarting the game and takes precedence over "
@@ -458,6 +466,14 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
 
     INSERT(Settings, vertex_input_dynamic_state, tr("Vertex Input Dynamic State"),
            tr("Enables vertex input dynamic state feature for better quality and performance."));
+
+    INSERT(Settings, mesh_shaders, tr("Mesh Shaders"),
+           tr("How Switch 2 games' mesh shader geometry is drawn.\n"
+              "Native uses the GPU's mesh shaders. Compute Fallback emulates them with compute "
+              "shaders: it can be slower in scenes with a lot of foliage, and it can't draw every "
+              "kind of mesh program.\n"
+              "Automatic uses the compute fallback on AMD RDNA2 GPUs (RX 6000 series), where "
+              "native mesh shaders hang the GPU, and native mesh shaders everywhere else."));
 
     INSERT(
         Settings, sample_shading, tr("Sample Shading"),
@@ -908,6 +924,13 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(ExtendedDynamicState, EDS1, tr("ExtendedDynamicState 1")),
                               PAIR(ExtendedDynamicState, EDS2, tr("ExtendedDynamicState 2")),
                               PAIR(ExtendedDynamicState, EDS3, tr("ExtendedDynamicState 3")),
+                          }});
+
+    translations->insert({Settings::EnumMetadata<Settings::MeshShaderMode>::Index(),
+                          {
+                              PAIR(MeshShaderMode, Automatic, tr("Automatic")),
+                              PAIR(MeshShaderMode, Native, tr("Native")),
+                              PAIR(MeshShaderMode, Compute, tr("Compute Fallback")),
                           }});
 
     translations->insert({Settings::EnumMetadata<Settings::GameListMode>::Index(),

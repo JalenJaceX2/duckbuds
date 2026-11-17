@@ -1065,6 +1065,8 @@ bool MemoryManager::SubmappedRangeFromRuns(
 // the range page by page, as MaxContinuousRange does: the texture cache, the buffer cache and
 // fast draws ask them for every image, buffer and draw they set up. EDEN_NX2_PERF_VERIFY=1 also
 // walks the pages, logs any difference and returns the walk's answer.
+// the range page by page, as MaxContinuousRange does: the buffer cache's virtual ranges, fast draws
+// and sparse images ask them for the ranges they bind.
 boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
 MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> result{};
@@ -1109,6 +1111,23 @@ MemoryManager::GetSubmappedDeviceRange(GPUVAddr gpu_addr, std::size_t size) cons
                       gpu_addr, size, result.size(), walked.size());
         }
         return walked;
+    }
+    return result;
+}
+
+boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
+MemoryManager::GetSubmappedRangeUncached(GPUVAddr gpu_addr, std::size_t size) const {
+    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> result{};
+    GetSubmappedRangeImpl<true>(gpu_addr, size, result);
+    return result;
+}
+
+boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
+MemoryManager::GetSubmappedDeviceRangeUncached(GPUVAddr gpu_addr, std::size_t size) const {
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> result{};
+    if (IsWithinGPUAddressRange(gpu_addr)) {
+        GetSubmappedRangeImpl<false>(
+            gpu_addr, (std::min<u64>)(size, address_space_size - gpu_addr), result);
     }
     return result;
 }

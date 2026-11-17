@@ -19,6 +19,10 @@
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 
+namespace Settings {
+struct ResolutionScalingInfo;
+}
+
 namespace Tegra::Texture {
 class UnswizzleWorker;
 }
@@ -157,9 +161,25 @@ void SwizzleImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr, const Ima
                   std::span<const BufferImageCopy> copies, std::span<const u8> memory,
                   Common::ScratchBuffer<u8>& tmp_buffer);
 
+/// SwizzleImage into `guest`, the image's guest memory from its GPU address, holding its bytes
+/// there before: appends to `written` each range [first, second) of it the copies wrote.
+void SwizzleImageTo(std::span<u8> guest, const ImageInfo& info,
+                    std::span<const BufferImageCopy> copies, std::span<const u8> memory,
+                    bool native_tiling, std::vector<std::pair<u64, u64>>& written);
+
 [[nodiscard]] bool IsBlockLinearSizeCompatible(const ImageInfo& new_info,
                                                const ImageInfo& overlap_info, u32 new_level,
                                                u32 overlap_level, bool strict_size) noexcept;
+
+/// Whether an image scaled by the resolution setting is at most max_extent texels wide and tall
+/// on the host (MSAA images have their sample grid in info.size).
+[[nodiscard]] bool ScaledImageFits(const ImageInfo& info,
+                                   const Settings::ResolutionScalingInfo& resolution,
+                                   u32 max_extent) noexcept;
+
+/// Whether a block-linear 2D image is wider than tall by padding only: made as wide as it is
+/// tall, it takes the same guest memory with the same layout.
+[[nodiscard]] bool IsPaddedSquare(const ImageInfo& info) noexcept;
 
 [[nodiscard]] bool IsPitchLinearSameSize(const ImageInfo& lhs, const ImageInfo& rhs,
                                          bool strict_size) noexcept;

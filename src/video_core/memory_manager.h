@@ -54,6 +54,13 @@ public:
     // Switch 2: GPU address of the read-only syncpoint shim (u32 per syncpoint); 0 = none.
     void SetNativeSyncpointShim(GPUVAddr address);
     static constexpr u32 NumShimSyncpoints = 192; // Tegra::Host1x::SyncpointManager
+    /// Whether [address, address + size) overlaps the syncpoint shim, whose words Read serves
+    /// from the guest syncpoints instead of memory.
+    [[nodiscard]] bool OverlapsSyncpointShim(GPUVAddr address, u64 size) const {
+        const GPUVAddr shim = native_syncpoint_shim.load(std::memory_order_acquire);
+        return shim != 0 && address < shim + NumShimSyncpoints * sizeof(u32) &&
+               address + size > shim;
+    }
 
     /// Switch 2 lays out block-linear surfaces with the console's GOB swizzle.
     void EnableNativeTiling() {
@@ -124,6 +131,9 @@ public:
                          std::source_location caller = std::source_location::current()) const;
     void WriteBlockUnsafe(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size);
 
+    /// A download for a guest read not yet in guest memory would land over this write later.
+    void FinishReadsBefore(DAddr dev_addr, std::size_t size, bool unsafe) const;
+
     /// Reads `count` consecutive words as Read<u32> would (Switch 2 syncpoint shim included),
     /// without a translation per word.
     void ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_t count,
@@ -193,6 +203,12 @@ public:
     /// MaxContinuousRange by walking the page tables (the answer with Nx2Perf off).
     size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
 
+    /// GetSubmappedRange and GetSubmappedDeviceRange by walking the page tables.
+    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
+    GetSubmappedRangeUncached(GPUVAddr gpu_addr, std::size_t size) const;
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32>
+    GetSubmappedDeviceRangeUncached(GPUVAddr gpu_addr, std::size_t size) const;
+
     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
         return gpu_addr < address_space_size;
     }
@@ -247,8 +263,6 @@ private:
 
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe,
                        std::source_location caller) const;
-    /// A download for a guest read not yet in guest memory would land over this write later.
-    void FinishReadsBefore(DAddr dev_addr, std::size_t size, bool unsafe) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
 
     [[nodiscard]] std::size_t PageEntryIndex(GPUVAddr gpu_addr, bool is_big_page) const {

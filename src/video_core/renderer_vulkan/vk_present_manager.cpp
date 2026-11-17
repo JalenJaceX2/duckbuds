@@ -3,6 +3,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <thread>
 
 #include "common/display_hdr.h"
@@ -40,7 +41,7 @@ static_assert(MAX_FRAMES_IN_FLIGHT <= LSFG_MAX_TARGETS);
 #endif
 
 // Sleeps until the deadline, without spinning: it may pass by up to a timer tick (about 0.5 ms
-// on Windows), well within a refresh, and the next deadline counts from the actual present.
+// on Windows), well within a refresh, and the next deadline counts from this one.
 void SleepUntil(std::chrono::steady_clock::time_point deadline) {
     while (true) {
         const auto left = deadline - std::chrono::steady_clock::now();
@@ -257,6 +258,7 @@ Frame* PresentManager::GetRenderFrame() {
     frame->present_done.Reset();
     frame->color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     frame->present_spacing = {};
+    frame->game_frame_presents = 1;
 #ifdef EGLANTINE_STREAMLINE
     frame->frame_gen = false;
 #endif
@@ -288,6 +290,11 @@ void PresentManager::Present(Frame* frame) {
 
 size_t PresentManager::MaxExtraFrames() const {
     return image_count - 1;
+}
+
+size_t PresentManager::FreeFrames() {
+    std::scoped_lock lock{free_mutex};
+    return free_queue.size();
 }
 
 bool PresentManager::NeedsStorage(const Frame* frame, bool required) const {
@@ -443,14 +450,18 @@ void PresentManager::PresentThread(std::stop_token token) {
             // before the queue lock goes out of scope. This way the swapchain
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
-            const bool trace = Common::DkbFrameTrace::Enabled();
-            const auto ready = trace ? std::chrono::steady_clock::now()
-                                     : std::chrono::steady_clock::time_point{};
-            SleepUntil(next_present);
+            const auto ready = std::chrono::steady_clock::now();
+            // The spacing counts from when this present was due, not from when it returned. A
+            // present that waits for vblank has already spent part of the spacing; counting it
+            // again cost each generated frame an extra refresh, which lengthened the measured
+            // frame interval and with it the spacing, until the game ran at a fraction of its
+            // speed (#1772).
+            const auto start = (std::max)(next_present, ready);
+            SleepUntil(start);
             CopyToSwapchain(frame);
-            const auto presented = std::chrono::steady_clock::now();
-            next_present = presented + frame->present_spacing;
-            if (trace) {
+            next_present = start + frame->present_spacing;
+            if (Common::DkbFrameTrace::Enabled()) {
+                const auto presented = std::chrono::steady_clock::now();
                 LogPacing(frame, presented - ready, presented);
             }
 
@@ -514,8 +525,10 @@ void PresentManager::SetImageCount() {
 #ifdef HAS_LSFG
     const size_t generations = Settings::FrameGenMaxGenerations();
     const size_t queued_composites = Settings::values.frame_gen_queue_target.GetValue() + 1;
+    // One frame more than the presents of the queued composites, for the next game frame
+    // (GenerationsWithoutWaiting).
     image_count =
-        std::clamp<size_t>((generations + 1) * queued_composites, swapchain.GetImageCount(),
+        std::clamp<size_t>((generations + 1) * queued_composites + 1, swapchain.GetImageCount(),
                            MAX_FRAMES_IN_FLIGHT);
 #else
     image_count = std::min<size_t>(swapchain.GetImageCount(), MAX_FRAMES_IN_FLIGHT);
@@ -612,7 +625,7 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         return;
     }
 
-    while (swapchain.AcquireNextImage(!use_present_thread)) {
+    while (swapchain.AcquireNextImage(!use_present_thread, frame->game_frame_presents)) {
         if (!RecreateSwapchain(frame)) {
             return;
         }
@@ -754,7 +767,6 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
             break;
         case VK_ERROR_DEVICE_LOST:
             device.ReportLoss();
-            [[fallthrough]];
         default:
             vk::Check(result);
             break;

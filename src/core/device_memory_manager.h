@@ -34,6 +34,13 @@ namespace Memory {
 class Memory;
 }
 
+/// Bumped each time pages become tracked again (UpdatePagesCachedCount with a positive delta):
+/// a cache takes the CPU's writes there and treats the pages as clean from then on. A CPU write
+/// marks its page before storing its bytes (Memory::Write), so a cache that tracks the page
+/// again in between can take the old bytes for the new ones; a write that sees this change after
+/// its store marks the page again (NoteStoredWrite in memory.cpp).
+inline std::atomic<u64> g_pages_tracked_generation{};
+
 template <typename DTraits>
 struct DeviceMemoryManagerAllocator;
 
@@ -151,6 +158,19 @@ public:
     Asid RegisterProcess(Memory::Memory* memory);
     void UnregisterProcess(Asid id);
 
+    /// Snapshot for unmapped-read reports: the process this device page was last mapped under
+    /// (Asid.id + 1, or 0 when no mapping was recorded). Lock-free and diagnostic-only: a stale
+    /// view would only change a log line.
+    [[nodiscard]] u32 MappingProvenanceForDiagnostics(DAddr address) const {
+        return mapping_asid_plus1.GetOrDefault(address >> page_bits)
+            .load(std::memory_order_acquire);
+    }
+
+    /// Snapshot for unmapped-read reports: how many processes are registered right now.
+    [[nodiscard]] size_t LiveProcessCountForDiagnostics() const {
+        return live_process_count.load(std::memory_order_acquire);
+    }
+
     void UpdatePagesCachedCount(DAddr addr, size_t size, s32 delta);
 
     // New batch API to update multiple ranges with a single lock acquisition.
@@ -249,11 +269,21 @@ private:
     };
     Common::SparseLargeVector<u32> compressed_device_addr;
     Common::SparseLargeVector<TrackedEntry> tracked_entries;
+    /// Asid.id + 1 of the process the last Map of each device page was attributed to; 0 when no
+    /// mapping was recorded (also the value a never-committed page reads back as). Kept out of
+    /// TrackedEntry so that struct's element size stays a divisor of the host page size, which
+    /// SparseLargeVector::CommitRegion's page math assumes. Atomic because unmapped-read reports
+    /// snapshot it without mapping_guard while Map/Unmap write it holding that guard.
+    Common::SparseLargeVector<std::atomic<u32>> mapping_asid_plus1;
 
     // Process memory interfaces
 
     std::deque<size_t> id_pool;
     std::deque<Memory::Memory*> registered_processes;
+    /// How many processes are registered right now. Atomic because unmapped-read reports read it
+    /// on the read thread while nvdrv session open/close register and unregister processes
+    /// without a lock shared with these reads.
+    std::atomic<size_t> live_process_count{0};
 
     // Memory protection management
 

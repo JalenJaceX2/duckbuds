@@ -30,9 +30,47 @@
 #include "core/hle/service/glue/glue_manager.h"
 #include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/server_manager.h"
+#include "core/hle/service/sockets/online_profile.h"
+#include "core/internal_network/local_redirect.h"
 #include "core/loader/loader.h"
 
 namespace Service::Account {
+
+// While the host redirect sends the game to a private server, answers with this emulator's
+// profile on it, which the server reads as the player's account at login
+// (sockets/online_profile.h, from Droplet). It comes before Nextendo's, and while a private
+// server is set it always answers: without its token, the game gets an empty one rather than
+// another service's. Without a private server the caller keeps its own answer.
+static bool ReplyServerIdToken(Core::System& system, HLERequestContext& ctx) {
+    if (Network::LocalRedirect::Server().empty()) {
+        return false;
+    }
+    const auto& id = system.GetApplicationProcessBuildID();
+    size_t length = id.size();
+    while (length > 0 && id[length - 1] == 0) {
+        --length;
+    }
+    std::string build;
+    for (size_t i = 0; i < length; ++i) {
+        build += fmt::format("{:02x}", id[i]);
+    }
+    std::string token = Sockets::OnlineProfile::IdentityToken(build);
+    const size_t capacity = ctx.GetWriteBufferSize();
+    if (token.size() >= capacity) {
+        LOG_ERROR(Service_ACC, "Server id token ({} bytes) does not fit the {}-byte buffer",
+                  token.size(), capacity);
+        token.clear();
+    }
+    // Titles read the token as a C string, so the rest of their buffer is zeroed.
+    std::vector<u8> out(capacity, 0);
+    std::memcpy(out.data(), token.data(), token.size());
+    ctx.WriteBuffer(out);
+
+    IPC::ResponseBuilder rb{ctx, 3};
+    rb.Push(ResultSuccess);
+    rb.Push(static_cast<u32>(token.size()));
+    return true;
+}
 
 // Thumbnails are hard coded to be at least this size
 constexpr std::size_t THUMBNAIL_SIZE = 0x24000;
@@ -505,6 +543,9 @@ protected:
     }
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
+        if (ReplyServerIdToken(system, ctx)) {
+            return;
+        }
         LOG_WARNING(Service_ACC, "(STUBBED) called");
 
         std::vector<u8> token_data(0x100);
@@ -719,13 +760,14 @@ private:
     Kernel::KEvent* completion_event{};
 };
 
-// While Nextendo Network is on, answers with the signed-in account's id token.
-static bool ReplyNextendoIdToken(Core::System& system, HLERequestContext& ctx) {
-    if (!Nextendo::LinkedAccount()) {
+// While Nextendo Network is on, answers with the id token of the profile's account.
+static bool ReplyNextendoIdToken(Core::System& system, HLERequestContext& ctx,
+                                 const Common::UUID& profile) {
+    if (!Nextendo::LinkedAccount(profile)) {
         return false;
     }
     const auto account =
-        Common::Nextendo::EnsureGameToken(Settings::values.nextendo_client_id.GetValue());
+        Common::Nextendo::EnsureGameToken(Settings::values.nextendo_client_id.GetValue(), profile);
     if (!account) {
         return false;
     }
@@ -740,13 +782,14 @@ static bool ReplyNextendoIdToken(Core::System& system, HLERequestContext& ctx) {
 
 class EnsureTokenIdCacheAsyncInterface final : public IAsyncContext {
 public:
-    explicit EnsureTokenIdCacheAsyncInterface(Core::System& system_) : IAsyncContext{system_} {
+    explicit EnsureTokenIdCacheAsyncInterface(Core::System& system_, Common::UUID profile_)
+        : IAsyncContext{system_}, profile{profile_} {
         MarkComplete();
     }
     ~EnsureTokenIdCacheAsyncInterface() = default;
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
-        if (ReplyNextendoIdToken(system, ctx)) {
+        if (ReplyServerIdToken(system, ctx) || ReplyNextendoIdToken(system, ctx, profile)) {
             return;
         }
         LOG_WARNING(Service_ACC, "(STUBBED) called");
@@ -766,15 +809,19 @@ protected:
     Result GetResult() const override {
         return ResultSuccess;
     }
+
+private:
+    Common::UUID profile;
 };
 
 class IManagerForApplication final : public ServiceFramework<IManagerForApplication> {
 public:
     explicit IManagerForApplication(Core::System& system_,
-                                    const std::shared_ptr<ProfileManager>& profile_manager_)
+                                    const std::shared_ptr<ProfileManager>& profile_manager_,
+                                    Common::UUID profile_)
         : ServiceFramework{system_, "IManagerForApplication"},
-          ensure_token_id{std::make_shared<EnsureTokenIdCacheAsyncInterface>(system)},
-          profile_manager{profile_manager_} {
+          ensure_token_id{std::make_shared<EnsureTokenIdCacheAsyncInterface>(system, profile_)},
+          profile_manager{profile_manager_}, profile{profile_} {
         // clang-format off
         static const FunctionInfo functions[] = {
             {0, &IManagerForApplication::CheckAvailability, "CheckAvailability"},
@@ -800,11 +847,12 @@ private:
         rb.Push(ResultSuccess);
     }
 
-    // The signed-in Nextendo account's id while Nextendo Network is on, so the game server sees
-    // the same account its nx2 token names.
+    // The profile's Nextendo account id while Nextendo Network is on, so the game server sees the
+    // same account its nx2 token names.
     u64 NetworkServiceAccountId() const {
-        if (const auto account = Nextendo::LinkedAccount(); account && account->pid != 0) {
-            return account->pid;
+        if (const auto account = Nextendo::LinkedAccount(profile); account && account->pid != 0) {
+            return Common::Nextendo::NetworkServiceAccountId(
+                system.GetApplicationProcessProgramID(), *account);
         }
         return profile_manager->GetLastOpenedUser().Hash();
     }
@@ -832,7 +880,7 @@ private:
     }
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
-        if (ReplyNextendoIdToken(system, ctx)) {
+        if (ReplyServerIdToken(system, ctx) || ReplyNextendoIdToken(system, ctx, profile)) {
             return;
         }
         LOG_WARNING(Service_ACC, "(STUBBED) called");
@@ -864,7 +912,7 @@ private:
     }
 
     void LoadNetworkServiceLicenseKindAsync(HLERequestContext& ctx) {
-        if (!Nextendo::LinkedAccount()) {
+        if (!Nextendo::LinkedAccount(profile)) {
             StubReplyInterface(ctx);
             return;
         }
@@ -884,6 +932,8 @@ private:
 
     std::shared_ptr<EnsureTokenIdCacheAsyncInterface> ensure_token_id{};
     std::shared_ptr<ProfileManager> profile_manager;
+    // The user the game asked for, whose Nextendo account it plays with.
+    Common::UUID profile;
 };
 
 // 8.0.0+
@@ -1076,10 +1126,14 @@ Result Module::Interface::InitializeApplicationInfoBase() {
 }
 
 void Module::Interface::GetBaasAccountManagerForApplication(HLERequestContext& ctx) {
-    LOG_DEBUG(Service_ACC, "called");
+    IPC::RequestParser rp{ctx};
+    const auto uuid = rp.PopRaw<Common::UUID>();
+    LOG_DEBUG(Service_ACC, "called, uuid=0x{}", uuid.RawString());
+    const auto profile =
+        profile_manager->UserExists(uuid) ? uuid : profile_manager->GetLastOpenedUser();
     IPC::ResponseBuilder rb{ctx, 2, 0, 1};
     rb.Push(ResultSuccess);
-    rb.PushIpcInterface<IManagerForApplication>(ctx, system, profile_manager);
+    rb.PushIpcInterface<IManagerForApplication>(ctx, system, profile_manager, profile);
 }
 
 void Module::Interface::IsUserAccountSwitchLocked(HLERequestContext& ctx) {
