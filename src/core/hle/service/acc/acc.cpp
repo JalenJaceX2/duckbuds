@@ -789,8 +789,7 @@ public:
     ~EnsureTokenIdCacheAsyncInterface() = default;
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
-        if (ReplyServerIdToken(system, ctx) || ReplyNextendoIdToken(system, ctx)) {
-        if (ReplyNextendoIdToken(system, ctx, profile)) {
+        if (ReplyServerIdToken(system, ctx) || ReplyNextendoIdToken(system, ctx, profile)) {
             return;
         }
         LOG_WARNING(Service_ACC, "(STUBBED) called");
@@ -881,8 +880,7 @@ private:
     }
 
     void LoadIdTokenCache(HLERequestContext& ctx) {
-        if (ReplyServerIdToken(system, ctx) || ReplyNextendoIdToken(system, ctx)) {
-        if (ReplyNextendoIdToken(system, ctx, profile)) {
+        if (ReplyServerIdToken(system, ctx) || ReplyNextendoIdToken(system, ctx, profile)) {
             return;
         }
         LOG_WARNING(Service_ACC, "(STUBBED) called");
