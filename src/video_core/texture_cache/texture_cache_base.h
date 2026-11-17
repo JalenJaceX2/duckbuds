@@ -5,9 +5,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -49,6 +51,7 @@
 #include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/texture_cache/writeback_ranges.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
 
@@ -180,16 +183,35 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     /// (6.48 GB) and the collector deleted ~40 recently used images a frame again; images that
     /// do not fit add to the out-of-memory margin.
     u64 retention_limit{};
+    u64 retention_budget{}; ///< The lowest driver budget read lately (RetentionBudget)
     u64 logged_critical_memory{}; ///< The critical threshold of the last thresholds line logged
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered
     u32 seen_failed_images{};     ///< Images the allocator could not make, already collected for
     u64 pressure_margin{};        ///< Extra room under the budget after images did not fit
     u64 pressure_quiet_frames{};  ///< Frames since the last such image
     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
+    // Device-local memory the allocator placed in host memory (heap over budget): see TickFrame.
+    u64 spill_margin{};           ///< Extra room for it, sized to what spilled (at most 768 MiB)
+    u64 spill_window_bytes{};     ///< Spilled in the current window
+    u64 spill_window_start{};     ///< frame_tick the current window began at
+    u64 spill_quiet_frames{};     ///< Frames since the last spill
+    u64 spill_collect_tick{};     ///< frame_tick of the first forced collect of this episode + 1
+    u32 spill_forced_collects{};  ///< Forced collects in this episode
+    u64 spill_last_collect{};     ///< frame_tick of the last forced collect
+    u64 spill_log_bytes{};        ///< Spilled since the last spill log line
+    u32 spill_log_collects{};     ///< Forced collects since the last spill log line
+    std::chrono::steady_clock::time_point spill_log_time{};
     u64 astc_opaque_images{};
     u64 astc_alpha_images{};
     Common::ScratchBuffer<u8> astc_scan_buffer;
     u64 images_deleted{};
+    /// Why the next DeleteImage happens, for EDEN_NX2_TC_TRACE: the collector (and its mode),
+    /// an unmap or a join. Read and reset by DeleteImage.
+    const char* trace_delete_reason = "other";
+    /// The collector's deleted image: its flags before UnregisterImage cleared BadOverlap, and
+    /// whether its contents were written back to guest memory. Read and reset by DeleteImage.
+    u32 trace_delete_flags{};
+    bool trace_delete_downloaded{};
     u64 scale_epoch{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
     bool debug_stats{}; ///< Collect what only the debug statistics lines use
@@ -293,6 +315,10 @@ public:
     /// Fill image_view_ids with the graphics/compute images in indices
     void FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist = true);
 
+    /// Whether the handle words and descriptors `memo` was built from still match guest memory.
+    [[nodiscard]] bool TextureMemoStillHolds(const SampledTextureMemo& memo,
+                                             std::span<const GPUVAddr> handle_addresses) const;
+
     /// Fills views and samplers of a draw from the pipeline's memo when nothing they were
     /// resolved from has changed since (true), prepares the images as FillImageViews does.
     /// handle_addresses are where the draw reads its texture handles from, in binding order.
@@ -354,6 +380,10 @@ public:
         return render_targets;
     }
 
+    [[nodiscard]] Runtime& GetRuntime() noexcept {
+        return runtime;
+    }
+
     /// Images created, deleted and created from overlapping ones (joins), invalidations of every
     /// channel's TIC tables, and TIC or TSC tables moved, since the last call.
     struct Churn {
@@ -369,6 +399,13 @@ public:
 
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
+
+    /// Calls its argument for each guest CPU write collected and not yet applied
+    /// (GPU::ForEachPendingCpuWrite): landing write-backs leave their bytes (SwizzleKeeping).
+    using PendingCpuWrites = std::function<void(const std::function<void(DAddr, size_t)>&)>;
+    void SetPendingCpuWrites(PendingCpuWrites source) {
+        pending_cpu_writes = std::move(source);
+    }
 
     /// Download contents of host images to guest memory in a region
     void DownloadMemory(DAddr cpu_addr, size_t size);
@@ -402,7 +439,8 @@ public:
     /// Health check of a game's DLSS network output (dst) against its input (src); see the
     /// runtime's ProbeGameDlssOutput. Returns an earlier check's result when one is ready.
     std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
-        const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src);
+        const Tegra::Engines::Fermi2D::Surface& dst, const Tegra::Engines::Fermi2D::Surface& src,
+        std::optional<std::array<u32, 2>> src_region = std::nullopt);
 
     /// Try to find a cached image view in the given CPU address
     [[nodiscard]] std::pair<ImageView*, bool> TryFindFramebufferImageView(
@@ -615,6 +653,13 @@ private:
     /// Returns true if the current clear's render area and scissor cover a width x height image
     [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;
 
+    /// Whether the current clear writes every byte of a single-level, single-layer 2D image with
+    /// this info at gpu_addr (every channel, the whole image, a target bound at that address)
+    [[nodiscard]] bool ClearWritesWhole(const ImageInfo& info, GPUVAddr gpu_addr) const;
+
+    /// Notes the bound targets the current clear writes whole as loaded at their clear's tick
+    void NoteClearedWhole();
+
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);
 
@@ -672,6 +717,133 @@ private:
     /// pages starts without an upload: the upload would only copy stale bytes the GPU overwrites.
     /// Switch 2 titles only: the buffer cache feeds Nx2MayBeGpuWritten for them alone.
     void MarkStale(const ImageBase& image);
+    /// Device byte ranges [begin, end) of a write-back that newer data owns.
+    using KeepRanges = boost::container::small_vector<std::pair<DAddr, DAddr>, 4>;
+    /// Fills `keep` with the image's bytes that newer write-backs (or newer images dropped
+    /// without one) cover, and `keep_ticks` (when given) with the modification tick of each;
+    /// true when they cover all of it.
+    [[nodiscard]] bool OverlapHasNewerData(ImageId image_id, const ImageBase& image,
+                                           KeepRanges& keep,
+                                           WritebackRanges::TickedRanges* keep_ticks = nullptr);
+    /// SwizzleImage of the `size` bytes at gpu_addr through `memory`, inside a
+    /// VideoCore::DownloadLanding, that leaves as they are the `keep` ranges of guest memory and
+    /// the guest CPU writes collected and not yet applied: it writes none of their bytes.
+    void SwizzleKeeping(Tegra::MemoryManager& memory, GPUVAddr gpu_addr, u64 size,
+                        const ImageInfo& info, std::span<const BufferImageCopy> copies,
+                        std::span<const u8> data, const KeepRanges& keep);
+    PendingCpuWrites pending_cpu_writes;
+    Common::ScratchBuffer<u8> swizzle_keep_buffer;
+    std::vector<std::pair<u64, u64>> swizzle_keep_written;
+    void NoteOverlapWriteback(const ImageBase& image, bool lost = false);
+    /// The same for the image's contents at modification tick `tick`, written to all of its
+    /// guest memory but the `keep` ranges: those hold other data, whose records stay. Returns
+    /// the write-back's id (WritebackRange::id).
+    u64 NoteOverlapWriteback(const ImageBase& image, bool lost, u64 tick,
+                             const KeepRanges& keep = {});
+    /// A noted write-back over [cpu_addr, cpu_addr + size) that was cancelled before it landed:
+    /// its range stays newer than older images, but its data is gone (like an image dropped
+    /// without one).
+    void NoteWritebackLost(DAddr cpu_addr, u64 size, u64 id);
+    /// Whether the image's guest memory is the one range at its cpu_addr, which write-backs
+    /// track, keep and note: not sparse, and not a stand-in address for GPU memory without CPU
+    /// backing (ImageCpuAddress; TrackImage skips those the same way).
+    [[nodiscard]] static bool HasGuestRange(const ImageBase& image) noexcept {
+        return False(image.flags & ImageFlagBits::Sparse) && image.cpu_addr < ~(1ULL << 40);
+    }
+    [[nodiscard]] bool WrittenBackAlready(const ImageBase& image) const;
+    /// Calls func(begin, end) for each range of guest memory the image's data is written to: the
+    /// one range at cpu_addr, a sparse image's mapped segments, none for a stand-in address.
+    template <typename Func>
+    void ForEachWrittenRange(const ImageBase& image, Func&& func);
+    /// WritebackRanges::KeepNewerBytes for every write-back waiting for the GPU and every range
+    /// `image` was written to, after it was written to guest memory.
+    void KeepInWaitingWritebacks(const ImageBase& image, u64 tick);
+    /// After a flush wrote `image` to guest memory: write-backs still waiting keep its bytes, and
+    /// later ones see it as newer data (NoteOverlapWriteback), while write-backs are on.
+    void NoteFlushed(const ImageBase& image);
+    /// NoteFlushed for contents staged at modification tick `tick` (asynchronous flushes: the
+    /// image may have been written again since).
+    void NoteFlushed(const ImageBase& image, u64 tick);
+    /// Fills `keep` with the bytes of the image's guest memory that landed write-backs and
+    /// flushes with contents newer than `tick` hold (an asynchronous flush's snapshot leaves them).
+    void KeepNewerLanded(const ImageBase& image, u64 tick, KeepRanges& keep);
+    /// Whether this backend supports the title's overlap write-backs.
+    [[nodiscard]] static bool OverlapWritebacksEnabled();
+    u64 join_writeback_reuses{};
+    void WriteBackBadOverlaps(ImageId new_image_id);
+    /// Collector write-backs waiting for the GPU: written to guest
+    /// memory once their command buffer is done, except bytes the guest writes first; dropped if
+    /// the memory is unmapped first. Their pages stay write-tracked meanwhile.
+    struct AsyncOverlapDownload {
+        u64 gpu_tick;
+        GPUVAddr gpu_addr;
+        DAddr cpu_addr;
+        u64 size;
+        ImageInfo info;
+        boost::container::small_vector<BufferImageCopy, 16> copies;
+        decltype(std::declval<Runtime&>().DownloadStagingBuffer(size_t{}, true)) map;
+        bool cancelled;
+        KeepRanges keep{};
+        /// The modification tick of the data each kept range holds instead (newer images', or
+        /// past the cache's tick for the guest's writes).
+        WritebackRanges::TickedRanges keep_ticks{};
+        /// Modification tick of the written-back image's contents.
+        u64 tick{};
+        /// The image's address space: gpu_addr is in it, whichever channel is bound on landing.
+        size_t address_space{};
+        /// NoteOverlapWriteback's id for it.
+        u64 writeback_id{};
+    };
+    std::deque<AsyncOverlapDownload> async_overlap_downloads;
+    /// The GPU memory of an address space the cache has seen, or null.
+    [[nodiscard]] Tegra::MemoryManager* AddressSpaceMemory(size_t as_id);
+    void FinishAsyncOverlapDownloads(bool wait_all);
+    /// After a write-back of [cpu_addr, cpu_addr + size) at modification tick `tick` landed,
+    /// waiting or not: images over it the GPU did not write, with contents no newer, load it again.
+    void ReloadUnderLanded(DAddr cpu_addr, u64 size, u64 tick);
+    /// Whether a write-back still waiting covers the image and would reload it when it lands
+    /// (the image has not been GPU-written since that write-back's contents).
+    [[nodiscard]] bool WritebackWouldReload(const ImageBase& image);
+    /// Whether a write-back still waiting writes to [cpu_addr, cpu_addr + size): its GPU data
+    /// is not in guest memory yet.
+    [[nodiscard]] bool WritebackPendingOver(DAddr cpu_addr, u64 size) const;
+    void CancelAsyncOverlapDownloads(DAddr cpu_addr, u64 size);
+    /// The guest wrote [cpu_addr, cpu_addr + size): waiting write-backs keep those bytes (they
+    /// are newer) and still land the rest; one written all over is cancelled.
+    void KeepGuestWrite(DAddr cpu_addr, u64 size);
+    void CancelAsyncOverlapDownloadsGpu(size_t as_id, GPUVAddr gpu_addr, u64 size);
+    u64 async_overlap_cancels{};
+    u64 join_writebacks{};
+    u64 join_writeback_images{};
+    static constexpr u32 OverlapPageBits = 12;
+    /// Per 4 KiB device page: the newest modification tick of a dropped GPU-written overlapping
+    /// image over it (written back or lost), so older ones are not written back over it.
+    std::unordered_map<DAddr, u64> overlap_writeback_ticks;
+    /// The same write-backs by byte range, per page they touch (a few each, CapPageRecords):
+    /// small targets share pages, and a page-wide skip dropped a neighbour's data with them
+    /// (black UI boxes).
+    struct WritebackRange {
+        DAddr begin;
+        DAddr end;
+        u64 tick;
+        bool lost; ///< An image dropped without a write-back: newer, but its data is gone
+        /// The whole image range the write-back is of: [begin, end) is the part of it that holds
+        /// its data.
+        DAddr source_begin;
+        DAddr source_end;
+        /// The write-back's own, which no other has: a waiting or cancelled one is found by it.
+        u64 id;
+    };
+    u64 next_writeback_id{};
+    /// Whether OverlapHasNewerData's last call found a lost image's range among the cover.
+    bool last_cover_lost{};
+    std::unordered_map<DAddr, boost::container::small_vector<WritebackRange, 4>>
+        overlap_writeback_ranges;
+    u64 overlap_partial_keeps{};
+    u64 overlap_download_skips{};
+    u64 overlap_download_batches{};  ///< GC overlap downloads (EDEN_DKB_FRAME_TRACE summary)
+    u64 overlap_download_images{};
+    u64 overlap_download_bytes{};
     void ClearStale(DAddr addr, size_t size);
     void ClearStaleImage(const ImageBase& image);
     /// Clears every device range [gpu_addr, gpu_addr + size) maps to.
@@ -691,6 +863,8 @@ private:
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;
     bool is_rescaling = false;
+    /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
+    bool depth_target_padded = false;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;
@@ -760,6 +934,11 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+    /// What the last CPU upload spent reading guest memory and untiling it, for EDEN_NX2_TC_TRACE.
+    struct {
+        double read_ms{};
+        double untile_ms{};
+    } upload_trace;
     Tegra::Texture::UnswizzleWorker unswizzle_worker;
 
     u64 modification_tick = 0;

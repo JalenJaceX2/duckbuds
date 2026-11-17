@@ -38,7 +38,8 @@ public:
         return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
     }
     bool IsTexturePixelFormatInteger(u32 handle) override {
-        REQUIRE(handle == expected_handle);
+        // ~0U: any handle (a test with several textures).
+        REQUIRE((expected_handle == ~0U || handle == expected_handle));
         ++format_reads;
         return integer_texture;
     }
@@ -366,6 +367,40 @@ TEST_CASE("Texture arrays a cap cut to one element still count as arrays",
     // A stage reading its textures on their own is left as the guest has it.
     info.texture_descriptors.front().is_descriptor_array = false;
     CHECK_NOTHROW(Shader::Optimization::LimitSampledTextureArrays(shader.program, host));
+}
+
+TEST_CASE("A texture array indexed by a found bit has 32 elements",
+          "[video_core][texture_handles]") {
+    for (const bool shift : {false, true}) {
+        CAPTURE(shift);
+        HandleProgram shader;
+        shader.env.cbuf_values = {{{14, 0x300}, 0xabc}};
+        const Value msb{shader.Emit(Opcode::FindUMsb32, {shader.Storage(0)})};
+        const Value index{
+            shift ? shader.Emit(Opcode::SelectU32,
+                                {shader.Emit(Opcode::IEqual, {msb, Value{~0U}}), msb,
+                                 shader.Emit(Opcode::BitwiseXor32, {msb, Value{31U}})})
+                  : msb};
+        const Value offset{shader.Emit(Opcode::ShiftLeftLogical32, {index, Value{3U}})};
+        auto& sample{shader.Sample(
+            shader.Emit(Opcode::GetCbufU32, {Value{14U}, shader.Add(offset, Value{0x300U})}))};
+        shader.Run();
+        const auto& descriptor = shader.Descriptor(sample);
+        CHECK(descriptor.handle_program == ~0U);
+        CHECK(descriptor.count == 32);
+        CHECK(descriptor.size_shift == 3);
+        CHECK(descriptor.cbuf_index == 14);
+        CHECK(descriptor.cbuf_offset == 0x300);
+        REQUIRE(sample.Arg(0).InstRecursive()->GetOpcode() == Opcode::UMin32);
+        CHECK(sample.Arg(0).InstRecursive()->Arg(1).U32() == 31);
+    }
+    HandleProgram shader;
+    shader.env.cbuf_values = {{{14, 0x300}, 0xabc}};
+    const Value offset{shader.Emit(Opcode::ShiftLeftLogical32, {shader.Storage(0), Value{3U}})};
+    auto& sample{shader.Sample(
+        shader.Emit(Opcode::GetCbufU32, {Value{14U}, shader.Add(offset, Value{0x300U})}))};
+    shader.Run();
+    CHECK(shader.Descriptor(sample).count > 32);
 }
 
 TEST_CASE("Texture descriptors a cap makes equal share one binding",
@@ -975,6 +1010,29 @@ TEST_CASE("A texture handle word that holds a storage buffer address is not a ha
     desc.cbuf_index = 0;
     desc.handle_program = 0; // computed for each draw: a real handle
     CHECK_FALSE(VideoCommon::HandleIsStoragePointer(info, desc, 0));
+}
+
+TEST_CASE("Each word of a 64-bit constant buffer read binds its own texture",
+          "[video_core][texture_handles]") {
+    // ULDC.64 UR10, c[0][0x298]; UMOV UR4, UR11: The Duskbloods' DLSS prepass samples the second
+    // word, which used to be bound from the first.
+    HandleProgram shader;
+    shader.env.cbuf_values = {{{0, 0x298}, 0x20020b}, {{0, 0x29c}, 0x20034a}};
+    shader.env.expected_handle = ~0U;
+    const Value pair{shader.Emit(Opcode::GetCbufU32x2, {Value{0U}, Value{0x298U}})};
+    const Value low{shader.Emit(Opcode::CompositeExtractU32x2, {pair, Value{0U}})};
+    const Value high{shader.Emit(Opcode::CompositeExtractU32x2, {pair, Value{1U}})};
+    auto& first{shader.Sample(shader.Emit(Opcode::Identity, {low}))};
+    auto& second{shader.Sample(shader.Emit(Opcode::Identity, {high}))};
+    shader.Run();
+
+    REQUIRE(shader.program.info.texture_descriptors.size() == 2);
+    CHECK(shader.Descriptor(first).cbuf_index == 0);
+    CHECK(shader.Descriptor(first).cbuf_offset == 0x298);
+    CHECK(shader.Descriptor(second).cbuf_index == 0);
+    CHECK(shader.Descriptor(second).cbuf_offset == 0x29c);
+    CHECK(shader.Descriptor(first).handle_program == ~0U);
+    CHECK(shader.Descriptor(second).handle_program == ~0U);
 }
 
 TEST_CASE("A handle word the translation saw dereferenced is not a handle without a storage buffer",
