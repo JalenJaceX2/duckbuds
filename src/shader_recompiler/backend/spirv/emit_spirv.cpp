@@ -419,6 +419,18 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
             LOG_DEBUG(Shader_SPIRV, "Fp32 denorm preserve used in shader without host support");
         }
     }
+    if (ctx.native_half_rounding) {
+        // The software matrix functions convert to fp16 natively (emit_spirv_tensor.cpp).
+        ctx.AddCapability(spv::Capability::DenormPreserve);
+        ctx.AddCapability(spv::Capability::RoundingModeRTE);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 16U);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTE, 16U);
+        if (!profile.support_separate_denorm_behavior || !profile.support_separate_rounding_mode) {
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 64U);
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTE, 64U);
+        }
+        return;
+    }
     if (!profile.support_separate_denorm_behavior || profile.has_broken_fp16_float_controls) {
         // No separate denorm behavior
         return;
@@ -444,20 +456,27 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
 
 void SetupSignedNanCapabilities(const Profile& profile, const IR::Program& program,
                                 EmitContext& ctx, Id main_func) {
-    if (profile.has_broken_fp16_float_controls && program.info.uses_fp16) {
+    // Drivers with broken fp16 float controls (NVIDIA) get no mode in programs that use fp16
+    // (ff35ef8ec1, Fire Emblem: Three Houses). Native (Switch 2) programs still get the fp32 and
+    // fp64 ones there: without the fp32 mode the driver may fold clamps such as
+    // min(max(1/x, -FLT_MAX), FLT_MAX) away, so 0 * (1/0) gives NaN where the console gives 0
+    // (black and NaN-spread blocks in The Duskbloods).
+    const bool broken_fp16 = profile.has_broken_fp16_float_controls && program.info.uses_fp16;
+    if (broken_fp16 && !program.is_native) {
         return;
     }
-    if (program.info.uses_fp16 && profile.support_fp16_signed_zero_nan_preserve) {
+    const auto preserve = [&](u32 width) {
         ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 16U);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, width);
+    };
+    if (program.info.uses_fp16 && profile.support_fp16_signed_zero_nan_preserve && !broken_fp16) {
+        preserve(16U);
     }
     if (profile.support_fp32_signed_zero_nan_preserve) {
-        ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 32U);
+        preserve(32U);
     }
     if (program.info.uses_fp64 && profile.support_fp64_signed_zero_nan_preserve) {
-        ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 64U);
+        preserve(64U);
     }
 }
 
@@ -656,7 +675,9 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
     const std::optional<u32> tensor_scratch_word{ReserveCooperativeHmmaScratch(profile, program)};
-    EmitContext ctx{profile, runtime_info, program, bindings};
+    const bool cooperative_hmma{tensor_scratch_word.has_value() ||
+                                UsesCooperativeHmma(profile, program)};
+    EmitContext ctx{profile, runtime_info, program, bindings, cooperative_hmma};
     ctx.tensor_scratch_word = tensor_scratch_word;
     DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};
