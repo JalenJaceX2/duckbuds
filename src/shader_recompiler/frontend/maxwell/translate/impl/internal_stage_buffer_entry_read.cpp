@@ -146,7 +146,15 @@ void TranslatorVisitor::ISBE_nx2(u64 insn) {
     }
     const IR::U32 address{ir.IAdd(X(isbe.address_reg), ir.Imm32(static_cast<u32>(isbe.offset)))};
     if (isbe.write == 0) {
-        X(isbe.reg, isbe.output != 0 ? ir.IsbeReadOutput(address) : ir.IsbeRead(address));
+        if (isbe.output != 0) {
+            // Task programs read back the payload words they wrote.
+            if (stage != Stage::Task || isbe.attribute == 0 || isbe.is_32 == 0) {
+                throw NotImplementedException("Stage buffer output read mode");
+            }
+            X(isbe.reg, ir.IsbeReadOutput(address));
+            return;
+        }
+        X(isbe.reg, ir.IsbeRead(address));
         return;
     }
     const IR::U32 value{X(isbe.reg)};
