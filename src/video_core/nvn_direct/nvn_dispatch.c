@@ -48,6 +48,9 @@ void nvn_direct_unmap_view(void* view, uint64_t size) { g_memory.unmap_view(g_me
 int nvn_direct_track_pages(uint64_t address, uint64_t size, int armed) {
     return g_memory.track_pages ? g_memory.track_pages(g_memory.context, address, size, armed) : 1;
 }
+int nvn_direct_native_image(uint64_t handle, uint64_t* address, uint64_t* size) {
+    return g_memory.native_image ? g_memory.native_image(g_memory.context, handle, address, size) : 0;
+}
 int nvn_direct_backing_file(uint64_t address, uint64_t* offset) {
     if (g_memory.backing_fd < 0 || !g_memory.backing) return -1;
     const uint8_t* const backing = g_memory.backing(g_memory.context, address);

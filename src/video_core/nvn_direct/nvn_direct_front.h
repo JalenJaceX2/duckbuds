@@ -28,6 +28,8 @@ int nvn_direct_track_pages(uint64_t address, uint64_t size, int armed);
 /// backing_fd) and the page's offset in it (*offset); -1 when there is no file or the guest has
 /// not mapped the page.
 int nvn_direct_backing_file(uint64_t address, uint64_t* offset);
+/// nvn_direct_memory's native_image: the guest range of a Switch 2 native image handle.
+int nvn_direct_native_image(uint64_t handle, uint64_t* address, uint64_t* size);
 /// Maps the guest memory at host (an arena pointer) at to, for size bytes (both page aligned),
 /// replacing what was mapped there: the same pages, read-write, as a virtual pool's range maps
 /// its physical pool's. Pages with no guest memory behind them are made inaccessible. Returns

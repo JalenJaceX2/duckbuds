@@ -34,6 +34,7 @@
 #include "core/nvn_direct_choice.h"
 #include "core/nvn_hook.h"
 #include "core/hle/service/nx2_image_layout.h"
+#include "core/hle/service/nx2_native_image_lookup.h"
 #include "core/hle/service/nx2_present.h"
 #include "video_core/framebuffer_config.h"
 #include "dynarmic/interface/A64/a64.h"
@@ -408,6 +409,22 @@ void* Backing(void* context, u64 address) {
     return state.process->GetMemory().GetPointerSilent(address);
 }
 
+/// nvn_direct_memory's native_image: nx2:gsv's images.
+int NativeImage(void*, u64 handle, u64* address, u64* size) {
+    auto& lookup = Service::g_nx2_native_image_lookup;
+    std::scoped_lock lock{lookup.mutex};
+    if (!lookup.range || handle > UINT32_MAX) {
+        return 0;
+    }
+    const auto range = lookup.range(static_cast<u32>(handle));
+    if (!range) {
+        return 0;
+    }
+    *address = range->first;
+    *size = range->second;
+    return 1;
+}
+
 #ifdef _WIN32
 /// nvn_direct_memory's alias calls: HostMemory's alias regions.
 void* AliasReserve(void* context, u64 size) {
@@ -454,6 +471,7 @@ bool DirectEntry(State& state, u64 pc, Dynarmic::A64::Jit& jit, Core::Memory::Me
                                           .unmap_view = UnmapPoolView,
                                           .track_pages = TrackPages,
                                           .backing = Backing,
+                                          .native_image = NativeImage,
                                           .context = &state,
                                           .backing_fd = state.host_memory->BackingFd(),
                                           .backing_base = state.host_memory->BackingBasePointer(),

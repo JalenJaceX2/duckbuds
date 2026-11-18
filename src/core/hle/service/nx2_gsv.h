@@ -86,6 +86,7 @@
 #include "core/hle/service/nx2_frame_interval.h"
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_movie_clock.h"
+#include "core/hle/service/nx2_native_image_lookup.h"
 #include "core/hle/service/nx2_video_input_queue.h"
 #include "core/hle/service/nx2_present.h"
 #include "core/hle/service/nx2_present_pacer.h"
@@ -1781,6 +1782,25 @@ struct Nx2NativeObjects {
         std::scoped_lock lk{mutex};
         const auto image = images.find(id);
         return image != images.end() ? image->second.decoder_mutex : nullptr;
+    }
+
+    /// The guest address and size of native image handle (image i of a pool is its id + i), once
+    /// its memory is bound.
+    std::optional<std::pair<u64, u64>> ImageRange(u32 handle) {
+        std::scoped_lock lk{mutex};
+        auto it = images.upper_bound(handle);
+        if (it == images.begin()) {
+            return std::nullopt;
+        }
+        --it;
+        const Image& image = it->second;
+        const auto memory = memories.find(image.memory);
+        if (handle - it->first >= image.count || memory == memories.end() ||
+            memory->second.address == 0) {
+            return std::nullopt;
+        }
+        return std::pair{memory->second.address + image.offset + (handle - it->first) * image.size,
+                         image.size};
     }
 };
 
@@ -4131,9 +4151,21 @@ public:
             {1612, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool1612"},
             {1691, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize1691"},
         });
+        std::scoped_lock lk{g_nx2_native_image_lookup.mutex};
+        g_nx2_native_image_lookup.owner = this;
+        g_nx2_native_image_lookup.range = [objects = m_objects](u32 handle) {
+            return objects->ImageRange(handle);
+        };
     }
 
     ~INx2GraphicsSystemSession() override {
+        {
+            std::scoped_lock lk{g_nx2_native_image_lookup.mutex};
+            if (g_nx2_native_image_lookup.owner == this) {
+                g_nx2_native_image_lookup.owner = nullptr;
+                g_nx2_native_image_lookup.range = nullptr;
+            }
+        }
         if (m_syncpt_memory != nullptr) {
             system.Host1x().GetSyncpointManager().SetGuestMirror({});
         }

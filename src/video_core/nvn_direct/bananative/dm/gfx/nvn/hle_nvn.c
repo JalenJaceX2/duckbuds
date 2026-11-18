@@ -336,6 +336,15 @@ NVN(nvnMemoryPoolBuilderSetDefaults, void, NVNmemoryPoolBuilder *b) { memset(b, 
 NVN(nvnMemoryPoolBuilderSetDevice, void, NVNmemoryPoolBuilder *b, NVNdevice *d) { ((pool_builder_t *)b)->dev = d; }
 NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size_t n) { ((pool_builder_t *)b)->mem = m; ((pool_builder_t *)b)->size = n; }
 NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
+// Lichii: a pool over a Switch 2 native image (Mario Kart World: GameChat's camera images, nx2:gsv 1211, each handle queried with gsv 428 first). The builder gets no storage, size or
+// flags: the pool is the image's guest memory, as SetStorage would give it, CPU-uncached and GPU-cached unless flags were set.
+NVN_NOPROTO(nvnMemoryPoolBuilderSetNativeHandleNVX, void, NVNmemoryPoolBuilder *b, uint64_t handle) {
+    pool_builder_t *s = (pool_builder_t *)b; uint64_t address = 0, size = 0;
+    if (!nvn_direct_native_image(handle, &address, &size)) { LOG("[RED] MemoryPoolBuilderSetNativeHandleNVX: native image %#llx is unknown or has no memory", (unsigned long long)handle); return; }
+    s->mem = (void *)(uintptr_t)nvn_direct_host_of(address); s->size = size;
+    if (!s->flags) s->flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+    LOG("MemoryPoolBuilderSetNativeHandleNVX: native image %llu at %#llx+%#llx", (unsigned long long)handle, (unsigned long long)address, (unsigned long long)size);
+}
 static uint8_t *vpool_reserve(pool_t *o); static void vpool_release(pool_t *o);   // sparse virtual pools, see MapVirtual
 // Live pools, for threads that read a texture's pool after the game's call returned (the Vulkan replay). A registered texture keeps its pool's pointer, a guest address: the game
 // may finalize the pool and unmap the memory holding the pool object (and the texture's storage) while the texture ID is still registered and not yet written by the replay

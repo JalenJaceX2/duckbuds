@@ -247,6 +247,9 @@ typedef struct nvn_direct_memory {
     /// The backing memory of the guest page at address (never write-protected), NULL when the
     /// guest has not mapped it.
     void* (*backing)(void* context, uint64_t address);
+    /// The guest range [*address, *address + *size) of a Switch 2 native image handle (nx2:gsv's
+    /// images, as gsv 428 answers it); 0 when the handle names no image with bound memory.
+    int (*native_image)(void* context, uint64_t handle, uint64_t* address, uint64_t* size);
     void* context;
     /// The file behind the backing memory (Lichii's memfd), -1 when there is none, and the
     /// backing view's base: the backing byte at p is the file's byte p - backing_base. Pools are
