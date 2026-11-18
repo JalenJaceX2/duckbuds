@@ -47,13 +47,16 @@ __attribute__((constructor)) static void keep_initial_data(void) {
     if (g_initial_data) memcpy(g_initial_data, DATA_BEGIN, size);
 }
 
-void nvn_direct_reset(void) {
-    if (!g_initial_data) return;
+int nvn_direct_reset(void) {
+    // A compiler that ignores "#pragma clang section" (GCC) leaves the sections empty: nothing can
+    // be reset, and the next boot in the process falls back (Core::NvnHook, RendererChoice::NotReset)
+    if (!g_initial_data || (DATA_END == DATA_BEGIN && BSS_END == BSS_BEGIN)) return 0;
     if (!nvn_direct_threads_left()) {
         VRED("a thread of the replay did not leave: its state is not reset");
-        return;
+        return 0;
     }
     memcpy(DATA_BEGIN, g_initial_data, (size_t)(DATA_END - DATA_BEGIN));
     memset(BSS_BEGIN, 0, (size_t)(BSS_END - BSS_BEGIN));
     g_t0_ns = now_ns(); // (the game's clock: nvnDeviceGetCurrentTimestampInNanoseconds)
+    return 1;
 }

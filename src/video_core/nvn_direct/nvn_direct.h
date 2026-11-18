@@ -306,8 +306,10 @@ void nvn_direct_park(void);
 void nvn_direct_destroy(void);
 
 /// The boot is over (its game and device are gone): every static variable of the front end and
-/// the replay returns to its initial value, for the next boot (nvn_reset.c).
-void nvn_direct_reset(void);
+/// the replay returns to its initial value, for the next boot (nvn_reset.c). 0 when it could not
+/// (a build whose compiler keeps no sections for them, or a thread that did not leave): the next
+/// boot must not use the direct renderer.
+int nvn_direct_reset(void);
 
 /// nvnDeviceGetInteger's answer for item, as the game's own driver gave it.
 void nvn_direct_set_device_integer(unsigned item, int value);
