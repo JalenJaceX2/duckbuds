@@ -934,7 +934,7 @@ static void astc_zero_blocks(uint8_t *p, size_t n) {   // the zeros of unmapped 
 }
 // Zero texels without staging: a buffer of zero blocks (first half) and of ASTC's zero blocks (second half), the source of every unmapped part of a sparse texture
 enum { ZHALF = 2 << 20 };
-static VkBuffer g_zbuf; static int g_zstate;   // 0 not tried, 1 made, -1 failed
+static VkBuffer g_zbuf; static VkDeviceMemory g_zmem; static int g_zstate;   // 0 not tried, 1 made, -1 failed (Lichii: g_zmem kept for the teardown)
 static int zero_src(void) {
     if (g_zstate) return g_zstate > 0;
     g_zstate = -1;
@@ -949,7 +949,7 @@ static int zero_src(void) {
     memset(p, 0, ZHALF);
     for (size_t k = 0; k < ZHALF; k += 16) memcpy((uint8_t *)p + ZHALF + k, k_astc_zero, 16);
     vk.vkUnmapMemory(V.dev, m);
-    g_zbuf = b; g_zstate = 1; return 1;
+    g_zbuf = b; g_zmem = m; g_zstate = 1; return 1;
 }
 // Block rows [y0, y1) of image level i, layer ly (w x h texels, bx blocks a row, pitch bytes a row) as zero texels from the zero buffer: 0 = not done (no buffer, or a row wider
 // than it), the caller zeroes them through scratch memory
@@ -1553,11 +1553,13 @@ static void up_run(void) {   // take parts until none is left
         if (atomic_fetch_add(&UP.done, 1) + 1 == n) { pthread_mutex_lock(&UP.mu); pthread_cond_broadcast(&UP.done_cv); pthread_mutex_unlock(&UP.mu); }
     }
 }
+static void up_wake(void) { pthread_mutex_lock(&UP.mu); pthread_cond_broadcast(&UP.cv); pthread_mutex_unlock(&UP.mu); }   // Lichii: the shutdown (vka_thread)
 static void *up_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-upload");
     uint64_t seen = 0;
     for (;;) {
-        pthread_mutex_lock(&UP.mu); while (UP.gen == seen) pthread_cond_wait(&UP.cv, &UP.mu); seen = UP.gen; pthread_mutex_unlock(&UP.mu);
+        pthread_mutex_lock(&UP.mu); while (UP.gen == seen && !vka_leaving()) pthread_cond_wait(&UP.cv, &UP.mu); seen = UP.gen; pthread_mutex_unlock(&UP.mu);
+        if (vka_leaving()) break;   // Lichii: the shutdown
         up_run();
     }
     return NULL;
@@ -1567,7 +1569,7 @@ static int up_parallel(up_part *p, uint32_t n, int *fail) {
     int want = VKA_ENV("DM_VK_UPLOAD_MT", 3); if (want <= 0 || n < 2) return 0;
     if (want > 6) want = 6;
     if (pthread_mutex_trylock(&g_up_one)) return 0;
-    while (UP.nth < want) { pthread_t th; if (pthread_create(&th, NULL, up_main, NULL)) break; pthread_detach(th); UP.nth++; }
+    while (UP.nth < want) { if (vka_thread(up_main, NULL, up_wake)) break; UP.nth++; }
     if (!UP.nth) { pthread_mutex_unlock(&g_up_one); return 0; }
     pthread_mutex_lock(&UP.mu);
     atomic_store(&UP.fail, 0); atomic_store(&UP.done, 0); atomic_store(&UP.p, p); atomic_store(&UP.next, 0); atomic_store(&UP.n, n); UP.gen++;
@@ -2378,12 +2380,12 @@ VkSampler vka_samp_id(int id) {
     pthread_mutex_unlock(&g_tmu);
     return s;
 }
+static VkSampler g_samp_default;   // (Lichii: at file scope for the teardown)
 VkSampler vka_samp_default(void) {
-    static VkSampler s;
-    if (!s) { VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    if (!g_samp_default) { VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
                                          .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0.25f};
-              vk.vkCreateSampler(V.dev, &ci, NULL, &s); }
-    return s;
+              vk.vkCreateSampler(V.dev, &ci, NULL, &g_samp_default); }
+    return g_samp_default;
 }
 
 // Re-uploads im if the CPU wrote its storage since its last upload, or a sparse one if its mappings or pages changed (vka_tex_prepare; caller holds g_tmu and nvn_pool_use)
@@ -2582,5 +2584,19 @@ vka_img *vka_cap_shared(const tex_t *t) {
     for (int i = 0; i < g_nlive && !im; i++) if (same_shape(g_live[i], t, &f, 0)) { im = g_live[i]; im->refs++; }
     pthread_mutex_unlock(&g_tmu);
     return im;
+}
+
+// Lichii: the teardown (vka_dev.c vka_destroy, after the work deferred to fences ran): every live image with its views and memory, the samplers, the bindless set, the
+// zero texel buffer and the tables
+void vka_tex_destroy(void) {
+    for (int i = 0; i < g_nlive; i++) img_destroy(g_live[i]);
+    for (int i = 0; i < g_nsamp; i++) vk.vkDestroySampler(V.dev, g_samp[i].s, NULL);
+    if (g_samp_default) vk.vkDestroySampler(V.dev, g_samp_default, NULL);
+    if (g_dpool) vk.vkDestroyDescriptorPool(V.dev, g_dpool, NULL);
+    if (g_dsl) vk.vkDestroyDescriptorSetLayout(V.dev, g_dsl, NULL);
+    if (g_zbuf) { vk.vkDestroyBuffer(V.dev, g_zbuf, NULL); vk.vkFreeMemory(V.dev, g_zmem, NULL); }
+    void *tabs[] = {g_map, g_live, g_cpuw, g_idx, g_wide, g_meet, g_vimg, (void *)g_tver, (void *)g_sver, g_gw, g_tdirty, g_tdflag, g_treg, g_acopy, g_wb, g_redo,
+                    g_sreg, g_sdirty, g_sdflag, g_samp, g_sres, g_tlazy, g_tlflag};
+    for (size_t i = 0; i < sizeof tabs / sizeof tabs[0]; i++) free(tabs[i]);
 }
 #endif

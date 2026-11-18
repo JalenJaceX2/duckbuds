@@ -41,6 +41,10 @@ class GPU;
 
 namespace Vulkan {
 
+#ifdef LICHII_NVN_DIRECT
+struct NvnDirectMemory;
+#endif
+
 Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld,
                     VkSurfaceKHR surface);
 
@@ -152,6 +156,7 @@ private:
 #ifdef LICHII_NVN_DIRECT
     std::optional<NvnDirectAstc> nvn_direct_astc; ///< The replay's ASTC decode (NVN2 direct mode).
     std::optional<NvnDirectShaders> nvn_direct_shaders; ///< The replay's shader recompiler.
+    std::unique_ptr<NvnDirectMemory> nvn_direct_memory; ///< The replay's memory figures.
 #endif
 
     Frame applet_frame;

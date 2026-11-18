@@ -200,4 +200,12 @@ void vka_nan_commit(uint64_t fence) {   // the submission's batch is read when f
     if (g_astc_state == 1) { g_astc_state = 2; vka_after(fence, astc_report, NULL); }
     g_bi++; g_b[g_bi % NBATCH].n = 0; g_pass = 0; g_nsplit = 0;
 }
+
+// Lichii: the teardown (vka_dev.c vka_destroy)
+void vka_nan_destroy(void) {
+    VkPipeline p[3] = {g_pipe, g_pipe3, g_fetch};
+    for (int i = 0; i < 3; i++) if (p[i]) vk.vkDestroyPipeline(V.dev, p[i], NULL);
+    if (g_lay) vk.vkDestroyPipelineLayout(V.dev, g_lay, NULL);
+    if (g_dsl) vk.vkDestroyDescriptorSetLayout(V.dev, g_dsl, NULL);
+}
 #endif

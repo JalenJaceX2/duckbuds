@@ -1270,4 +1270,31 @@ uint64_t vka_mem_placed_bytes(uint64_t *peak) { pthread_rwlock_rdlock(&g_rw); ui
 
 // The hook hle_svc.c calls when it gives guest memory back (weak no-op there for the Apple builds; its region and open hooks stay the weak no-ops)
 int dm_gfx_guest_release(uintptr_t lo, uintptr_t hi) { return vka_mem_release(lo, hi); }
+
+// Lichii: the teardown (vka_dev.c vka_destroy): every import and pack, the views of guest memory under them, udmabuf's device
+void vka_mem_destroy(void) {
+    pthread_mutex_lock(&g_pl); pthread_rwlock_wrlock(&g_rw);
+    for (int i = 0; i < g_nsg; i++) {
+        seg_t *s = &g_sg[i];
+        if (!s->mem) continue;   // (an alias: the memory is its physical segment's)
+        if (s->pack) {   // (the pack goes with its last segment)
+            if (!--s->pack->members) { vk.vkDestroyBuffer(V.dev, s->pack->buf, NULL); vk.vkFreeMemory(V.dev, s->pack->mem, NULL); free(s->pack); }
+            continue;
+        }
+        vk.vkDestroyBuffer(V.dev, s->buf, NULL); vk.vkFreeMemory(V.dev, s->mem, NULL);
+        if (s->view) nvn_direct_unmap_view(s->view, s->hi - s->lo);
+    }
+    free(g_sg); g_sg = NULL; g_nsg = 0;
+    pthread_rwlock_unlock(&g_rw); pthread_mutex_unlock(&g_pl);
+    pthread_mutex_lock(&g_pmu);
+    for (int i = 0; i < g_npool; i++) { free(g_pool[i].gmap); free(g_pool[i].segs.lo); }
+    free(g_pool); g_pool = NULL; g_npool = 0;
+    pthread_mutex_unlock(&g_pmu);
+    free(g_pend);
+#if !defined(_WIN32)
+    free(g_ul);
+    if (V.udmabuf) close(V.udmabuf_fd);
+#endif
+    free(t_lc); t_lc = NULL;
+}
 #endif

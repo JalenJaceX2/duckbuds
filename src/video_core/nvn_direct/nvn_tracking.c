@@ -32,7 +32,8 @@
 enum { PAGE_SHIFT = 12 };
 #define PAGE_SIZE (1ull << PAGE_SHIFT)
 
-// A registered pool. Kept (live 0) after it goes: images hold its pointer (nvn_dirty_span).
+// A registered pool. Kept (live 0) after it goes, until the teardown: images hold its pointer
+// (nvn_dirty_span).
 typedef struct {
     uintptr_t lo, hi; // host pointers into the arena
     _Atomic uint64_t* gen; // per page: generation of the last CPU write seen (0: none)
@@ -43,6 +44,8 @@ typedef struct {
 
 static span_t** g_spans; // live spans by lo (under g_mu for changes, g_rw for lookups)
 static int g_nspans, g_capspans;
+static span_t** g_gone; // spans of pools that went (under g_mu)
+static int g_ngone, g_capgone;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t g_rw = PTHREAD_RWLOCK_INITIALIZER;
 static _Atomic uint64_t g_now = 1;
@@ -127,8 +130,28 @@ void nvn_dirty_remove_range(const void* mem) {
     if (s) {
         arm_pages(s, 0, ((s->hi - s->lo - 1) >> PAGE_SHIFT), 0);
         atomic_store(&s->live, 0);
+        if (g_ngone == g_capgone) {
+            const int cap = g_capgone ? 2 * g_capgone : 256;
+            span_t** gone = realloc(g_gone, (size_t)cap * sizeof *g_gone);
+            if (gone) { g_gone = gone; g_capgone = cap; }
+        }
+        if (g_ngone < g_capgone) g_gone[g_ngone++] = s;
     }
     pthread_mutex_unlock(&g_mu);
+}
+
+// The teardown (nvn_direct_destroy, after the replay's images went): every span, live or gone.
+void nvn_tracking_destroy(void) {
+    for (int k = 0; k < 2; k++) {
+        span_t** const spans = k ? g_gone : g_spans;
+        for (int i = 0, n = k ? g_ngone : g_nspans; i < n; i++) {
+            free(spans[i]->gen);
+            free(spans[i]->armed);
+            free(spans[i]->host);
+            free(spans[i]);
+        }
+        free(spans);
+    }
 }
 
 void nvn_direct_host_written(const void* mem, size_t size) {

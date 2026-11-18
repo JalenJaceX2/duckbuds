@@ -229,7 +229,7 @@ void vks_free(vks_img *s) {
     if (!g_npi && !g_npo) { for (uint32_t i = 0; i < g_nrel; i++) slot_give(g_rel[i], g_sval); g_nrel = 0; }   // (unbinds of its own tiles only: no batch would give them back)
     uint64_t last = s->last; VkSemaphore sem = g_stl;
     pthread_mutex_unlock(&g_ks);
-    if (last && sem && !vka_hung()) {
+    if (last && sem && !vka_hung() && !vka_stopping()) {   // (Lichii: after the stop a batch may never go to the queue; the teardown runs with the device idle)
         VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &sem, .pValues = &last};
         if (vk.vkWaitSemaphores(V.dev, &wi, vka_hang_ns())) VRED("sparse image: bind batch %llu not done in %.1f s: its slots are given back anyway", (unsigned long long)last, vka_hang_ns() / 1e9);
     }
@@ -316,4 +316,11 @@ void vks_stats(char *o, size_t n) {
     pthread_mutex_unlock(&g_ks);
 }
 uint64_t vks_bytes_nolock(void) { return g_bytes; }
+
+// Lichii: the teardown (vka_dev.c vka_destroy, after every image went): the tile blocks, the timeline and the tables
+void vks_destroy(void) {
+    for (uint32_t i = 0; i < g_ntb; i++) if (g_tb[i]) { vk.vkFreeMemory(V.dev, g_tb[i]->dm, NULL); free(g_tb[i]); }
+    if (g_stl) vk.vkDestroySemaphore(V.dev, g_stl, NULL);
+    free(g_tb); free(g_pi); free(g_po); free(g_rel);
+}
 #endif

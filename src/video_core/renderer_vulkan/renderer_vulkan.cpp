@@ -179,6 +179,19 @@ public:
 /// never held the cap. Read at most every 250 ms (an NVML process query takes about a millisecond).
 class NvmlProcessMemory {
 public:
+    NvmlProcessMemory(const NvmlProcessMemory&) = delete;
+    NvmlProcessMemory& operator=(const NvmlProcessMemory&) = delete;
+    ~NvmlProcessMemory() {
+        if (nvml_initialized) {
+            if (const auto shutdown = reinterpret_cast<int (*)()>(dlsym(library, "nvmlShutdown"))) {
+                shutdown();
+            }
+        }
+        if (library != nullptr) {
+            dlclose(library);
+        }
+    }
+
     explicit NvmlProcessMemory(const Device& device) {
         library = dlopen("libnvidia-ml.so.1", RTLD_NOW | RTLD_LOCAL);
         if (library == nullptr) { // (NixOS keeps the driver's libraries here)
@@ -196,8 +209,8 @@ public:
         processes = reinterpret_cast<int (*)(void*, unsigned*, ProcessInfo*)>(
             load("nvmlDeviceGetGraphicsRunningProcesses_v3"));
         unsigned devices = 0;
-        if (!init || !count || !by_index || !uuid_of || !processes || init() != 0 ||
-            count(&devices) != 0) {
+        nvml_initialized = init && count && by_index && uuid_of && processes && init() == 0;
+        if (!nvml_initialized || count(&devices) != 0) {
             processes = nullptr;
             return;
         }
@@ -258,6 +271,7 @@ private:
         unsigned gpu_instance, compute_instance;
     };
     void* library{};
+    bool nvml_initialized{};
     void* nvml_device{};
     int (*processes)(void*, unsigned*, ProcessInfo*){};
     std::mutex mutex;
@@ -267,17 +281,22 @@ private:
 
 #endif
 
+} // Anonymous namespace
+
+/// The device memory figures the replay reads (nvn_direct_device.memory_usage / memory_budget).
 struct NvnDirectMemory {
     const Device* device;
     NvmlProcessMemory nvml;
 };
+
+namespace {
 
 /// NVN2 direct mode: the replay runs on this device. Its NVN queues take the
 /// graphics family's queues from 1 on, its own work (uploads, sparse binds) queue 0 with Lichii; every
 /// submission of the replay holds the scheduler's submit lock. Returns whether the replay is up.
 bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const Device& device,
                     Scheduler& scheduler, NvnDirectAstc* astc, NvnDirectShaders& shaders,
-                    VideoCore::ShaderNotify& shader_notify) {
+                    NvnDirectMemory& memory, VideoCore::ShaderNotify& shader_notify) {
     std::vector<const char*> extensions;
     for (const std::string& name : device.GetLoadedExtensions()) {
         extensions.push_back(name.c_str());
@@ -310,7 +329,7 @@ bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const 
         .memory_budget = [](void* context) -> uint64_t {
             return static_cast<NvnDirectMemory*>(context)->device->GetDeviceMemoryBudget();
         },
-        .memory_context = new NvnDirectMemory{&device, NvmlProcessMemory{device}},   // (the replay's, for the process: one launch per process)
+        .memory_context = &memory,
         .pipeline_building = [](void* notify) {
             static_cast<VideoCore::ShaderNotify*>(notify)->MarkShaderBuilding();
         },
@@ -330,10 +349,15 @@ bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const 
         adopted.queues[index] = queues[(index + 1) % queues.size()];
     }
     // The replay keeps its pipeline cache, prewarm list, kept translations and the view formats
-    // it learns in DM_TEMP (Banana Native's cache directory variable): unless it is set, Lichii's
-    // cache directory, one folder per title named as the shader cache's (nvn_direct/<16 hex
-    // digits of the program id>/), never the working directory or HOME, its fallback.
-    if (const char* temp = std::getenv("DM_TEMP"); temp == nullptr || *temp == '\0') {
+    // it learns in DM_TEMP (Banana Native's cache directory variable): unless it was set when the
+    // process started, Lichii's cache directory, one folder per title named as the shader cache's
+    // (nvn_direct/<16 hex digits of the program id>/), set again at each boot, never the working
+    // directory or HOME, its fallback.
+    static const bool temp_given = [] {
+        const char* const temp = std::getenv("DM_TEMP");
+        return temp != nullptr && *temp != '\0';
+    }();
+    if (!temp_given) {
         const u64 title = Core::NvnHook::DirectProgramId();
         auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "nvn_direct";
         if (title != 0) {
@@ -343,7 +367,7 @@ bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const 
 #ifdef _WIN32
             _putenv_s("DM_TEMP", Common::FS::PathToUTF8String(dir).c_str()); // (getenv's environment)
 #else
-            setenv("DM_TEMP", Common::FS::PathToUTF8String(dir).c_str(), 0);
+            setenv("DM_TEMP", Common::FS::PathToUTF8String(dir).c_str(), 1);
 #endif
         }
     }
@@ -486,11 +510,13 @@ try
         }
         const PipelineCache& pipeline_cache = rasterizer.GetPipelineCache();
         nvn_direct_shaders.emplace(device, pipeline_cache.GetProfile(), pipeline_cache.GetHostInfo());
+        nvn_direct_memory.reset(new NvnDirectMemory{&device, NvmlProcessMemory{device}});
         if (!AdoptNvnDirect(dld, *instance, device, scheduler,
                             nvn_direct_astc ? &*nvn_direct_astc : nullptr, *nvn_direct_shaders,
-                            gpu_.ShaderNotify())) {
+                            *nvn_direct_memory, gpu_.ShaderNotify())) {
             // Before the game runs: it falls back to GPU emulation on this device rather than
             // run with nothing to show.
+            nvn_direct_memory.reset();
             nvn_direct_shaders.reset();
             nvn_direct_astc.reset();
             device.EndNvnDirect();
@@ -507,9 +533,11 @@ RendererVulkan::~RendererVulkan() {
     scheduler.RegisterOnSubmit([] {});
 #ifdef LICHII_NVN_DIRECT
     // NVN2 direct mode: the replay's threads leave the device (and the ASTC
-    // decode it calls back into) before both go away.
+    // decode it calls back into) before both go away, and its objects go once the device is idle.
     if (device.IsNvnDirect()) {
         nvn_direct_park();
+        void(device.GetLogical().WaitIdle());
+        nvn_direct_destroy();
     }
 #endif
     void(device.GetLogical().WaitIdle());

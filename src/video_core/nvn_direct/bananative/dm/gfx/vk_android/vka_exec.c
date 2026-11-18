@@ -846,20 +846,21 @@ static void copy_t2t(const p_copy_t2t *c) {
 // Lichii: nvnCommandBufferConvertCooperativeVectorMatrix, on the CPU as the console's driver converts (hle_nvn.c nvn_coopvec_convert), once the GPU has done what the
 // submission recorded before it: the part ends there, signalling a timeline of its own, and the replay waits for that. The parts after it see the CPU's writes (the
 // queue submit makes host writes visible). Without a part left (NCHUNK), or without the GPU, it converts at once
+static VkSemaphore g_coop_sem;   // (Lichii: at file scope for the teardown)
 static void coopvec_convert(const p_coopvec_convert *c) {
-    static VkSemaphore sem; static uint64_t val;
-    if (g_cb && !sem) {
+    static uint64_t val;
+    if (g_cb && !g_coop_sem) {
         VkSemaphoreTypeCreateInfo ti = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
         VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ti};
-        if (vk.vkCreateSemaphore(V.dev, &si, NULL, &sem)) { sem = VK_NULL_HANDLE; VRED_ONCE("cooperative-vector conversion: no timeline semaphore: converted without waiting for the GPU"); }
+        if (vk.vkCreateSemaphore(V.dev, &si, NULL, &g_coop_sem)) { g_coop_sem = VK_NULL_HANDLE; VRED_ONCE("cooperative-vector conversion: no timeline semaphore: converted without waiting for the GPU"); }
     }
-    if (g_cb && sem) {
+    if (g_cb && g_coop_sem) {
         vka_rp_end();
         int signalled = g_psy.ns < PWS;
-        if (signalled) { g_psy.ss[g_psy.ns] = sem; g_psy.sv[g_psy.ns++] = ++val; }
+        if (signalled) { g_psy.ss[g_psy.ns] = g_coop_sem; g_psy.sv[g_psy.ns++] = ++val; }
         if (signalled && chunk()) {
             vka_enc_sync();   // (the part is submitted on the encoder thread when it is on)
-            VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &sem, .pValues = &val};
+            VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_coop_sem, .pValues = &val};
             VkResult r = vk.vkWaitSemaphores(V.dev, &wi, vka_hang_ns());
             if (r) VRED("cooperative-vector conversion: the submission's work before it not done in %.1f s (%d): converted anyway", vka_hang_ns() / 1e9, r);
         } else {
@@ -1190,5 +1191,23 @@ void vka_rp_exec(const uint8_t *handle, uint64_t fence) {
     if (!handle) return;
     walk_t w = {{handle}, 1};
     walk(&w);
+}
+
+// Lichii: the teardown (vka_dev.c vka_destroy, after every thread left): the submissions' command pool (their command buffers with it), the queue events' and the
+// conversion's semaphores, the masked stencil clear's pipelines, the timestamp query pools
+void vka_exec_destroy(void) {
+    if (g_pool) vk.vkDestroyCommandPool(V.dev, g_pool, NULL);
+    for (int i = 0; i < g_nevs; i++) {
+        for (int q = 0; q < NVN_DIRECT_MAX_QUEUES; q++) if (g_evs[i].qs[q]) vk.vkDestroySemaphore(V.dev, g_evs[i].qs[q], NULL);
+        for (int k = 0; k < g_evs[i].ng; k++) vk.vkDestroySemaphore(V.dev, g_evs[i].g[k].sem, NULL);
+    }
+    if (g_coop_sem) vk.vkDestroySemaphore(V.dev, g_coop_sem, NULL);
+    for (int i = 0; i < g_nsmc; i++) vk.vkDestroyPipeline(V.dev, g_smc[i].p, NULL);
+    if (g_smc_lay) vk.vkDestroyPipelineLayout(V.dev, g_smc_lay, NULL);
+    if (g_smc_vs) vk.vkDestroyShaderModule(V.dev, g_smc_vs, NULL);
+    PFN_vkDestroyQueryPool destroy_qp = (PFN_vkDestroyQueryPool)vk.vkGetDeviceProcAddr(V.dev, "vkDestroyQueryPool");
+    if (g_qp) destroy_qp(V.dev, g_qp, NULL);
+    if (g_sqp) destroy_qp(V.dev, g_sqp, NULL);
+    free(g_post); free(g_qt);
 }
 #endif

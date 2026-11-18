@@ -3343,3 +3343,19 @@ static void push_defer(NVNcommandBuffer *c, int compute, uint64_t w, uint64_t of
 }
 NVN_NOPROTO(nvnCommandBufferPushGraphicsConstantsDeferred, void, NVNcommandBuffer *c, uint64_t w, uint64_t off, uint64_t n, NVNbufferAddress src) { push_defer(c, 0, w, off, n, src); }
 NVN_NOPROTO(nvnCommandBufferPushComputeConstantsDeferred, void, NVNcommandBuffer *c, uint64_t w, uint64_t off, uint64_t n, NVNbufferAddress src) { push_defer(c, 1, w, off, n, src); }
+
+// ---------- Lichii: the teardown ----------
+// nvn_direct_destroy, after the replay's (vka_destroy): the virtual pools' address ranges (mappings of guest memory), the host segments of command memory, the tables
+void nvn_hle_destroy(void) {
+    for (int i = 0; i < g_nvp; i++) {
+        struct vpool *v = g_vp[i];
+        munmap(v->base, v->len);
+        for (uint64_t l = 0; l < (v->size + (2u << 20) - 1) >> 21; l++) free(v->pt[l]);
+        free(v->pt); free(v);
+    }
+    free(g_vp);
+    for (int i = 0; i < g_nhostseg; i++) free(g_hostseg[i].mem);
+    free(g_hostseg);
+    for (int i = 0; i < g_npc; i++) { free(g_pc[i].bb); free(g_pc[i].tb); free(g_pc[i].mb); }
+    free(g_pc); free(g_pl); free(g_ft); free(g_fl);
+}

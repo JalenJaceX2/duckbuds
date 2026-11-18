@@ -116,4 +116,14 @@ void vka_dlss_eval(VkCommandBuffer cb, const p_dlss *c) {
     vka_barrier(cb);
 }
 #undef SC
+
+// Lichii: the teardown (vka_dev.c vka_destroy)
+void vka_dlss_destroy(void) {
+    for (int i = 0; i < g_npipe; i++) vk.vkDestroyPipeline(V.dev, g_pipe[i].p, NULL);
+    if (g_lay) vk.vkDestroyPipelineLayout(V.dev, g_lay, NULL);
+    if (g_dsl) vk.vkDestroyDescriptorSetLayout(V.dev, g_dsl, NULL);
+    if (g_vs) vk.vkDestroyShaderModule(V.dev, g_vs, NULL);
+    if (g_fs) vk.vkDestroyShaderModule(V.dev, g_fs, NULL);
+    if (g_samp) vk.vkDestroySampler(V.dev, g_samp, NULL);
+}
 #endif

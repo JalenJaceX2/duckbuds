@@ -7,9 +7,10 @@
 // not in the game's NVN driver and Lichii's Maxwell GPU path. This is the C interface between
 // them and Lichii; the replay's own headers stay out of C++.
 //
-// One launch per process: the front end and the replay keep process-lifetime state (globals,
-// detached threads), so a later game in the same process falls back to Lichii's GPU emulation
-// (Core::NvnHook::Install, RendererChoice::EarlierBoot).
+// One game at a time: a boot starts the front end and the replay (nvn_direct_adopt_device,
+// nvn_direct_init), and the end of the boot takes them down again (nvn_direct_stop,
+// nvn_direct_park, nvn_direct_destroy, nvn_direct_reset), so the next game in the process starts
+// them as the first did.
 
 #pragma once
 
@@ -193,7 +194,7 @@ static inline uint32_t nvn_direct_scale_image_bit(uint32_t nvn_stage) {
 static inline uint32_t nvn_direct_scale_image_bits(uint32_t nvn_stage) { return nvn_stage == 1 || nvn_stage == 5 ? 32 : 16; }
 
 /// Hands Lichii's device to the replay and initialises it (vka_init); returns whether it is up.
-/// Called once, after the device exists. When it fails the boot falls back to GPU emulation
+/// Called once a boot, after the device exists. When it fails the boot falls back to GPU emulation
 /// (Core::NvnHook::DirectFailed).
 int nvn_direct_adopt_device(const nvn_direct_device* device);
 
@@ -225,7 +226,7 @@ typedef struct nvn_direct_memory {
 /// arena the game's addresses are offsets into (host = arena + address for every address below
 /// guest_size), the guest memory's views and the game's NVN: switch2 = NVN2 (else NVN1), sdk_major
 /// the NintendoSDK major its sdk was built with (-1 unknown, 0 a prerelease SDK 0.x; NVN1 reports
-/// other API versions to SDK 10 and older). Called once, when the game's NVN is taken over.
+/// other API versions to SDK 10 and older). Called once a boot, when the game's NVN is taken over.
 void nvn_direct_init(uint8_t* arena, uint64_t guest_size, const nvn_direct_memory* memory,
                      int switch2, int sdk_major);
 
@@ -290,13 +291,25 @@ int nvn_direct_call_blocks(int slot, const uint64_t x[8]);
 
 /// The emulator shuts down, before the guest's cores are suspended: nothing
 /// more is replayed or submitted, every fence reads as done, and the game's threads waiting on the
-/// host inside an NVN call (a fence, the replay worker's queue, a present) return. For the rest of
-/// the process.
+/// host inside an NVN call (a fence, the replay worker's queue, a present) return. Until
+/// nvn_direct_reset.
 void nvn_direct_stop(void);
 
-/// Before Lichii's device goes away (after nvn_direct_stop, which it implies): waits (bounded)
-/// until the replay's threads no longer use the device and saves the pipeline cache a last time.
+/// Before Lichii's device goes away (after nvn_direct_stop, which it implies): saves the pipeline
+/// cache a last time and waits (bounded) until every thread of the replay and the front end has
+/// left; the process exits when one does not.
 void nvn_direct_park(void);
+
+/// After nvn_direct_park, once the device is idle and before it is destroyed: the replay's Vulkan
+/// objects, its imports and views of guest memory and the front end's mappings of it are
+/// destroyed, and a line says whether any object was left.
+void nvn_direct_destroy(void);
+
+/// The boot is over (its game and device are gone): every static variable of the front end and
+/// the replay returns to its initial value, for the next boot (nvn_reset.c). 0 when it could not
+/// (a build whose compiler keeps no sections for them, or a thread that did not leave): the next
+/// boot must not use the direct renderer.
+int nvn_direct_reset(void);
 
 /// nvnDeviceGetInteger's answer for item, as the game's own driver gave it.
 void nvn_direct_set_device_integer(unsigned item, int value);

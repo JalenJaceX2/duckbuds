@@ -68,7 +68,9 @@ void Install(Core::System& system, Kernel::KProcess& process);
 /// in this process that asks for the direct renderer. Logged.
 void DirectFailed();
 
-/// The boot is over (the end of System::ShutdownMainProcess): its hook state goes.
+/// The boot is over (the end of System::ShutdownMainProcess): its hook state goes, and the direct
+/// renderer's front end and replay return to their state before the first boot
+/// (nvn_direct_reset).
 void Uninstall();
 
 /// The renderer Install chose for the current (or last) boot.

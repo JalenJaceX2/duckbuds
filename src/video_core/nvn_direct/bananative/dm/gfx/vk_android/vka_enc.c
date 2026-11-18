@@ -429,6 +429,7 @@ static void *enc_main(void *arg) {
                 if (++i % 64 == 0) { uint64_t n = mono_ns(); if (!t0) t0 = n; else if (n - t0 > 200000) break; }
             }
             if (h == t) {
+                if (vka_leaving()) break;   // Lichii: the shutdown
                 uint32_t s = atomic_load(&g_cseq);   // (an event count, as wait_tail's)
                 atomic_store(&g_csleep, 1);
                 atomic_thread_fence(memory_order_seq_cst);
@@ -459,15 +460,16 @@ void vka_enc_install(void) {   // vka_dev.c, once the device's entry points are 
     static int done; if (done) return; done = 1;
     ENC_FNS(ENC_HOOK)
 }
+static void enc_wake(void) { atomic_fetch_add(&g_cseq, 1); fwake(&g_cseq); }   // Lichii: the shutdown (vka_thread)
 static int up(void) {
     if (g_up) return g_up > 0;
     g_ring = malloc(RING);
-    pthread_t th;
-    if (!g_ring || pthread_create(&th, NULL, enc_main, NULL)) { VRED("cannot start the command encoder thread: the replay thread records directly"); g_up = -1; return 0; }
-    pthread_detach(th); g_up = 1;
+    if (!g_ring || vka_thread(enc_main, NULL, enc_wake)) { VRED("cannot start the command encoder thread: the replay thread records directly"); g_up = -1; return 0; }
+    g_up = 1;
     VLOG("command encoder: the replay thread's Vulkan commands are recorded on a thread of their own (DM_VK_ENC=0: on the replay thread)");
     return 1;
 }
+void vka_enc_destroy(void) { free(g_ring); }   // Lichii: the teardown (vka_dev.c vka_destroy), after the thread left
 void vka_enc_sync(void) {
     flush_pub();
     if (g_ph != atomic_load_explicit(&g_tail, memory_order_acquire)) wait_tail(g_ph);

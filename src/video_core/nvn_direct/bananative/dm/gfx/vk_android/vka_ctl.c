@@ -260,8 +260,7 @@ void vka_ctl_shot_done(VkFence fence) {   // present thread, after the present's
     if (g_rec_shot.path[0]) snprintf(j->path, sizeof j->path, "%s", g_rec_shot.path);
     else { ctl_dir(); snprintf(j->path, sizeof j->path, "%s/ctl-shot-%llu.png", g_ctl_dir, (unsigned long long)j->frame); }
     pthread_mutex_unlock(&g_smu);
-    pthread_t th; if (pthread_create(&th, NULL, shot_main, j)) { free(rgb); free(j); return; }
-    pthread_detach(th);
+    if (vka_thread(shot_main, j, NULL)) { free(rgb); free(j); return; }   // (Lichii: joined at the shutdown)
 }
 
 // ---------- Commands ----------
@@ -278,4 +277,7 @@ int dm_gfx_ctl(const char *line) {   // the control thread (hle_hid.c ctl_main):
     if (!strcmp(line, "stats")) { atomic_store(&g_stats, 1); return 1; }
     return 0;
 }
+
+// Lichii: the teardown (vka_dev.c vka_destroy): the screenshot's readback buffer
+void vka_ctl_destroy(void) { if (g_sbuf) { vk.vkDestroyBuffer(V.dev, g_sbuf, NULL); vk.vkFreeMemory(V.dev, g_smem, NULL); } }
 #endif

@@ -161,6 +161,7 @@ static int init_once(void) {
     if (!vk.vkMapMemory2KHR) vk.vkMapMemory2KHR = (PFN_vkMapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkMapMemory2");   // core in 1.4
     if (!vk.vkUnmapMemory2KHR) vk.vkUnmapMemory2KHR = (PFN_vkUnmapMemory2KHR)vk.vkGetDeviceProcAddr(V.dev, "vkUnmapMemory2");
     if (!vk.vkMapMemory2KHR || !vk.vkUnmapMemory2KHR) V.placed = V.placed_range = 0;
+    { void vka_census_install(void); vka_census_install(); }   // Lichii: the objects made and destroyed are counted (nvn_shutdown.c)
     {   // Lichii: the state of hle_nvn.c's "Command-buffer state" section that needs an extension, where Lichii's device enabled it (vulkan_device.cpp)
         VkPhysicalDeviceProvokingVertexFeaturesEXT fpv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
         VkPhysicalDeviceExclusiveScissorFeaturesNV fex = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXCLUSIVE_SCISSOR_FEATURES_NV, .pNext = &fpv};
@@ -778,6 +779,33 @@ void vka_up_throttle(void) {
 }
 uint64_t vka_up_batches(void) { return g_n_ubatch; }
 void vka_up_stats(uint64_t *batches, uint64_t *waits, double *wait_ms) { if (batches) *batches = g_n_ubatch; if (waits) *waits = g_n_uwait; if (wait_ms) *wait_ms = g_uwait_ns / 1e6; }
+
+// ---------- Lichii: the teardown ----------
+// nvn_direct_destroy, once every thread of the replay has left (nvn_direct_park) and the device is idle: every Vulkan object the replay made, its imports and views of
+// guest memory and its host memory go, so the next game starts on a device and a process without them. The work deferred to fences (vka_after) runs first: it gives
+// back images and pool memory. Each file destroys its own (the images before their memory blocks, the pipelines before their layouts and modules)
+void vka_tex_destroy(void); void vka_imem_destroy(void); void vks_destroy(void); void vka_pso_destroy(void); void vka_shader_destroy(void); void vka_rc_destroy(void);
+void vka_exec_destroy(void); void vka_draw_destroy(void); void vka_enc_destroy(void); void vka_mem_destroy(void); void vka_capture_destroy(void); void vka_ctl_destroy(void);
+void vka_dlss_destroy(void); void vka_nan_destroy(void); void vka_gprof_destroy(void); void nvn_present_destroy(void); void vka_census_line(void);
+void vka_destroy(void) {
+    atomic_store(&g_hung, 0);   // (the GPU is idle: what a hang or the stop kept from being freed goes now, and what is deferred from now on runs at once)
+    pthread_mutex_lock(&g_fmu); after_rec *run = g_after; g_after = NULL; __atomic_store_n(&g_done, g_fence, __ATOMIC_RELEASE); pthread_mutex_unlock(&g_fmu);
+    while (run) { after_rec *a = run; run = a->next; a->fn(a->arg); free(a); }
+    nvn_present_destroy();
+    vka_capture_destroy(); vka_ctl_destroy(); vka_dlss_destroy(); vka_nan_destroy(); vka_gprof_destroy();
+    vka_exec_destroy(); vka_draw_destroy(); vka_enc_destroy();
+    vka_pso_destroy(); vka_rc_destroy(); vka_shader_destroy();
+    vka_tex_destroy(); vka_imem_destroy(); vks_destroy();
+    vka_mem_destroy();
+    for (sblk *l[3] = {g_open[0], g_open[1], g_busy}, **p = l; p < l + 3; p++)
+        for (sblk *b = *p, *n; b; b = n) { n = b->next; vk.vkUnmapMemory(V.dev, b->mem); vk.vkDestroyBuffer(V.dev, b->buf, NULL); vk.vkFreeMemory(V.dev, b->mem, NULL); free(b); }
+    if (g_upool) vk.vkDestroyCommandPool(V.dev, g_upool, NULL);
+    if (g_utl) vk.vkDestroySemaphore(V.dev, g_utl, NULL);
+    for (int i = 0; i < NVN_DIRECT_MAX_QUEUES; i++) if (V.qtl[i]) vk.vkDestroySemaphore(V.dev, V.qtl[i], NULL);
+    vk.vkDestroySemaphore(V.dev, V.tl, NULL);
+    vka_census_line();
+    free((void *)g_adopt.extensions);
+}
 #endif
 
 #if defined(__ANDROID__)
