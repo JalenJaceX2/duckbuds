@@ -13,12 +13,14 @@ add_library(nvn_direct STATIC
     gen/nvn_dispatch.inc
     gen_dispatch.py
     nvn_direct.h
+    nvn_direct_state.h
     nvn_dispatch.c
     nvn_direct_front.h
     nvn_direct_host.c
     nvn_direct_log.cpp
     nvn_present.c
     nvn_recompile.c
+    nvn_reset.c
     nvn_shutdown.c
     nvn_tracking.c
     nvn_window.c
@@ -91,6 +93,11 @@ target_include_directories(nvn_direct PRIVATE
     ${BN}/host
 )
 target_compile_definitions(nvn_direct PRIVATE __ANDROID__ _GNU_SOURCE)
+# Every C file's static variables in the sections nvn_direct_reset returns to their initial values
+# (nvn_direct_state.h); MSVC's form below
+if (NOT MSVC)
+    target_compile_options(nvn_direct PRIVATE $<$<COMPILE_LANGUAGE:C>:-include ${CMAKE_CURRENT_SOURCE_DIR}/nvn_direct_state.h>)
+endif()
 # Upstream's code is kept as it is: its warnings are not Lichii's to fix.
 target_compile_options(nvn_direct PRIVATE -w)
 target_compile_definitions(nvn_direct INTERFACE LICHII_NVN_DIRECT)
@@ -101,7 +108,8 @@ if (MSVC)
     # clang-cl knows GNU C only as gnu17 (its /std:c17 has no typeof), and the POSIX additions to the C
     # library's headers (shim/win32/posix.h) come ahead of every file
     target_compile_options(nvn_direct PRIVATE $<$<COMPILE_LANGUAGE:C>:/clang:-std=gnu17>
-        $<$<COMPILE_LANGUAGE:C>:/FI${CMAKE_CURRENT_SOURCE_DIR}/bananative/shim/win32/posix.h>)
+        $<$<COMPILE_LANGUAGE:C>:/FI${CMAKE_CURRENT_SOURCE_DIR}/bananative/shim/win32/posix.h>
+        $<$<COMPILE_LANGUAGE:C>:/FI${CMAKE_CURRENT_SOURCE_DIR}/nvn_direct_state.h>)
     target_compile_definitions(nvn_direct PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE)
     target_link_libraries(nvn_direct PRIVATE synchronization)
 else()

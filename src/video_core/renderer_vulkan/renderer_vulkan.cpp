@@ -349,10 +349,15 @@ bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const 
         adopted.queues[index] = queues[(index + 1) % queues.size()];
     }
     // The replay keeps its pipeline cache, prewarm list, kept translations and the view formats
-    // it learns in DM_TEMP (Banana Native's cache directory variable): unless it is set, Lichii's
-    // cache directory, one folder per title named as the shader cache's (nvn_direct/<16 hex
-    // digits of the program id>/), never the working directory or HOME, its fallback.
-    if (const char* temp = std::getenv("DM_TEMP"); temp == nullptr || *temp == '\0') {
+    // it learns in DM_TEMP (Banana Native's cache directory variable): unless it was set when the
+    // process started, Lichii's cache directory, one folder per title named as the shader cache's
+    // (nvn_direct/<16 hex digits of the program id>/), set again at each boot, never the working
+    // directory or HOME, its fallback.
+    static const bool temp_given = [] {
+        const char* const temp = std::getenv("DM_TEMP");
+        return temp != nullptr && *temp != '\0';
+    }();
+    if (!temp_given) {
         const u64 title = Core::NvnHook::DirectProgramId();
         auto dir = Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "nvn_direct";
         if (title != 0) {
@@ -362,7 +367,7 @@ bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const 
 #ifdef _WIN32
             _putenv_s("DM_TEMP", Common::FS::PathToUTF8String(dir).c_str()); // (getenv's environment)
 #else
-            setenv("DM_TEMP", Common::FS::PathToUTF8String(dir).c_str(), 0);
+            setenv("DM_TEMP", Common::FS::PathToUTF8String(dir).c_str(), 1);
 #endif
         }
     }

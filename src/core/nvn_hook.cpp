@@ -616,6 +616,11 @@ void DirectFailed() {
     LOG_WARNING(Core, "Renderer: GPU emulation ({})", Describe(g_choice));
     // The game has not run yet: without a state its NVN driver runs, on GPU emulation.
     g_state.reset();
+#ifdef LICHII_NVN_DIRECT
+    // The front end and the replay as before the first boot (their threads were joined and their
+    // objects destroyed with the renderer): the next boot starts them again.
+    nvn_direct_reset();
+#endif
 }
 
 void Uninstall() {

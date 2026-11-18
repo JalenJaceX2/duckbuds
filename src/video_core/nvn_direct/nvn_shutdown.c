@@ -3,7 +3,7 @@
 
 // The emulator shutting down in direct mode. Upstream's replay lives as long as
 // its process (detached threads, the GPU until exit); in Lichii the emulation stops first and the
-// device goes away while the process goes on.
+// device goes away while the process goes on, and the next game starts the replay again.
 // - nvn_direct_stop, before the guest's cores are suspended: a game thread inside a halted NVN
 //   call (core/nvn_hook.cpp RunHaltedCall) waits on the host, where the kernel cannot suspend it
 //   (a fence, room in the replay worker's queue, a present's fill). Those waits return now:
@@ -17,6 +17,8 @@
 //   the device must not go away under it.
 // - nvn_direct_destroy, once the device is idle: the replay's Vulkan objects and its imports and
 //   views of guest memory go (vka_destroy).
+// - nvn_direct_reset (nvn_reset.c), once the game is gone: every static variable back to its
+//   initial value.
 
 #include <pthread.h>
 #include <stdatomic.h>
