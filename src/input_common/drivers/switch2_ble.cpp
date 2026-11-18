@@ -19,6 +19,8 @@
 #include <vector>
 
 #include <SDL3/SDL.h>
+// SDK 10.0.22621's cppwinrt base.h needs GUID complete under clang-cl.
+#include <guiddef.h>
 #include <winrt/Windows.Devices.Bluetooth.Advertisement.h>
 #include <winrt/Windows.Devices.Bluetooth.GenericAttributeProfile.h>
 #include <winrt/Windows.Devices.Bluetooth.h>
