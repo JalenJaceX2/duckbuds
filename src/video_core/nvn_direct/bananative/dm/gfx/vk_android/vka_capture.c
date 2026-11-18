@@ -652,4 +652,13 @@ static void cap_present(const tex_t *t, const int crop[4]) {
     g_cap_active = 0; g_cap_done = 1;
 }
 void nvn_cap_present(const tex_t *t, const int crop[4]) { pthread_mutex_lock(&g_cap_mu); cap_present(t, crop); pthread_mutex_unlock(&g_cap_mu); }
+
+// Lichii: the teardown (vka_dev.c vka_destroy): the one-off work's pool and what late submissions kept
+void vka_capture_destroy(void) {
+    for (int i = 0; i < g_nolate; i++) {
+        vcap_late *l = &g_olate[i];
+        vk.vkDestroyFence(V.dev, l->f, NULL); vk.vkDestroyCommandPool(V.dev, l->cp, NULL); vcap_hbuf_free(&l->h); vka_tex_drop(l->im);
+    }
+    if (g_ocp) vk.vkDestroyCommandPool(V.dev, g_ocp, NULL);
+}
 #endif

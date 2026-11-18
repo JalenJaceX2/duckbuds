@@ -97,4 +97,9 @@ void vka_gp_sub_begin(VkCommandBuffer cb, uint64_t frame) {
     if (g_state == 1) { g_cb = cb; mark(cb, 1, "submission", 0); }
 }
 void vka_gp_commit(VkCommandBuffer cb, uint64_t fence) { if (g_state == 1 && cb == g_cb) { mark(cb, 3, "commit", 0); g_fence = fence; } }
+
+// Lichii: the teardown (vka_dev.c vka_destroy)
+void vka_gprof_destroy(void) {
+    if (g_qp) ((PFN_vkDestroyQueryPool)vk.vkGetDeviceProcAddr(V.dev, "vkDestroyQueryPool"))(V.dev, g_qp, NULL);
+}
 #endif

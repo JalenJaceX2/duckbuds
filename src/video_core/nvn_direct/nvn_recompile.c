@@ -502,6 +502,8 @@ uint32_t vka_rc_prim(uint64_t key) {
     pthread_mutex_lock(&g_mu); rc_ent* e = rc_find(&g_sh, rc_key(key)); rc_shader* r = e ? e->val : NULL; pthread_mutex_unlock(&g_mu);
     return r ? r->prim : 0;
 }
+// The one-entry libraries of the shaders made (their shaders read them until the teardown, vka_rc_destroy). Under g_mu
+static vka_shlib** g_libs; static size_t g_nlibs, g_libs_cap;
 // The shader of a translation, new or kept (o: its descriptors and SPIR-V; control and c1: what it was made from): r->sh, NULL when refused (why says what)
 static _Atomic unsigned g_ahead;   // shaders made from kept translations before the game set them (vka_rc_by_key: the prewarm list)
 static void rc_make(rc_shader* r, uint64_t key, const nvn_direct_shader* o, const rc_control* control, const uint8_t* c1, uint32_t c1_len, uint64_t vin_types, uint32_t prim_inputs, char* why, size_t whyn) {
@@ -512,6 +514,10 @@ static void rc_make(rc_shader* r, uint64_t key, const nvn_direct_shader* o, cons
     vka_shlib* L = b ? rc_lib(key, rc_vks(r->st), flags, o, b, o->desc_count, c1_len ? c1 : NULL, c1_len, vin_types, err, sizeof err) : NULL;
     free(b);
     if (!L) { if (!*why) snprintf(why, whyn, "%s", err); return; }
+    pthread_mutex_lock(&g_mu);
+    if (g_nlibs == g_libs_cap) { size_t nc = g_libs_cap ? 2 * g_libs_cap : 1024; vka_shlib** n = realloc(g_libs, nc * sizeof *n); if (n) { g_libs = n; g_libs_cap = nc; } }
+    if (g_nlibs < g_libs_cap) g_libs[g_nlibs++] = L;
+    pthread_mutex_unlock(&g_mu);
     r->sh = vka_shader_make(L, key);
     if (!r->sh) return;
     r->sh->nvn2_control = nvn2_control(control->bytes) ? control->bytes : NULL; g_made++;
@@ -676,6 +682,19 @@ static void spec_add(uint64_t key, uint64_t data, const rc_control* control) {
     for (; g_spec_up < on; g_spec_up++) vka_thread(spec_main, NULL, spec_wake);
     pthread_cond_signal(&g_spec_cv);
     pthread_mutex_unlock(&g_spec_mu);
+}
+
+// The teardown (vka_dev.c vka_destroy, after every thread left): the tables, the kept translations, the libraries and the file
+static void rc_map_free(rc_map* m, int values) {
+    if (values) for (size_t i = 0; i < m->cap; i++) if (m->e[i].key) free(m->e[i].val);
+    free(m->e);
+}
+void vka_rc_destroy(void) {
+    for (size_t i = 0; i < g_nlibs; i++) { free((void*)g_libs[i]->base); free(g_libs[i]); }
+    free(g_libs);
+    rc_map_free(&g_sh, 1); rc_map_free(&g_ctl, 1); rc_map_free(&g_disk, 1); rc_map_free(&g_spec_done, 0);
+    free(g_guards); free(g_spec);
+    if (g_disk_f) fclose(g_disk_f);
 }
 
 // Shaders made in this run, and of them the ones an earlier run kept (the rest were translated now: new to this run's DM_TEMP)

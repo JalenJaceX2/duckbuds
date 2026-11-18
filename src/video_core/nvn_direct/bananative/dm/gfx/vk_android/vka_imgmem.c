@@ -167,4 +167,11 @@ void vka_imem_stats(char *o, size_t n) {
     pthread_mutex_unlock(&g_imu);
 }
 uint64_t vka_imem_allocations(void) { pthread_mutex_lock(&g_imu); uint64_t c = S.blocks + S.ded + (uint64_t)Z.n; pthread_mutex_unlock(&g_imu); return c; }
+// Lichii: the teardown (vka_dev.c vka_destroy, after every image went): the empty blocks the memory types kept, the zero-shared table
+void vka_imem_destroy(void) {
+    for (int t = 0; t < VK_MAX_MEMORY_TYPES; t++)
+        for (iblock *b = g_blocks[t], *n; b; b = n) { n = b->next; vk.vkFreeMemory(V.dev, b->dm, NULL); vke_fini(&b->free); free(b); }
+    for (int i = 0; i < Z.n; i++) vk.vkFreeMemory(V.dev, (VkDeviceMemory)(uintptr_t)Z.e[i].h, NULL);   // (none: freed with their last image)
+    free(Z.e);
+}
 #endif

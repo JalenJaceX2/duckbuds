@@ -217,3 +217,11 @@ int nvn_direct_present_frame(uint64_t id, nvn_direct_frame* out) {
     }
     return 1;
 }
+
+// The teardown (vka_dev.c vka_destroy): the frames still held, their views and references
+void nvn_present_destroy(void) {
+    for (int i = 0; i < NHELD; i++) if (g_held[i].im) {
+        vk.vkDestroyImageView(V.dev, g_held[i].frame.view, NULL);
+        vka_tex_drop(g_held[i].im);
+    }
+}

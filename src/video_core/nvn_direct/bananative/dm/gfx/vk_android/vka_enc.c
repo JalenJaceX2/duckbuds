@@ -469,6 +469,7 @@ static int up(void) {
     VLOG("command encoder: the replay thread's Vulkan commands are recorded on a thread of their own (DM_VK_ENC=0: on the replay thread)");
     return 1;
 }
+void vka_enc_destroy(void) { free(g_ring); }   // Lichii: the teardown (vka_dev.c vka_destroy), after the thread left
 void vka_enc_sync(void) {
     flush_pub();
     if (g_ph != atomic_load_explicit(&g_tail, memory_order_acquire)) wait_tail(g_ph);

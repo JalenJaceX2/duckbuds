@@ -1623,4 +1623,19 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
 void vka_draw_stats(uint64_t *draws, uint64_t *skipped, uint64_t *dispatches, uint64_t *pipelines) {
     if (draws) *draws = g_draws; if (skipped) *skipped = g_skipped; if (dispatches) *dispatches = g_dispatches; if (pipelines) *pipelines = 0;
 }
+
+// Lichii: the teardown (vka_dev.c vka_destroy): the descriptor pools (their sets with them), the shading-rate attachments and pipeline (the static spans go with
+// vka_shader.c's blocks, the placeholders with the images)
+void vka_draw_destroy(void) {
+    fsc_reset();
+    for (int s = 0; s < NSLOT; s++) for (int i = 0; i < g_ndp[s]; i++) vk.vkDestroyDescriptorPool(V.dev, g_dp[s][i], NULL);
+    for (int s = 0; s < NSLOT; s++) {
+        if (g_vrs_att[s].view) vk.vkDestroyImageView(V.dev, g_vrs_att[s].view, NULL);
+        if (g_vrs_att[s].img) vk.vkDestroyImage(V.dev, g_vrs_att[s].img, NULL);
+        if (g_vrs_att[s].mem) vk.vkFreeMemory(V.dev, g_vrs_att[s].mem, NULL);
+    }
+    if (g_vrs.pipe) vk.vkDestroyPipeline(V.dev, g_vrs.pipe, NULL);
+    if (g_vrs.layout) vk.vkDestroyPipelineLayout(V.dev, g_vrs.layout, NULL);
+    if (g_vrs.dsl) vk.vkDestroyDescriptorSetLayout(V.dev, g_vrs.dsl, NULL);
+}
 #endif

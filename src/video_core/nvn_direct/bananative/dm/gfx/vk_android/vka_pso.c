@@ -92,10 +92,10 @@ typedef struct { lkey k; int push; } slkey;
 static kmap g_setls = {.klen = sizeof(slkey)};
 typedef struct { VkDescriptorSetLayout s[3]; int graphics; } plkey;
 static kmap g_playouts = {.klen = sizeof(plkey)};
+static VkDescriptorSetLayout g_empty_set;   // (Lichii: at file scope for the teardown)
 static VkDescriptorSetLayout empty_set_layout(void) {   // (caller holds g_mu) for a set a layout lacks on a device without graphics pipeline libraries
-    static VkDescriptorSetLayout e;
-    if (!e) { VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; if (vk.vkCreateDescriptorSetLayout(V.dev, &li, NULL, &e)) e = VK_NULL_HANDLE; }
-    return e;
+    if (!g_empty_set) { VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; if (vk.vkCreateDescriptorSetLayout(V.dev, &li, NULL, &g_empty_set)) g_empty_set = VK_NULL_HANDLE; }
+    return g_empty_set;
 }
 static VkDescriptorSetLayout set_layout(const lkey *k, int push) {   // (caller holds g_mu) VK_NULL_HANDLE on failure (logged)
     slkey sk; memset(&sk, 0, sizeof sk); memcpy(&sk.k, k, offsetof(lkey, b) + (size_t)k->n * sizeof k->b[0]); sk.push = push;
@@ -736,6 +736,9 @@ static VkPipeline gpl_link(pstate *P, const vka_gkey *k) {
 typedef struct opt_job { struct opt_job *next; gval *g; vka_shader *sh[VKA_NSTAGE]; vka_layout lay; vka_gkey k; } opt_job;
 static opt_job *g_opt_head, **g_opt_tail = &g_opt_head; static pthread_mutex_t g_opt_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_opt_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_opt_waiting;
+// Lichii: the linked pipelines the optimized ones replaced (draws recorded with them may still run): destroyed at the teardown (vka_pso_destroy). Under g_mu
+static VkPipeline *g_retired; static size_t g_nretired, g_cretired;
+static void opt_wake(void) { pthread_mutex_lock(&g_opt_mu); pthread_cond_broadcast(&g_opt_cv); pthread_mutex_unlock(&g_opt_mu); }   // Lichii: the shutdown (vka_thread)
 static void *opt_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-psopt");
     setpriority(PRIO_PROCESS, 0, 10);   // Lichii: under the game's threads and the asynchronous ones (the linked pipeline already draws)
@@ -749,6 +752,8 @@ static void *opt_main(void *a) {
         pstate *P = malloc(sizeof *P);
         VkPipeline p = P && pstate_fill(P, j->sh, &j->lay, &j->k) ? full_pipeline(P, j->sh, " in the background") : VK_NULL_HANDLE;
         pthread_mutex_lock(&g_mu);
+        if (p && g_nretired == g_cretired) { size_t c = g_cretired ? 2 * g_cretired : 256; VkPipeline *n = realloc(g_retired, c * sizeof *n); if (n) { g_retired = n; g_cretired = c; } }
+        if (p && g_nretired < g_cretired) g_retired[g_nretired++] = j->g->p;
         if (p) { __atomic_store_n(&j->g->p, p, __ATOMIC_RELEASE); __atomic_store_n(&j->g->linked, 0, __ATOMIC_RELEASE); g_nopt++; }   // a failure keeps the linked pipeline (logged)
         g_opt_waiting--;
         pthread_mutex_unlock(&g_mu);
@@ -1279,5 +1284,27 @@ static void lib_ahead_start(void) {
     for (int i = 0; i < nt; i++) if (!vka_thread(lib_ahead_main, NULL, NULL)) g_la_threads++;
     VLOG("graphics pipeline libraries: made ahead on %d background threads: %u vertex and %u pixel shaders of the kept translations (destroyed once made: the driver's caches keep them)",
          g_la_threads, nvs, nfs);
+}
+
+// Lichii: the teardown (vka_dev.c vka_destroy, after every thread left): the pipelines, libraries, layouts and set layouts, the pipeline cache (saved by vka_pso_park),
+// and the tables and queued jobs
+static void km_destroy(kmap *m, void (*fn)(void *val)) {
+    for (size_t i = 0; i < m->cap; i++) if (m->e[i].key) { if (fn) fn(m->e[i].val); free(m->e[i].key); }
+    free(m->e);
+}
+static void gval_destroy(void *v) { gval *g = v; if (g->p) vk.vkDestroyPipeline(V.dev, g->p, NULL); free(g); }
+static void lib_destroy(void *v) { if ((uintptr_t)v > (uintptr_t)LIB_BUSY) vk.vkDestroyPipeline(V.dev, (VkPipeline)v, NULL); }
+static void playout_destroy(void *v) { vk.vkDestroyPipelineLayout(V.dev, (VkPipelineLayout)v, NULL); }
+static void setl_destroy(void *v) { vk.vkDestroyDescriptorSetLayout(V.dev, (VkDescriptorSetLayout)v, NULL); }
+void vka_pso_destroy(void) {
+    km_destroy(&g_gfx, gval_destroy); km_destroy(&g_cs, gval_destroy);
+    for (int k = 0; k < NLIB; k++) km_destroy(&g_lib[k], lib_destroy);
+    for (size_t i = 0; i < g_nretired; i++) vk.vkDestroyPipeline(V.dev, g_retired[i], NULL);
+    km_destroy(&g_lshort, free); km_destroy(&g_playouts, playout_destroy); km_destroy(&g_setls, setl_destroy);
+    if (g_empty_set) vk.vkDestroyDescriptorSetLayout(V.dev, g_empty_set, NULL);
+    if (g_pc) vk.vkDestroyPipelineCache(V.dev, g_pc, NULL);
+    for (opt_job *j = g_opt_head, *n; j; j = n) { n = j->next; free(j); }
+    for (async_job *j = g_as_head, *n; j; j = n) { n = j->next; free(j); }
+    free(g_retired); free(g_pw_load); free(g_pw_buf); free(g_la);
 }
 #endif

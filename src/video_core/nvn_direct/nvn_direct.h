@@ -299,6 +299,11 @@ void nvn_direct_stop(void);
 /// left; the process exits when one does not.
 void nvn_direct_park(void);
 
+/// After nvn_direct_park, once the device is idle and before it is destroyed: the replay's Vulkan
+/// objects, its imports and views of guest memory and the front end's mappings of it are
+/// destroyed, and a line says whether any object was left.
+void nvn_direct_destroy(void);
+
 /// nvnDeviceGetInteger's answer for item, as the game's own driver gave it.
 void nvn_direct_set_device_integer(unsigned item, int value);
 

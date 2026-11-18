@@ -51,7 +51,8 @@
     X(vkCmdDrawMeshTasksIndirectEXT) X(vkCmdDrawMeshTasksIndirectCountEXT) \
     X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) X(vkCmdSetDepthBounds) \
     X(vkGetMemoryHostPointerPropertiesEXT) X(vkGetMemoryFdPropertiesKHR)   /* Lichii: pools imported from guest memory (vka_mem.c) */ \
-    X(vkDestroyCommandPool)   /* Lichii: a frame capture copy's pool, once the GPU finished it late (vka_capture.c vcap_late_reap) */
+    X(vkDestroyCommandPool)   /* Lichii: a frame capture copy's pool, once the GPU finished it late (vka_capture.c vcap_late_reap) */ \
+    X(vkDestroyDescriptorSetLayout) X(vkDestroyDescriptorPool) X(vkDestroyPipelineCache)   /* Lichii: the teardown (vka_dev.c vka_destroy) */
 #define VKA_DECL(f) PFN_##f f;
 typedef struct { PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr; VKA_GLOBAL_FNS(VKA_DECL) VKA_INSTANCE_FNS(VKA_DECL) VKA_DEVICE_FNS(VKA_DECL) } vka_fns;
 extern vka_fns vk;   // a missing optional entry point is NULL

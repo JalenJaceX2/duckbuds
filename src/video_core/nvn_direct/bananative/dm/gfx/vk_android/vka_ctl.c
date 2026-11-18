@@ -277,4 +277,7 @@ int dm_gfx_ctl(const char *line) {   // the control thread (hle_hid.c ctl_main):
     if (!strcmp(line, "stats")) { atomic_store(&g_stats, 1); return 1; }
     return 0;
 }
+
+// Lichii: the teardown (vka_dev.c vka_destroy): the screenshot's readback buffer
+void vka_ctl_destroy(void) { if (g_sbuf) { vk.vkDestroyBuffer(V.dev, g_sbuf, NULL); vk.vkFreeMemory(V.dev, g_smem, NULL); } }
 #endif

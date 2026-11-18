@@ -20,6 +20,7 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 // ---------- Static memory: buffers that live as long as the process ----------
 typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *ptr; VkDeviceSize size, used; } stblk;
 static stblk g_st;
+static stblk *g_st_old; static int g_nst_old;   // Lichii: the blocks before g_st, for the teardown (vka_shader_destroy)
 int vka_static(VkDeviceSize n, VkDeviceSize align, vka_span *out) {
     if (!align) align = 16;
     pthread_mutex_lock(&g_mu);
@@ -36,6 +37,7 @@ int vka_static(VkDeviceSize n, VkDeviceSize align, vka_span *out) {
             if (t == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &b.mem) || vk.vkBindBufferMemory(V.dev, b.buf, b.mem, 0) || vk.vkMapMemory(V.dev, b.mem, 0, VK_WHOLE_SIZE, 0, &p)) p = NULL;
         }
         if (!p) { pthread_mutex_unlock(&g_mu); VRED("static block of %llu bytes not allocated", (unsigned long long)b.size); return 0; }
+        if (g_st.buf) { stblk *l = realloc(g_st_old, (size_t)(g_nst_old + 1) * sizeof *l); if (l) { g_st_old = l; g_st_old[g_nst_old++] = g_st; } }
         b.ptr = p; g_st = b; o = 0;   // the old block stays (its buffers are still bound by shaders)
     }
     g_st.used = o + n; *out = (vka_span){g_st.buf, g_st.ptr + o, o};
@@ -313,5 +315,20 @@ int vka_prog_shaders(const prog_t *p, vka_progsh *out) {
         }
     vka_prog_put(p->serial, out);
     return 1;
+}
+
+// Lichii: the teardown (vka_dev.c vka_destroy, after the pipelines): every shader's modules, the static blocks, the tables
+void vka_shader_destroy(void) {
+    for (size_t i = 0; i < g_shcap; i++) if (g_sh[i].sh) {
+        vka_shader *s = g_sh[i].sh;
+        if (s->gs_claim) vk.vkDestroyShaderModule(V.dev, s->gs_claim, NULL);
+        vka_shader_scratch_free(s);
+    }
+    free(g_sh); free(g_miss);
+    for (int i = 0; i <= g_nst_old; i++) {
+        const stblk *b = i < g_nst_old ? &g_st_old[i] : &g_st;
+        if (b->buf) { vk.vkDestroyBuffer(V.dev, b->buf, NULL); vk.vkFreeMemory(V.dev, b->mem, NULL); }
+    }
+    free(g_st_old);
 }
 #endif
