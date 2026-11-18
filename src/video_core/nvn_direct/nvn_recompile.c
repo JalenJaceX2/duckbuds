@@ -657,8 +657,9 @@ static void* spec_main(void* a) {
     return NULL;
 }
 // nvn_direct_park (after vka_stop): wakes the speculative threads and waits (bounded) until none translates. 1 = none does
+static void spec_wake(void) { pthread_mutex_lock(&g_spec_mu); pthread_cond_broadcast(&g_spec_cv); pthread_mutex_unlock(&g_spec_mu); }
 int vka_rc_park(uint64_t timeout_ns) {
-    pthread_mutex_lock(&g_spec_mu); pthread_cond_broadcast(&g_spec_cv); pthread_mutex_unlock(&g_spec_mu);
+    spec_wake();
     const uint64_t t0 = now_ns();
     while (atomic_load(&g_spec_busy) && now_ns() - t0 < timeout_ns) usleep(1000);
     return !atomic_load(&g_spec_busy);
@@ -672,7 +673,7 @@ static void spec_add(uint64_t key, uint64_t data, const rc_control* control) {
     pthread_mutex_lock(&g_spec_mu);
     if (g_spec_n == g_spec_cap) { size_t nc = g_spec_cap ? 2 * g_spec_cap : 1024; spec_item* n = realloc(g_spec, nc * sizeof *n); if (!n) { pthread_mutex_unlock(&g_spec_mu); return; } g_spec = n; g_spec_cap = nc; }
     g_spec[g_spec_n++] = (spec_item){key, data, control};
-    for (; g_spec_up < on; g_spec_up++) { pthread_t th; if (!pthread_create(&th, NULL, spec_main, NULL)) pthread_detach(th); }
+    for (; g_spec_up < on; g_spec_up++) vka_thread(spec_main, NULL, spec_wake);
     pthread_cond_signal(&g_spec_cv);
     pthread_mutex_unlock(&g_spec_mu);
 }

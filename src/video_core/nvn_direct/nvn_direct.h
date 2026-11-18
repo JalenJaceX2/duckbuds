@@ -294,8 +294,9 @@ int nvn_direct_call_blocks(int slot, const uint64_t x[8]);
 /// the process.
 void nvn_direct_stop(void);
 
-/// Before Lichii's device goes away (after nvn_direct_stop, which it implies): waits (bounded)
-/// until the replay's threads no longer use the device and saves the pipeline cache a last time.
+/// Before Lichii's device goes away (after nvn_direct_stop, which it implies): saves the pipeline
+/// cache a last time and waits (bounded) until every thread of the replay and the front end has
+/// left; the process exits when one does not.
 void nvn_direct_park(void);
 
 /// nvnDeviceGetInteger's answer for item, as the game's own driver gave it.

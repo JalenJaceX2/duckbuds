@@ -72,7 +72,8 @@ static void *worker_main(void *arg) {
     for (;;) {
         uint64_t t0 = wns();
         pthread_mutex_lock(&g_mu);
-        while (g_qout == g_qin) pthread_cond_wait(&g_cv, &g_mu);
+        while (g_qout == g_qin && !vka_leaving()) pthread_cond_wait(&g_cv, &g_mu);
+        if (g_qout == g_qin) { pthread_mutex_unlock(&g_mu); break; }   // Lichii: the shutdown (vka_leaving)
         job_t j = g_q[g_qout % NJOB];
         pthread_mutex_unlock(&g_mu);
         uint64_t t1 = wns(), c1 = j.kind == J_SUB ? thread_cpu_ns() : 0; g_idle_ns += t1 - t0;
@@ -104,9 +105,8 @@ static void *worker_main(void *arg) {
 static pthread_once_t g_up_once = PTHREAD_ONCE_INIT;
 static void up_once(void) {
     if (!vka_worker_on()) return;
-    pthread_t th;
-    if (pthread_create(&th, NULL, worker_main, NULL)) { VRED("cannot start the replay worker: submissions are replayed inline"); g_up = -1; g_on = 0; return; }
-    pthread_detach(th); g_up = 1;
+    if (vka_thread(worker_main, NULL, vka_worker_wake)) { VRED("cannot start the replay worker: submissions are replayed inline"); g_up = -1; g_on = 0; return; }
+    g_up = 1;
     VLOG("replay worker: submissions and presents are replayed on their own thread, at most %d frame%s behind the game (DM_VK_WORKER=0: inline)", g_frames, g_frames == 1 ? "" : "s");
 }
 static int up(void) { pthread_once(&g_up_once, up_once); return g_up > 0; }

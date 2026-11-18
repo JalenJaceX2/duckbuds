@@ -1553,11 +1553,13 @@ static void up_run(void) {   // take parts until none is left
         if (atomic_fetch_add(&UP.done, 1) + 1 == n) { pthread_mutex_lock(&UP.mu); pthread_cond_broadcast(&UP.done_cv); pthread_mutex_unlock(&UP.mu); }
     }
 }
+static void up_wake(void) { pthread_mutex_lock(&UP.mu); pthread_cond_broadcast(&UP.cv); pthread_mutex_unlock(&UP.mu); }   // Lichii: the shutdown (vka_thread)
 static void *up_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-upload");
     uint64_t seen = 0;
     for (;;) {
-        pthread_mutex_lock(&UP.mu); while (UP.gen == seen) pthread_cond_wait(&UP.cv, &UP.mu); seen = UP.gen; pthread_mutex_unlock(&UP.mu);
+        pthread_mutex_lock(&UP.mu); while (UP.gen == seen && !vka_leaving()) pthread_cond_wait(&UP.cv, &UP.mu); seen = UP.gen; pthread_mutex_unlock(&UP.mu);
+        if (vka_leaving()) break;   // Lichii: the shutdown
         up_run();
     }
     return NULL;
@@ -1567,7 +1569,7 @@ static int up_parallel(up_part *p, uint32_t n, int *fail) {
     int want = VKA_ENV("DM_VK_UPLOAD_MT", 3); if (want <= 0 || n < 2) return 0;
     if (want > 6) want = 6;
     if (pthread_mutex_trylock(&g_up_one)) return 0;
-    while (UP.nth < want) { pthread_t th; if (pthread_create(&th, NULL, up_main, NULL)) break; pthread_detach(th); UP.nth++; }
+    while (UP.nth < want) { if (vka_thread(up_main, NULL, up_wake)) break; UP.nth++; }
     if (!UP.nth) { pthread_mutex_unlock(&g_up_one); return 0; }
     pthread_mutex_lock(&UP.mu);
     atomic_store(&UP.fail, 0); atomic_store(&UP.done, 0); atomic_store(&UP.p, p); atomic_store(&UP.next, 0); atomic_store(&UP.n, n); UP.gen++;

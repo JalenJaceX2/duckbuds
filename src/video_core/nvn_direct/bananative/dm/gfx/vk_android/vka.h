@@ -165,6 +165,10 @@ int vka_async_pipelines(void);                     // vka_dev.c: Lichii's asynch
 void vka_pipeline_notify(int built);                // vka_dev.c: a pipeline made off the frame path starts (0) or is done (1): the host's "building shaders"
 void vka_stop(void);                                // vka_dev.c: as after a hang nothing more is submitted and every fence reads as done, silently; waits return at once
 int vka_stopping(void);
+// Lichii: every thread the replay and the front end start is joined when the game stops (nvn_shutdown.c), so the next game starts them again: vka_thread starts fn(arg)
+// (0 = started); wake, while the shutdown waits for the thread to leave, wakes its waits (NULL: it leaves by itself); each thread returns once vka_leaving()
+int vka_thread(void *(*fn)(void *), void *arg, void (*wake)(void));
+int vka_leaving(void);
 void vka_worker_wake(void);                         // vka_worker.c: the game's waits for room in the worker's queue see the stop
 int vka_worker_idle(uint64_t timeout_ns);           // the worker has replayed every job queued (1), or timed out (0)
 int vka_complete_stop(uint64_t timeout_ns);         // vka_dev.c (Lichii): the completion thread has run what was submitted and left (1), or timed out (0)

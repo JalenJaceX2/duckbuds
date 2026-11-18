@@ -260,8 +260,7 @@ void vka_ctl_shot_done(VkFence fence) {   // present thread, after the present's
     if (g_rec_shot.path[0]) snprintf(j->path, sizeof j->path, "%s", g_rec_shot.path);
     else { ctl_dir(); snprintf(j->path, sizeof j->path, "%s/ctl-shot-%llu.png", g_ctl_dir, (unsigned long long)j->frame); }
     pthread_mutex_unlock(&g_smu);
-    pthread_t th; if (pthread_create(&th, NULL, shot_main, j)) { free(rgb); free(j); return; }
-    pthread_detach(th);
+    if (vka_thread(shot_main, j, NULL)) { free(rgb); free(j); return; }   // (Lichii: joined at the shutdown)
 }
 
 // ---------- Commands ----------

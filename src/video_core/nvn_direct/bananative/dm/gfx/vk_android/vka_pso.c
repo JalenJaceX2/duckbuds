@@ -22,7 +22,7 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 // submission), so a backgrounded app does not keep compiling on the CPU for minutes
 static _Atomic int g_pso_paused;
 void vka_pso_pause(int on) { atomic_store(&g_pso_paused, on != 0); }
-static void pause_point(void) { while (atomic_load_explicit(&g_pso_paused, memory_order_relaxed)) usleep(100000); }
+static int pause_point(void) { while (atomic_load_explicit(&g_pso_paused, memory_order_relaxed) && !vka_leaving()) usleep(100000); return vka_leaving(); }   // Lichii: 1 = the shutdown, the thread leaves
 // The keys' hash, 8 bytes a step: the draw path hashes a pipeline key (about 1 KB) per draw, and FNV a byte at a time took 1 us of it on the Adreno 840 phone's cores
 static uint64_t fnv(const void *p, size_t n, uint64_t h) {
     const uint8_t *b = p; size_t i = 0;
@@ -181,7 +181,7 @@ static uint64_t g_ngfx, g_ncs, g_nfail, g_ncs_over, g_create_ns, g_frame_made;  
 static uint64_t g_probe_hit, g_probe_miss, g_probe_miss_ns;          // GPL: the cache-only try before a link (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT)
 static _Atomic uint64_t g_save_ns_total, g_hy_draws, g_pw_wait_ns;
 static void pw_load(void); static void pw_start(void); static int pw_save(void); static void lib_ahead_start(void);
-static void *saver_main(void *a);
+static void *saver_main(void *a); static void saver_wake(void);
 static pthread_mutex_t g_save_mu = PTHREAD_MUTEX_INITIALIZER;   // one save at a time (the saver thread, a forced save)
 static int g_pc_parked;   // Lichii: vka_pso_park made the last save (under g_save_mu): no more, the device goes away after it
 static pthread_mutex_t g_sv_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_sv_cv = PTHREAD_COND_INITIALIZER; static int g_sv_want, g_sv_up;
@@ -216,8 +216,7 @@ static void pc_open_once(void) {
     else VLOG("pipeline cache %s: %zu bytes read", g_pc_path[0] ? g_pc_path : e && !strcmp(e, "0") ? "(none: DM_VK_PCACHE=0)" : "(not kept: no DM_TEMP or HOME)", n);
     free(data);
     pw_load();
-    pthread_t th;
-    if (!pthread_create(&th, NULL, saver_main, NULL)) { pthread_detach(th); g_sv_up = 1; }
+    if (!vka_thread(saver_main, NULL, saver_wake)) g_sv_up = 1;
     pw_start();
     lib_ahead_start();
 }
@@ -253,10 +252,12 @@ static void save_now(void) {
                             (unsigned long long)made, keys, dt / 1e6);
     free(d);
 }
+static void saver_wake(void) { pthread_mutex_lock(&g_sv_mu); pthread_cond_broadcast(&g_sv_cv); pthread_mutex_unlock(&g_sv_mu); }   // Lichii: the shutdown (vka_thread)
 static void *saver_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-pcache");
     for (;;) {
-        pthread_mutex_lock(&g_sv_mu); while (!g_sv_want) pthread_cond_wait(&g_sv_cv, &g_sv_mu); g_sv_want = 0; pthread_mutex_unlock(&g_sv_mu);
+        pthread_mutex_lock(&g_sv_mu); while (!g_sv_want && !vka_leaving()) pthread_cond_wait(&g_sv_cv, &g_sv_mu); g_sv_want = 0; pthread_mutex_unlock(&g_sv_mu);
+        if (vka_leaving()) break;   // Lichii: the shutdown (after vka_pso_park's last save)
         pthread_mutex_lock(&g_save_mu); if (!g_pc_parked) save_now(); pthread_mutex_unlock(&g_save_mu);
     }
     return NULL;
@@ -739,9 +740,10 @@ static void *opt_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-psopt");
     setpriority(PRIO_PROCESS, 0, 10);   // Lichii: under the game's threads and the asynchronous ones (the linked pipeline already draws)
     for (;;) {
-        pause_point();
+        if (pause_point()) break;
         pthread_mutex_lock(&g_opt_mu);
-        while (!g_opt_head) pthread_cond_wait(&g_opt_cv, &g_opt_mu);
+        while (!g_opt_head && !vka_leaving()) pthread_cond_wait(&g_opt_cv, &g_opt_mu);
+        if (!g_opt_head) { pthread_mutex_unlock(&g_opt_mu); break; }
         opt_job *j = g_opt_head; g_opt_head = j->next; if (!g_opt_head) g_opt_tail = &g_opt_head;
         pthread_mutex_unlock(&g_opt_mu);
         pstate *P = malloc(sizeof *P);
@@ -758,7 +760,7 @@ static void opt_queue(gval *g, vka_shader *const sh[VKA_NSTAGE], const vka_layou
     static int ok;
     opt_job *j = malloc(sizeof *j); if (!j) return;
     j->next = NULL; j->g = g; memcpy(j->sh, sh, sizeof j->sh); j->lay = *lay; j->k = *k;
-    if (!ok) { pthread_t th; static _Atomic int tried; if (!atomic_exchange(&tried, 1)) { ok = !pthread_create(&th, NULL, opt_main, NULL); if (ok) pthread_detach(th); else VRED("pipeline optimizer thread not started: linked pipelines stay"); } }
+    if (!ok) { static _Atomic int tried; if (!atomic_exchange(&tried, 1)) { ok = !vka_thread(opt_main, NULL, opt_wake); if (!ok) VRED("pipeline optimizer thread not started: linked pipelines stay"); } }
     if (!ok) { free(j); return; }
     pthread_mutex_lock(&g_mu); g_opt_waiting++; pthread_mutex_unlock(&g_mu);
     pthread_mutex_lock(&g_opt_mu); *g_opt_tail = j; g_opt_tail = &j->next; pthread_cond_signal(&g_opt_cv); pthread_mutex_unlock(&g_opt_mu);
@@ -946,7 +948,7 @@ static void *pw_main(void *a) {
     uint32_t n = g_pw_load_n; offs = malloc((n ? n : 1) * sizeof *offs);
     if (offs) for (size_t o = 0, i = 0; i < n; i++) { offs[i] = o; pwrec r; memcpy(&r, g_pw_load + o, sizeof r); o += pw_size(&r); }
     for (;;) {
-        pause_point();
+        if (pause_point()) break;
         uint32_t i = atomic_fetch_add(&g_pw_next, 1);
         if (!offs || i >= n || i >= max) break;
         vka_pipeline_notify(0);   // (Lichii: each key counts in its "building shaders")
@@ -986,7 +988,7 @@ static void pw_start(void) {
     if (nt <= 0 || !g_pw_load_n) { if (g_pw_load_n) VLOG("prewarm: off (DM_VK_PREWARM=0): %u keys not made ahead", g_pw_load_n); return; }
     if (nt > 4) nt = 4;
     g_pw_t0 = now_ns(); g_pw_threads = 0;
-    for (int i = 0; i < nt; i++) { pthread_t th; if (!pthread_create(&th, NULL, pw_main, NULL)) { pthread_detach(th); g_pw_threads++; } }
+    for (int i = 0; i < nt; i++) if (!vka_thread(pw_main, NULL, NULL)) g_pw_threads++;
     VLOG("prewarm: %u pipeline keys of earlier runs made ahead on %d background threads (DM_VK_PREWARM=0 off)", g_pw_load_n, g_pw_threads);
 }
 
@@ -1066,13 +1068,15 @@ static int gfx_make(gval *g, const gkey_full *fk, size_t len, vka_shader *const 
     if (linked) opt_queue(g, sh, lay, k);
     return 1;
 }
+static void async_wake(void) { pthread_mutex_lock(&g_as_mu); pthread_cond_broadcast(&g_as_cv); pthread_mutex_unlock(&g_as_mu); }   // Lichii: the shutdown (vka_thread)
 static void *async_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-psoasync");
     t_how = " (asynchronous)";
     for (;;) {
-        pause_point();
+        if (pause_point()) break;
         pthread_mutex_lock(&g_as_mu);
-        while (!g_as_head) pthread_cond_wait(&g_as_cv, &g_as_mu);
+        while (!g_as_head && !vka_leaving()) pthread_cond_wait(&g_as_cv, &g_as_mu);
+        if (!g_as_head) { pthread_mutex_unlock(&g_as_mu); break; }
         async_job *j = g_as_head; g_as_head = j->next; if (!g_as_head) g_as_tail = &g_as_head;
         pthread_mutex_unlock(&g_as_mu);
         uint64_t t0 = now_ns();
@@ -1086,7 +1090,7 @@ static void *async_main(void *a) {
 }
 static int g_as_threads;
 static void async_start(void) {
-    for (int i = 0; i < async_threads(); i++) { pthread_t th; if (!pthread_create(&th, NULL, async_main, NULL)) { pthread_detach(th); g_as_threads++; } }
+    for (int i = 0; i < async_threads(); i++) if (!vka_thread(async_main, NULL, async_wake)) g_as_threads++;
     VLOG("pipelines the frame path would compile: made on %d asynchronous threads, their draws skipped until then", g_as_threads);
 }
 static void async_queue(gval *g, const gkey_full *fk, size_t len, const vka_layout *lay) {
@@ -1241,7 +1245,7 @@ static void *lib_ahead_main(void *a) {
     (void)a; pthread_setname_np(pthread_self(), "vk-libahead");
     setpriority(PRIO_PROCESS, 0, 10);
     for (;;) {
-        pause_point();
+        if (pause_point()) break;
         uint32_t i = atomic_fetch_add(&g_la_next, 1);
         if (i >= g_la_n || !gpl_on()) break;
         vka_pipeline_notify(0);
@@ -1272,7 +1276,7 @@ static void lib_ahead_start(void) {
     }
     free(vs); free(fs);
     g_la_t0 = now_ns();
-    for (int i = 0; i < nt; i++) { pthread_t th; if (!pthread_create(&th, NULL, lib_ahead_main, NULL)) { pthread_detach(th); g_la_threads++; } }
+    for (int i = 0; i < nt; i++) if (!vka_thread(lib_ahead_main, NULL, NULL)) g_la_threads++;
     VLOG("graphics pipeline libraries: made ahead on %d background threads: %u vertex and %u pixel shaders of the kept translations (destroyed once made: the driver's caches keep them)",
          g_la_threads, nvs, nfs);
 }
