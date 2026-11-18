@@ -95,8 +95,11 @@ inline bool DrawReuseProbeEnabled() {
 struct MeshEmulationSetup {
     std::vector<u32> vertex_spirv;
     u32 output_binding{};
-    u32 block_words{};    ///< output words per mesh workgroup
-    u32 max_primitives{}; ///< triangles per mesh workgroup
+    u32 block_words{};          ///< output words per mesh workgroup
+    u32 max_primitives{};       ///< primitives per mesh workgroup
+    u32 primitive_vertices{3};  ///< vertices per primitive: 1 points, 2 lines, 3 triangles
+    /// Generic location carrying the mesh program's PrimitiveId to the pixel program, ~0 if none
+    u32 primitive_id_location{~0U};
     // With a task program (stage 0, the mesh program at mesh_stage): its payload buffer and the
     // distribution pass's offsets and arguments (Shader::RuntimeInfo), and that pass's shader.
     bool has_task{};
@@ -151,6 +154,13 @@ public:
     const std::array<u64, 6>& ShaderHashes() const noexcept {
         return key.unique_hashes;
     }
+    const GraphicsPipelineCacheKey& Key() const noexcept {
+        return key;
+    }
+    /// Each stage's SPIR-V (zstd), kept once the pipeline is built; empty for absent stages.
+    const std::array<std::vector<u8>, NUM_STAGES>& KeptSpirv() const noexcept {
+        return kept_spirv;
+    }
 
     struct SampledImage {
         u32 stage;
@@ -171,6 +181,13 @@ public:
 
     bool SupportsAlphaToOne() const noexcept {
         return fragment_has_color0_output;
+    }
+
+    /// The vertex shader is the last pre-rasterization stage and puts every vertex on the far
+    /// plane, and depth bias enable is a dynamic state. Without a dynamic depth clamp enable the
+    /// pipeline clamps depth.
+    bool OnFarPlane() const noexcept {
+        return on_far_plane;
     }
 
     /// Color components of a render target the fragment shader writes, as VkColorComponentFlags
@@ -202,9 +219,10 @@ public:
         return mesh_emulation ? u64{mesh_emulation->block_words} * 4 : 0;
     }
 
-    /// Vertices of the emulation's triangle list for one mesh workgroup.
+    /// Vertices of the emulation's point, line or triangle list for one mesh workgroup.
     [[nodiscard]] u32 MeshEmulationVerticesPerGroup() const noexcept {
-        return mesh_emulation ? mesh_emulation->max_primitives * 3 : 0;
+        return mesh_emulation ? mesh_emulation->max_primitives * mesh_emulation->primitive_vertices
+                              : 0;
     }
 
     /// The emulation's setup (output layout), or null.
@@ -406,6 +424,9 @@ private:
 
     void KeepImageDescriptors(size_t stage, size_t first_entry);
 
+    void CheckColorFeedbackLoop(std::span<const VideoCommon::ImageViewInOut> views,
+                                const std::array<bool, NUM_STAGES>& stages, size_t fragment_entry);
+
     bool ConfigureDraw(const RescalingPushConstant& rescaling,
                        const RenderAreaPushConstant& render_are);
 
@@ -445,6 +466,7 @@ private:
     std::vector<SampledImage> sampled_images;
     u32 num_textures{};
     bool fragment_has_color0_output{};
+    bool on_far_plane{};
     u32 color_output_mask{};
     bool writes_storage{};
     /// Every texture is sampled with a handle read from a constant buffer: ConfigureImpl can

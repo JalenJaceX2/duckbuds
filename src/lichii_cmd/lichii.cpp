@@ -36,6 +36,8 @@
 #include "common/literals.h"
 #include "common/logging.h"
 #include "common/memory_detect.h"
+#include "common/nextendo.h"
+#include "common/npln_patch_catalog.h"
 #include "common/scm_rev.h"
 #include "common/settings.h"
 #include "common/string_util.h"
@@ -47,6 +49,8 @@
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/hle/service/acc/nextendo_id_token.h"
+#include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
@@ -57,6 +61,8 @@
 #include "network/network.h"
 #include "sdl_config.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_trace/replay.h"
+#include "video_core/gpu_trace/sample.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
@@ -480,6 +486,54 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
     return result.ok;
 }
 
+/// GPU trace replay (docs/nx2/gpu-trace.md):
+///   eden-cli --replay <trace> --out <dir> [--frames N] [--device N]
+///                     [--record <trace> --record-from <present> --record-presents N]
+///   eden-cli --gpu-trace-sample <trace>: writes the synthetic trace.
+static bool ReplayGpuTrace(Core::System& system, int argc, char** argv) {
+    namespace GpuTrace = VideoCommon::GpuTrace;
+    if (std::string_view{argv[1]} == "--gpu-trace-sample") {
+        if (argc < 3) {
+            fmt::print(stderr, "usage: --gpu-trace-sample <trace>\n");
+            return false;
+        }
+        return GpuTrace::WriteSampleTrace(Common::FS::ToU8String(argv[2]));
+    }
+    GpuTrace::ReplayOptions options;
+    for (int i = 2; i < argc; ++i) {
+        const std::string_view argument{argv[i]};
+        const bool has_value = i + 1 < argc;
+        if (argument == "--out" && has_value) {
+            options.out = Common::FS::ToU8String(argv[++i]);
+        } else if (argument == "--frames" && has_value) {
+            options.max_frames = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (argument == "--record" && has_value) {
+            options.record = Common::FS::ToU8String(argv[++i]);
+        } else if (argument == "--record-from" && has_value) {
+            options.record_from = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (argument == "--record-presents" && has_value) {
+            options.record_presents = static_cast<u32>(std::strtoul(argv[++i], nullptr, 10));
+        } else if (argument == "--device" && has_value) {
+            Settings::values.vulkan_device.SetValue(std::atoi(argv[++i]));
+        } else if (options.trace.empty()) {
+            options.trace = Common::FS::ToU8String(argv[i]);
+        } else {
+            fmt::print(stderr, "unknown argument {}\n", argument);
+            return false;
+        }
+    }
+    if (options.trace.empty() || options.out.empty()) {
+        fmt::print(stderr, "usage: --replay <trace> --out <dir> [--frames N] [--device N]\n");
+        return false;
+    }
+    std::string error;
+    if (!GpuTrace::Replay(system, options, error)) {
+        fmt::print(stderr, "replay failed: {}\n", error);
+        return false;
+    }
+    return true;
+}
+
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
     // input; 240 Hz is plenty for input and the key script.
@@ -524,6 +578,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
         return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
+    if (argc > 1 && (std::string_view{argv[1]} == "--replay" ||
+                     std::string_view{argv[1]} == "--gpu-trace-sample")) {
+        return ReplayGpuTrace(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     }
 
     int option_index = 0;
@@ -611,6 +669,21 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
                                           &manual_provider);
     state->system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
     state->system.GetFileSystemController().CreateFactories(*state->system.GetFilesystem());
+    // The booted NSP's or XCI's control data (NACP) comes from this provider, which the Qt game
+    // list fills; without it the game reads an empty NACP.
+    if (const auto file =
+            state->system.GetFilesystem()->OpenFile(lp.filepath, FileSys::OpenMode::Read)) {
+        switch (Loader::IdentifyFile(file)) {
+        case Loader::FileType::NSP:
+        case Loader::FileType::NSZ:
+        case Loader::FileType::XCI:
+        case Loader::FileType::XCZ:
+            void(manual_provider.AddEntriesFromContainer(file));
+            break;
+        default:
+            break;
+        }
+    }
     state->system.GetUserChannel().clear();
 
     Service::AM::FrontendAppletParameters load_parameters{
@@ -633,6 +706,19 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         load_parameters.previous_program_index = handoff->previous_program_index;
         LOG_INFO(Frontend, "Restarted by the game: program index {}, {} user channel entries",
                  handoff->program_index, state->system.GetUserChannel().size());
+    }
+    // SdlState read the profiles before the config named the NAND.
+    state->system.GetProfileManager().ResetUserSaveFile();
+    Common::Nextendo::MigrateAccountFile(Service::Account::Nextendo::CurrentProfile(state->system));
+    if (Common::Nextendo::OnlinePlayActive()) {
+        const auto loader = Loader::GetLoader(
+            state->system, Core::GetGameFileFromPath(state->system.GetFilesystem(), lp.filepath),
+            load_parameters.program_id, load_parameters.program_index);
+        u64 title_id{};
+        if (loader && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success) {
+            Common::NplnPatchCatalog::PrepareForGame(
+                title_id, [&] { return loader->ReadMainBuildIdHex(state->system); });
+        }
     }
     const Core::SystemResultStatus load_result = state->system.Load(*state->emu_window, lp.filepath, load_parameters);
     switch (load_result) {
