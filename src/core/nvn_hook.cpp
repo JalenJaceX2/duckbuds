@@ -113,8 +113,6 @@ bool DirectAsked() {
 
 /// The boot's state, from Install to Uninstall (none unless the boot runs the direct renderer).
 std::unique_ptr<State> g_state;
-/// A boot of this process ran the direct renderer: its replay starts once per process.
-bool g_direct_ran{};
 /// The direct renderer failed to start on the device in this process (DirectFailed).
 bool g_replay_failed{};
 RendererChoice g_choice{RendererChoice::SettingOff};
@@ -588,7 +586,6 @@ void Install(Core::System& system, Kernel::KProcess& process) {
         .vulkan = Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan,
         .is_64bit = process.Is64Bit(),
         .has_nvn = state_owner != nullptr && !state_owner->bootstrap_entries.empty(),
-        .direct_ran_before = g_direct_ran,
         .replay_failed = g_replay_failed,
     });
     if (built || IsFallback(g_choice)) {
@@ -600,7 +597,6 @@ void Install(Core::System& system, Kernel::KProcess& process) {
         return;
     }
     State& state = *state_owner;
-    g_direct_ran = true;
     InstallDirect(state);
     LOG_INFO(Core,
              "NVN hook: {} nvnBootstrapLoader exports (SDK {}), nvnPrivate0 {:#x} ({} bytes), "
@@ -616,15 +612,15 @@ void DirectFailed() {
     LOG_WARNING(Core, "Renderer: GPU emulation ({})", Describe(g_choice));
     // The game has not run yet: without a state its NVN driver runs, on GPU emulation.
     g_state.reset();
+}
+
+void Uninstall() {
+    g_state.reset();
 #ifdef LICHII_NVN_DIRECT
     // The front end and the replay as before the first boot (their threads were joined and their
     // objects destroyed with the renderer): the next boot starts them again.
     nvn_direct_reset();
 #endif
-}
-
-void Uninstall() {
-    g_state.reset();
 }
 
 RendererChoice Choice() {

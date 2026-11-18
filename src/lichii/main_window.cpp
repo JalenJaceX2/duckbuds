@@ -2387,10 +2387,8 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             case RendererChoice::NoNvn:
                 return tr("the game does not use NVN");
             case RendererChoice::ReplayFailed:
-                return tr("it could not start on this GPU");
-            case RendererChoice::EarlierBoot:
             default:
-                return tr("it runs once per session: restart Lichii to use it again");
+                return tr("it could not start on this GPU");
             }
         }();
         message_label->setText(
