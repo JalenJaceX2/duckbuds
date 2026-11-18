@@ -356,6 +356,7 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
     case MAXWELL3D_REG_INDEX(const_buffer.offset):
     case MAXWELL3D_REG_INDEX(global_base_vertex_index):
     case MAXWELL3D_REG_INDEX(global_base_instance_index):
+    case MAXWELL3D_REG_INDEX(vertex_id_base):
     case MAXWELL3D_REG_INDEX(index_buffer.start_addr_high):
     case MAXWELL3D_REG_INDEX(index_buffer.start_addr_low):
     case MAXWELL3D_REG_INDEX(index_buffer.limit_addr_high):
@@ -364,8 +365,17 @@ bool Maxwell3D::IsFastDrawParameter(u32 method) {
         return true;
     default:
         return DrawManager::IsInstanceLoopMethod(method) || IsFastDrawDeltaMethod(method) ||
-               IsFastDrawVertexBuffer(method) || IsFastDrawVertexFormat(method);
+               IsFastDrawVertexBuffer(method) || IsFastDrawVertexFormat(method) ||
+               IsFastDrawQueryMethod(method);
     }
+}
+
+bool Maxwell3D::IsFastDrawQueryMethod(u32 method) {
+    // Neither is in what a delta draw keeps: the draw manager asks ShouldExecute for every draw,
+    // every draw resumes the counters and host conditional rendering (NotifySegment,
+    // CounterEnable), and a resolve that leaves the render pass ends the delta chain there.
+    return method == MAXWELL3D_REG_INDEX(clear_report_value) ||
+           method == MAXWELL3D_REG_INDEX(render_enable.mode);
 }
 
 bool Maxwell3D::IsFastDrawVertexFormat(u32 method) {
@@ -380,8 +390,10 @@ bool Maxwell3D::IsFastDrawVertexBuffer(u32 method) {
     constexpr u32 streams = MAXWELL3D_REG_INDEX(vertex_streams);
     constexpr u32 stream_words = sizeof(Regs::VertexStream) / sizeof(u32);
     if (method >= streams && method < streams + Regs::NumVertexArrays * stream_words) {
+        // address_high and address_low; stride, enable and frequency where they are dynamic.
         const u32 word = (method - streams) % stream_words;
-        return word == 1 || word == 2; // address_high, address_low
+        return word == 1 || word == 2 ||
+               VideoCommon::Nx2FastDraw::g_dynamic_vertex_streams.load(std::memory_order_relaxed);
     }
     constexpr u32 sizes = 0x600 / sizeof(u32); // SET_VERTEX_STREAM_SIZE_A/B (NativeVertexStreamSize)
     constexpr u32 limits = MAXWELL3D_REG_INDEX(vertex_stream_limits);
@@ -408,7 +420,8 @@ bool Maxwell3D::IsFastDrawDeltaMethod(u32 method) {
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
-    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method)) {
+    if (!DrawManager::IsInstanceLoopMethod(method) && !IsFastDrawDeltaMethod(method) &&
+        !IsFastDrawQueryMethod(method)) {
         VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Method, method);
     }
     if (GetNativeMacroEngine().native_turing && method == MAXWELL3D_REG_INDEX(clear_surface)) {

@@ -355,13 +355,17 @@ Id EmitIsbeRead(EmitContext& ctx, Id address) {
                         word);
 }
 
-// A task program reading back its output region: the task payload it writes.
+// A program reading back a word of its own output attribute region: the word
+// EmitIsbeWriteAttribute stores at the same address. A word that another invocation writes is
+// only defined here when that write is ordered before this read; hardware runs the warp's
+// threads in step, these invocations are not.
 Id EmitIsbeReadOutput(EmitContext& ctx, Id address) {
-    if (ctx.stage != Stage::Task) {
-        throw NotImplementedException("Stage buffer output read outside task programs");
-    }
     const Id index{ctx.OpShiftRightLogical(ctx.U32[1], address, ctx.Const(2U))};
-    return ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, index));
+    if (ctx.stage == Stage::Task) {
+        return ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, index));
+    }
+    return ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_attributes,
+                                            Clamped(ctx, index, ctx.mesh_attribute_words)));
 }
 
 void EmitIsbeWriteAttribute(EmitContext& ctx, Id address, Id value) {

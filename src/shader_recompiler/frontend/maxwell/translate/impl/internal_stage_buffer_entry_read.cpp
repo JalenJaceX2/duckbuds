@@ -126,7 +126,8 @@ void TranslatorVisitor::ISBERD(u64 insn) {
 
 // nx2 pseudo instruction for the ISBERD/ISBEWR of Switch 2 task and mesh programs (see
 // frontend/ampere/lower_to_maxwell.h). Addresses are linear bytes in the stage buffer: reads come
-// from the input attribute region, writes go to the output attribute or map region.
+// from the input attribute region, or with .O from the output attribute region the program has
+// written; writes go to the output attribute or map region.
 void TranslatorVisitor::ISBE_nx2(u64 insn) {
     union {
         u64 raw;
