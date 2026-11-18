@@ -136,6 +136,7 @@ private:
     vk::Instance instance;
 
     vk::DebugUtilsMessenger debug_messenger;
+    vk::DebugUtilsMessenger address_messenger;
 
     vk::SurfaceKHR surface;
 

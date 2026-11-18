@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <filesystem>
@@ -17,6 +18,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/internal_network/local_redirect.h"
+#include "core/internal_network/network.h"
 
 namespace Network::LocalRedirect {
 namespace {
@@ -107,28 +109,40 @@ std::shared_ptr<const Config> Get() {
 }
 
 bool IsLoopback(const SockAddrIn& address) {
+    if (address.family == Domain::INET6) {
+        static constexpr IPv6Address loopback{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+        static constexpr std::array<u8, 12> v4_mapped{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+        return address.ip6 == loopback ||
+               (std::equal(v4_mapped.begin(), v4_mapped.end(), address.ip6.begin()) &&
+                address.ip6[12] == 127);
+    }
     return address.ip[0] == 127;
-}
-
-std::string AddressToString(const SockAddrIn& address) {
-    return fmt::format("{}.{}.{}.{}:{}", address.ip[0], address.ip[1], address.ip[2],
-                       address.ip[3], address.portno);
 }
 
 } // Anonymous namespace
 
+std::vector<std::string> ParseHosts(std::string_view text) {
+    std::vector<std::string> hosts;
+    while (!text.empty()) {
+        const size_t end = text.find_first_of(", \t\r\n");
+        std::string host = Normalize(text.substr(0, end));
+        if (host.starts_with("*.")) {
+            host.erase(0, 2);
+        }
+        // A wildcard anywhere else, or on its own, names no host.
+        if (!host.empty() && host.find('*') == std::string::npos &&
+            std::ranges::find(hosts, host) == hosts.end()) {
+            hosts.push_back(std::move(host));
+        }
+        text = end == std::string_view::npos ? std::string_view{} : text.substr(end + 1);
+    }
+    return hosts;
+}
+
 void Configure() {
     auto config = std::make_shared<Config>();
     if (Settings::values.online_service_redirect.GetValue()) {
-        std::string_view rest{Settings::values.online_redirect_hosts.GetValue()};
-        while (!rest.empty()) {
-            const size_t comma = rest.find(',');
-            std::string host = Normalize(rest.substr(0, comma));
-            if (!host.empty()) {
-                config->hosts.push_back(std::move(host));
-            }
-            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
-        }
+        config->hosts = ParseHosts(Settings::values.online_redirect_hosts.GetValue());
         if (const auto& text = Settings::values.online_redirect_server.GetValue(); !text.empty()) {
             config->server = ParseServer(text);
             if (!config->server) {
@@ -144,7 +158,7 @@ void Configure() {
                  "Host redirect on: {} (and subdomains) -> 127.0.0.1; TCP 127.0.0.1:443 -> {}; "
                  "loopback only {}; extra CA certificate {} bytes",
                  config->hosts.empty() ? "no host names" : fmt::format("{}", fmt::join(config->hosts, ", ")),
-                 config->server ? AddressToString(*config->server) : "unchanged",
+                 config->server ? SockAddrToString(*config->server) : "unchanged",
                  config->loopback_only, config->test_ca.size());
     }
     std::scoped_lock lock{config_mutex};
@@ -193,7 +207,7 @@ SockAddrIn ConnectTarget(const SockAddrIn& address) {
     if (!config->server || address.ip != IPv4Address{127, 0, 0, 1} || address.portno != 443) {
         return address;
     }
-    LOG_DEBUG(Network, "Host redirect: 127.0.0.1:443 -> {}", AddressToString(*config->server));
+    LOG_DEBUG(Network, "Host redirect: 127.0.0.1:443 -> {}", SockAddrToString(*config->server));
     return *config->server;
 }
 

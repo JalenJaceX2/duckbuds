@@ -35,6 +35,7 @@
 #include "core/memory.h"
 #include "core/perf_stats.h"
 #include "video_core/gpu.h"
+#include "video_core/host_vsync.h"
 #include "video_core/nx2.h"
 #include "video_core/renderer_base.h"
 
@@ -103,8 +104,12 @@ public:
      * @param timing  Present word 12: (swap interval << 16) | refresh rate.
      * @param process Owning process, for the Mario Kart World dynamic FPS case; may be null.
      * @param presents The presenter's own count of presents (for its log line).
+     * @param vsync_owner The session's vsync state for HostVsync::SetPacing (the host display
+     *                    starts the frames of a game with an unlocked frame rate); null when the
+     *                    presenter has none (direct presents keep the vsync timer's rate).
      */
-    void PaceToVblank(u32 timing, const Kernel::KProcess* process, u64 presents) {
+    void PaceToVblank(u32 timing, const Kernel::KProcess* process, u64 presents,
+                      const void* vsync_owner) {
         auto& kernel = system.Kernel();
         const bool trace = Common::DkbFrameTrace::Enabled();
         if (trace) {
@@ -150,6 +155,13 @@ public:
         }();
         const u32 fps_limit =
             forced_fps_limit != 0 ? forced_fps_limit : Settings::values.fps_limit.GetValue();
+        // The display starts this session's frames (HostVsync) only for a game whose frame rate
+        // is unlocked, no faster than the FPS limit. A locked game counts vsync events to time
+        // itself, so it keeps the timer's fixed rate.
+        if (vsync_owner != nullptr) {
+            VideoCore::HostVsync::SetPacing(
+                vsync_owner, process != nullptr && process->IsFrameRateUnlocked(), fps_limit);
+        }
         // With a frame rate limit other than 60 Hz the vsync event already paces the game; holding
         // its swap interval here as well kept it at 60 fps (interval 2 of a 120 Hz event). Only an
         // explicit FPS limit still applies then.

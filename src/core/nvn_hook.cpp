@@ -728,7 +728,7 @@ void PresentDirect(Core::System& system, State& state) {
         system.GPU().RequestComposite(std::move(layers), {});
     }
     present.Finish(own);
-    present.PaceToVblank((frame.interval << 16) | 60, system.ApplicationProcess(), own);
+    present.PaceToVblank((frame.interval << 16) | 60, system.ApplicationProcess(), own, nullptr);
     LogStubCensus(state, number);
 }
 } // namespace
