@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bananative/dm/gfx/vk_android/vka.h"
 #include "nvn_direct.h"
 
 // This file's own variables stay out of those sections: they outlive the reset.
@@ -36,8 +37,7 @@ extern char __start_nvn_direct_data[] __attribute__((weak)), __stop_nvn_direct_d
 #define DATA_END __stop_nvn_direct_data
 #endif
 
-extern uint64_t g_t0_ns; // nvn_direct_host.c
-uint64_t now_ns(void);
+int nvn_direct_threads_left(void); // nvn_shutdown.c
 
 static unsigned char* g_initial_data;
 
@@ -49,6 +49,10 @@ __attribute__((constructor)) static void keep_initial_data(void) {
 
 void nvn_direct_reset(void) {
     if (!g_initial_data) return;
+    if (!nvn_direct_threads_left()) {
+        VRED("a thread of the replay did not leave: its state is not reset");
+        return;
+    }
     memcpy(DATA_BEGIN, g_initial_data, (size_t)(DATA_END - DATA_BEGIN));
     memset(BSS_BEGIN, 0, (size_t)(BSS_END - BSS_BEGIN));
     g_t0_ns = now_ns(); // (the game's clock: nvnDeviceGetCurrentTimestampInNanoseconds)

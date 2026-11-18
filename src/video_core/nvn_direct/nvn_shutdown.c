@@ -34,6 +34,7 @@ void nvn_direct_present_wake(void); // nvn_present.c
 int vka_rc_park(uint64_t timeout_ns); // nvn_recompile.c
 void vka_destroy(void); // vka_dev.c
 void nvn_hle_destroy(void); // hle_nvn.c
+void nvn_tracking_destroy(void); // nvn_tracking.c
 
 static _Atomic int g_parked;
 
@@ -231,10 +232,19 @@ void nvn_direct_park(void) {
     _exit(1);
 }
 
+// nvn_reset.c, before the reset: a boot that ended without nvn_direct_park (it failed before its
+// renderer adopted the device) may have left the stop's watchdog. 1 = no thread is left
+int nvn_direct_threads_left(void) {
+    atomic_store(&g_parked, 1);
+    int running = 0;
+    return threads_leave(3000000000ull, &running);
+}
+
 void nvn_direct_destroy(void) {
     const uint64_t t0 = now_ns();
     VLOG("the device is idle: the replay's objects go");
     if (vka_ok()) vka_destroy();
     nvn_hle_destroy();
+    nvn_tracking_destroy();
     VLOG("the replay's objects and the front end's mappings destroyed in %.0f ms", (now_ns() - t0) / 1e6);
 }
