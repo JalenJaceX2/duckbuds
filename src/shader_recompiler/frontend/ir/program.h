@@ -28,6 +28,8 @@ struct Program {
     u32 local_memory_size{};
     u32 shared_memory_size{};
     bool is_geometry_passthrough{};
+    /// A native (Switch 2) program (Environment::IsNativeProgram).
+    bool is_native{};
     MeshInfo mesh{};
     /// Sets of storage buffer descriptor indices, and the global accesses routed among one of them
     /// (an index into the sets) instead of among every bound storage buffer
