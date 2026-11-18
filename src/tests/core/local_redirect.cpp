@@ -131,6 +131,24 @@ TEST_CASE("LocalRedirect: host names map to the user's server", "[core]") {
     REQUIRE(Same(LocalRedirect::ConnectTarget(Public), Public));
     REQUIRE(LocalRedirect::Allowed(Public));
 
+    // A dual-stack INET6 socket reaches 127.0.0.1 as ::ffff:127.0.0.1 and stays INET6.
+    Network::SockAddrIn mapped{Network::Domain::INET6, {}, 443};
+    mapped.ip6 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1};
+    const Network::SockAddrIn mapped_target = LocalRedirect::ConnectTarget(mapped);
+    REQUIRE(mapped_target.family == Network::Domain::INET6);
+    REQUIRE(mapped_target.portno == 8443);
+    REQUIRE(mapped_target.ip6 ==
+            Network::IPv6Address{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1});
+    Network::SockAddrIn mapped_http = mapped;
+    mapped_http.portno = 80;
+    REQUIRE(LocalRedirect::ConnectTarget(mapped_http).portno == 80);
+    // The redirect never resolves to ::1, so ::1 stays where it is.
+    Network::SockAddrIn loopback6 = mapped;
+    loopback6.ip6 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    const Network::SockAddrIn loopback6_target = LocalRedirect::ConnectTarget(loopback6);
+    REQUIRE(loopback6_target.ip6 == loopback6.ip6);
+    REQUIRE(loopback6_target.portno == 443);
+
     Settings::values.online_redirect_loopback_only = true;
     LocalRedirect::Configure();
     REQUIRE_FALSE(LocalRedirect::Allowed(Public));
