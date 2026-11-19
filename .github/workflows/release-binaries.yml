@@ -676,8 +676,8 @@ jobs:
   # unticked.
   release:
     name: Publish release
-    needs: build
-    if: github.event_name == 'push' || inputs.publish_release
+    needs: [prepare-release, build]
+    if: ${{ !cancelled() && needs.prepare-release.result == 'success' && (github.event_name == 'push' || inputs.publish_release) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
