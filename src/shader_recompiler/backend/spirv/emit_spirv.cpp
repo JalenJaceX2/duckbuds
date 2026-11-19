@@ -456,20 +456,27 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
 
 void SetupSignedNanCapabilities(const Profile& profile, const IR::Program& program,
                                 EmitContext& ctx, Id main_func) {
-    if (profile.has_broken_fp16_float_controls && program.info.uses_fp16) {
+    // Drivers with broken fp16 float controls (NVIDIA) get no mode in programs that use fp16
+    // (ff35ef8ec1, Fire Emblem: Three Houses). Native (Switch 2) programs still get the fp32 and
+    // fp64 ones there: without the fp32 mode the driver may fold clamps such as
+    // min(max(1/x, -FLT_MAX), FLT_MAX) away, so 0 * (1/0) gives NaN where the console gives 0
+    // (black and NaN-spread blocks in The Duskbloods).
+    const bool broken_fp16 = profile.has_broken_fp16_float_controls && program.info.uses_fp16;
+    if (broken_fp16 && !program.is_native) {
         return;
     }
-    if (program.info.uses_fp16 && profile.support_fp16_signed_zero_nan_preserve) {
+    const auto preserve = [&](u32 width) {
         ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 16U);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, width);
+    };
+    if (program.info.uses_fp16 && profile.support_fp16_signed_zero_nan_preserve && !broken_fp16) {
+        preserve(16U);
     }
     if (profile.support_fp32_signed_zero_nan_preserve) {
-        ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 32U);
+        preserve(32U);
     }
     if (program.info.uses_fp64 && profile.support_fp64_signed_zero_nan_preserve) {
-        ctx.AddCapability(spv::Capability::SignedZeroInfNanPreserve);
-        ctx.AddExecutionMode(main_func, spv::ExecutionMode::SignedZeroInfNanPreserve, 64U);
+        preserve(64U);
     }
 }
 
@@ -497,14 +504,18 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
         }
         ctx.AddCapability(spv::Capability::DemoteToHelperInvocation);
     }
-    if (info.stores[IR::Attribute::ViewportIndex] && profile.support_multi_viewport) {
+    // A mesh program emulated as compute stores its Layer and ViewportIndex in its output buffer.
+    const bool stores_viewport_layer{!ctx.runtime_info.mesh_as_compute};
+    if (info.stores[IR::Attribute::ViewportIndex] && profile.support_multi_viewport &&
+        stores_viewport_layer) {
         ctx.AddCapability(spv::Capability::MultiViewport);
     }
     if (info.stores[IR::Attribute::ViewportMask] && profile.support_viewport_mask) {
         ctx.AddExtension("SPV_NV_viewport_array2");
         ctx.AddCapability(spv::Capability::ShaderViewportMaskNV);
     }
-    if (info.stores[IR::Attribute::Layer] || info.stores[IR::Attribute::ViewportIndex]) {
+    if ((info.stores[IR::Attribute::Layer] || info.stores[IR::Attribute::ViewportIndex]) &&
+        stores_viewport_layer) {
         if (profile.support_viewport_index_layer_non_geometry && ctx.stage != Stage::Geometry) {
             ctx.AddExtension("SPV_EXT_shader_viewport_index_layer");
             ctx.AddCapability(spv::Capability::ShaderViewportIndexLayerEXT);
@@ -593,7 +604,13 @@ void PatchPhiNodes(IR::Program& program, EmitContext& ctx) {
                     ++phi_index;
                 }
                 IR::Inst* phi = phi_instructions[phi_index];
-                return { ctx.Def(phi->Arg(phi_arg)), parent };
+                const Id value{ctx.Def(phi->Arg(phi_arg))};
+                if (!Sirit::ValidId(value)) {
+                    // An operand removed from the program: SPIR-V with ID 0 can bring the
+                    // driver down, a failed pipeline only skips its work.
+                    throw LogicError("Phi operand {} has no definition", phi_arg);
+                }
+                return { value, parent };
             });
         }
 
@@ -668,7 +685,9 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
     const std::optional<u32> tensor_scratch_word{ReserveCooperativeHmmaScratch(profile, program)};
-    EmitContext ctx{profile, runtime_info, program, bindings};
+    const bool cooperative_hmma{tensor_scratch_word.has_value() ||
+                                UsesCooperativeHmma(profile, program)};
+    EmitContext ctx{profile, runtime_info, program, bindings, cooperative_hmma};
     ctx.tensor_scratch_word = tensor_scratch_word;
     DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};
