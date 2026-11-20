@@ -161,7 +161,7 @@ int cap_close(cap_writer *w) {
 int cap_load(cap_reader *r, const char *path) {
     memset(r, 0, sizeof *r);
     FILE *f = fopen(path, "rb"); if (!f) return 0;
-    fseeko(f, 0, SEEK_END); off_t n = ftello(f); fseeko(f, 0, SEEK_SET);
+    fseeko(f, 0, SEEK_END); int64_t n = ftello(f); fseeko(f, 0, SEEK_SET);
     if (n < 16 || !(r->buf = malloc((size_t)n)) || fread(r->buf, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(r->buf); r->buf = NULL; return 0; }
     fclose(f); r->n = (size_t)n;
     uint32_t ver; memcpy(&ver, r->buf + 8, 4);

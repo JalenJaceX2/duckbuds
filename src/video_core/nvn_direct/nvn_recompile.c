@@ -415,13 +415,13 @@ static void disk_open(void) {
     const uint64_t stamp[2] = {NVN_RECOMPILE_STAMP, (uint64_t)V.props.vendorID << 48 ^ (uint64_t)V.props.deviceID << 32 ^ V.props.driverVersion ^
                                                     (vka_scale_on() ? ((uint64_t)vka_scale_up << 8 | vka_scale_shift) * 0x9E3779B97F4A7C15ull : 0)};
     char path[1024]; snprintf(path, sizeof path, "%s/vk_recompiled.bin", t);
-    FILE* f = fopen(path, "rb"); unsigned n = 0; long good = 0, end = 0;
+    FILE* f = fopen(path, "rb"); unsigned n = 0; int64_t good = 0, end = 0;
     if (f) {
         uint32_t magic = 0; uint64_t had[2] = {0, 0};
         if (fread(&magic, 4, 1, f) == 1 && magic == RC_FILE_MAGIC && fread(had, 8, 2, f) == 2 && had[0] == stamp[0] && had[1] == stamp[1]) {
-            rc_rec r; good = ftell(f); unsigned ns = 0;
+            rc_rec r; good = ftello(f); unsigned ns = 0;
             while (fread(&r, sizeof r, 1, f) == 1 && (r.magic == RC_REC_MAGIC || r.magic == RC_SPEC_MAGIC)) {
-                if (r.magic == RC_SPEC_MAGIC) { if (r.size != sizeof r) break; rc_put(&g_spec_done, rc_key(r.key), (void*)1); ns++; good = ftell(f); continue; }
+                if (r.magic == RC_SPEC_MAGIC) { if (r.size != sizeof r) break; rc_put(&g_spec_done, rc_key(r.key), (void*)1); ns++; good = ftello(f); continue; }
                 size_t rest = rc_rec_rest(&r);
                 if (r.size != sizeof r + rest) break;
                 uint8_t* m = malloc(sizeof r + rest); if (!m) break;
@@ -430,15 +430,15 @@ static void disk_open(void) {
                 if (r.ctl_len < sizeof(rc_control) || rc_control_bytes(rc_rec_control((const rc_rec*)m)) != r.ctl_len) { free(m); break; }
                 // (Lichii: by the slot of its depth mode: records written before the mode was part of the slot have the key's own in r.slot)
                 rc_put(&g_disk, rc_translation_slot(r.key, r.prim_inputs, (int)rc_rec_control((const rc_rec*)m)->stage, r.gl_depth), m);
-                n++; good = ftell(f);
+                n++; good = ftello(f);
             }
             if (ns) VLOG("recompiler: %u shaders translated speculatively in earlier runs (not done again)", ns);
             // A run killed while it appended a record leaves part of one at the end: cut there, or this run's records would follow it and never be read
-            fseek(f, 0, SEEK_END); end = ftell(f);
+            fseeko(f, 0, SEEK_END); end = ftello(f);
         } else n = ~0u;
         fclose(f);
         if (n != ~0u && end > good) {
-            VLOG("recompiler: %s ends in %ld bytes of a record not written whole (a run that ended while writing it): cut off", path, end - good);
+            VLOG("recompiler: %s ends in %lld bytes of a record not written whole (a run that ended while writing it): cut off", path, (long long)(end - good));
             if (truncate(path, good)) VRED("recompiler: %s not cut (errno %d): translations made now are not read back", path, errno);
         }
     }

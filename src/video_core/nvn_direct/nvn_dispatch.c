@@ -67,7 +67,7 @@ uint64_t nvn_direct_alias_pages(void* to, uint64_t host, uint64_t size) {
             n += 0x1000;
         }
         uint8_t* const at = (uint8_t*)to + o;
-        if (fd < 0 || mmap(at, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, (off_t)offset) ==
+        if (fd < 0 || mmap(at, n, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, offset) ==
                           MAP_FAILED) {
             mmap(at, n, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
             missing += n;
