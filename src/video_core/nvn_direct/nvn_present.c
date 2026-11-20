@@ -30,10 +30,11 @@ typedef struct {
 } pres_t;
 static pres_t g_pres[NPRES];
 static uint64_t g_reserved, g_filled;
-// The presenting queue's last submission, by ticket: the present waits for it
-// and every fence before it. The last submission of any queue may be another queue's that waits for an event the game
-// signals only in its next frame (Mario Kart World's second queue): the next acquire then waited
-// for it, and the composite up to 1 s.
+// The presenting queue's last submission, by ticket: the composite waits for that fence alone (its
+// queue's earlier work and the syncs it waited for on the GPU come before it), not the fences of
+// other queues before it. The last submission of any queue may be another queue's that waits for
+// an event the game signals only in its next frame (Mario Kart World's second queue): the next
+// acquire then waited for it, and the composite up to 1 s.
 _Thread_local uint64_t nvn_direct_present_queue_fence;
 static uint64_t g_queue_fence[NPRES];
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -211,7 +212,7 @@ int nvn_direct_present_frame(uint64_t id, nvn_direct_frame* out) {
     if (!ok) return 0;
     // Drawn on the replay's queues: Lichii samples it once the GPU is past its fence (bounded:
     // a frame whose GPU work waits on the CPU is shown as far as it got).
-    if (out->fence && !vka_wait_done(out->fence, 1000000000ull)) {
+    if (out->fence && !vka_wait_fence(out->fence, 1000000000ull)) {
         static _Atomic int n;
         if (atomic_fetch_add(&n, 1) < 8) VRED("present: frame %llu's fence %llu not reached in 1 s: shown as it is", (unsigned long long)out->id, (unsigned long long)out->fence);
     }
