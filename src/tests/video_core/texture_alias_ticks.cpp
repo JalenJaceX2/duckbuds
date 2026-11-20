@@ -209,4 +209,18 @@ TEST_CASE("A small readback image's stale async download is not written back",
     CHECK(VideoCommon::SkipStaleReadbackWriteBack(image, staged, true));
     CHECK_FALSE(VideoCommon::SkipStaleReadbackWriteBack(image, staged, false));
     CHECK_FALSE(VideoCommon::SkipStaleReadbackWriteBack(images[large], staged, true));
+
+    // Uploaded again since (a synchronous read cleared GpuModified, then the guest wrote its
+    // memory): the snapshot would overwrite the guest's newer bytes.
+    for (const ImageId id : {small, large}) {
+        images[id].modification_tick = staged;
+        images[id].load_tick = staged;
+    }
+    CHECK(VideoCommon::SkipStaleReadbackWriteBack(image, staged, true));
+    CHECK_FALSE(VideoCommon::SkipStaleReadbackWriteBack(image, staged, false));
+    CHECK_FALSE(VideoCommon::SkipStaleReadbackWriteBack(images[large], staged, true));
+    image.load_tick = staged + 3;
+    CHECK(VideoCommon::SkipStaleReadbackWriteBack(image, staged, true));
+    image.load_tick = staged - 1;
+    CHECK_FALSE(VideoCommon::SkipStaleReadbackWriteBack(image, staged, true));
 }
