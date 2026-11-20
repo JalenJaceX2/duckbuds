@@ -158,6 +158,10 @@ typedef struct nvn_direct_device {
     /// until asynchronous threads have made it, instead of the frame waiting for its compile
     /// (vka_pso.c async_threads).
     int async_pipelines;
+    /// Whether Lichii's device enabled pipelineCreationCacheControl (Vulkan 1.3 or
+    /// VK_EXT_pipeline_creation_cache_control): only then does the replay ask the pipeline cache
+    /// alone with VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT (vka_pso.c cache_probe).
+    int pipeline_creation_cache_control;
     /// Translates a program stage with Lichii's shader recompiler: 1 = done,
     /// 0 = not (shader->error says why). NULL: no recompiler.
     int (*shader_translate)(void* context, const nvn_direct_shader_source* source, nvn_direct_shader* shader);

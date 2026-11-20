@@ -339,6 +339,7 @@ bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const 
         },
         .pipeline_context = &shader_notify,
         .async_pipelines = Settings::values.use_asynchronous_shaders.GetValue(),
+        .pipeline_creation_cache_control = device.IsPipelineCreationCacheControlSupported(),
         .shader_translate = &NvnDirectShaders::Translate,
         .shader_free = &NvnDirectShaders::Free,
         .shader_context = &shaders,

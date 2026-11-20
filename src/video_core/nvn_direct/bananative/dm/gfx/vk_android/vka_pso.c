@@ -1047,7 +1047,7 @@ static int gfx_make(gval *g, const gkey_full *fk, size_t len, vka_shader *const 
     if (P && pstate_fill(P, sh, lay, k)) {   // (else logged by vka_shader_module)
         const int gpl = gpl_on() && !P->mesh && !P->vrs && !k->excl;   // (a mesh pipeline is made whole: the libraries here are cut for vertex input pipelines; Lichii: so are those with a shading rate attachment or an exclusive scissor)
         // The pipeline cache may already hold the optimized one (made in an earlier run): then it is made at once, else linked from parts
-        if (mode == MK_FRAME && (gpl || async)) p = cache_probe(P);
+        if (mode == MK_FRAME && (gpl || async) && V.cache_ctl) p = cache_probe(P);   // (the cache-only try needs pipelineCreationCacheControl; without it, as a miss)
         if (!p && mode != MK_PREWARM && gpl) {
             uint64_t t1 = now_ns();
             t_lib_peek = async; p = gpl_link(P, k); t_lib_peek = 0;

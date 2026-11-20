@@ -50,6 +50,8 @@ VK_DEFINE_HANDLE(VmaPool)
 
 #define FOR_EACH_VK_FEATURE_1_3(FEATURE)                                                           \
     FEATURE(EXT, ImageRobustness, IMAGE_ROBUSTNESS, robust_image_access)                           \
+    FEATURE(EXT, PipelineCreationCacheControl, PIPELINE_CREATION_CACHE_CONTROL,                    \
+            pipeline_creation_cache_control)                                                       \
     FEATURE(EXT, ShaderDemoteToHelperInvocation, SHADER_DEMOTE_TO_HELPER_INVOCATION,               \
             shader_demote_to_helper_invocation)                                                    \
     FEATURE(EXT, SubgroupSizeControl, SUBGROUP_SIZE_CONTROL, subgroup_size_control)                \
@@ -1118,6 +1120,12 @@ FN_MAX_LIMIT_LIST
     /// Returns true if the device supports VK_KHR_synchronization2.
     bool HasSynchronization2() const {
         return extensions.synchronization2;
+    }
+
+    /// Returns true if pipelineCreationCacheControl is enabled (Vulkan 1.3 or
+    /// VK_EXT_pipeline_creation_cache_control).
+    bool IsPipelineCreationCacheControlSupported() const {
+        return extensions.pipeline_creation_cache_control;
     }
 
     /// Returns the minimum supported version of SPIR-V.
