@@ -71,15 +71,30 @@ int64_t plat_thread_self_system_ns(void) {
     FILETIME created, exited, kernel, user;
     return GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user) ? (int64_t)(filetime_100ns(kernel) * 100) : -1;
 }
-// Sleeps of less than the scheduler's tick (the replay polls in steps of 50-200 us): a high-resolution waitable timer per thread, Sleep where there is none
+// Sleeps of less than the scheduler's tick (the replay polls in steps of 50-200 us): a high-resolution waitable timer per thread. Where the system
+// cannot make one, a regular waitable timer (it ends on the system timer's tick), and Sleep where there is no timer at all. Each thread tries once
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION   // (Windows 10 1803; older SDKs lack the name, as in common/thread.cpp)
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 static _Thread_local HANDLE t_timer;
+static _Thread_local int t_timer_tried;
+static volatile LONG g_timer_failure_logged;
 int nanosleep(const struct timespec *req, struct timespec *rem) {
     if (rem) { rem->tv_sec = 0; rem->tv_nsec = 0; }
     uint64_t ns = (uint64_t)req->tv_sec * 1000000000ull + (uint64_t)req->tv_nsec;
-    if (!t_timer) t_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!t_timer_tried) {
+        t_timer_tried = 1;
+        t_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!t_timer) {
+            DWORD high_resolution_error = GetLastError();
+            t_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+            DWORD regular_error = t_timer ? 0 : GetLastError();
+            if (!InterlockedExchange(&g_timer_failure_logged, 1)) {
+                if (t_timer) LOG("no high-resolution waitable timer (error %lu): sleeps end on the system timer's tick", high_resolution_error);
+                else LOG("no high-resolution waitable timer (error %lu) nor a regular one (error %lu): sleeps are rounded up to whole milliseconds", high_resolution_error, regular_error);
+            }
+        }
+    }
     LARGE_INTEGER due;
     due.QuadPart = -(LONGLONG)((ns + 99) / 100);   // relative, in 100 ns steps
     if (t_timer && SetWaitableTimerEx(t_timer, &due, 0, NULL, NULL, NULL, 0)) WaitForSingleObject(t_timer, INFINITE);
