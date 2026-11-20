@@ -151,9 +151,11 @@ TEST_CASE("A small readback image's async download clears GpuModified only when 
     const ImageId small = images.insert(exposure, 0x10000, 0x10000);
     const ImageId large = images.insert(Info(), 0x20000, 0x20000);
     REQUIRE(images[large].guest_size_bytes > 0x1000);
-    // As PrepareImage after RefreshContents and MarkModification, then CommitAsyncFlushes.
+    // As PrepareImage after RefreshContents (load_tick = the counter) and MarkModification
+    // (++counter), then CommitAsyncFlushes.
     for (const ImageId id : {small, large}) {
         images[id].flags = ImageFlagBits::GpuModified;
+        images[id].load_tick = 6;
         images[id].modification_tick = 7;
     }
     ImageBase& image = images[small];
@@ -171,4 +173,40 @@ TEST_CASE("A small readback image's async download clears GpuModified only when 
     image.modification_tick = staged;
     image.flags |= ImageFlagBits::CpuModified;
     CHECK_FALSE(VideoCommon::AsyncReadbackLands(image, staged, true));
+
+    // Uploaded again after the commit (RefreshContents cleared CpuModified): the GPU image holds
+    // the guest's bytes, which the write-back overwrote.
+    image.flags &= ~ImageFlagBits::CpuModified;
+    image.load_tick = staged;
+    CHECK_FALSE(VideoCommon::AsyncReadbackLands(image, staged, true));
+    image.load_tick = staged + 3;
+    CHECK_FALSE(VideoCommon::AsyncReadbackLands(image, staged, true));
+    image.load_tick = staged - 1;
+    CHECK(VideoCommon::AsyncReadbackLands(image, staged, true));
+}
+
+TEST_CASE("A small readback image's stale async download is not written back",
+          "[video_core][texture_cache]") {
+    Common::SlotVector<ImageBase> images;
+    ImageInfo exposure = Info();
+    exposure.format = PixelFormat::R32G32_FLOAT;
+    exposure.size = {8, 1, 1};
+    const ImageId small = images.insert(exposure, 0x10000, 0x10000);
+    const ImageId large = images.insert(Info(), 0x20000, 0x20000);
+    REQUIRE(images[large].guest_size_bytes > 0x1000);
+    const u64 staged = 7;
+    for (const ImageId id : {small, large}) {
+        images[id].load_tick = 6;
+        images[id].modification_tick = staged;
+    }
+    ImageBase& image = images[small];
+
+    CHECK_FALSE(VideoCommon::SkipStaleReadbackWriteBack(image, staged, true));
+
+    // Written again by the GPU after the copy was staged: the snapshot is older.
+    image.modification_tick = 8;
+    images[large].modification_tick = 8;
+    CHECK(VideoCommon::SkipStaleReadbackWriteBack(image, staged, true));
+    CHECK_FALSE(VideoCommon::SkipStaleReadbackWriteBack(image, staged, false));
+    CHECK_FALSE(VideoCommon::SkipStaleReadbackWriteBack(images[large], staged, true));
 }

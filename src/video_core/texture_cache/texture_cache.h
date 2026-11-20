@@ -3194,8 +3194,13 @@ void TextureCache<P>::PopAsyncFlushes() {
                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
+                if (SkipStaleReadbackWriteBack(image, download_info.tick, SmallReadbacks())) {
+                    continue;
+                }
                 // Newer data written meanwhile stays: a write-back queued after this flush was
                 // committed can land before it pops, and the snapshot is older.
+                // This can overwrite guest writes made after the commit, as on the stock path; no
+                // CpuModified skip, since that flag is per page and would drop valid landings.
                 KeepRanges keep;
                 KeepNewerLanded(image, download_info.tick, keep);
                 if (WriteBackImage(image, copies, download_span, keep)) {

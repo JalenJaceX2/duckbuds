@@ -211,12 +211,23 @@ void NoteStorageWrite(ImageBase& image, u32 levels_before, const SubresourceRang
 /// Whether an asynchronous download of a small readback image (CpuReadDownloads), staged at
 /// modification tick `download_tick`, leaves guest memory with the image's current contents
 /// once written back, so the image is no longer GPU-modified. Not once the GPU wrote it again
-/// or the guest wrote its memory.
+/// or the guest wrote its memory, or it was uploaded again since (RefreshContents sets load_tick
+/// to the counter, which the staged write then raised above it).
 [[nodiscard]] inline bool AsyncReadbackLands(const ImageBase& image, u64 download_tick,
                                              bool small_readbacks) noexcept {
     return small_readbacks && image.guest_size_bytes <= 0x1000 &&
-           image.modification_tick == download_tick &&
+           image.modification_tick == download_tick && image.load_tick < download_tick &&
            False(image.flags & ImageFlagBits::CpuModified);
+}
+
+/// Whether the write-back of a small readback image's async download, staged at
+/// `download_tick`, is skipped because the GPU wrote the image since: a synchronous read may
+/// already have put the newer data in guest memory, and either a newer download is queued or
+/// GpuModified makes the next read download.
+[[nodiscard]] inline bool SkipStaleReadbackWriteBack(const ImageBase& image, u64 download_tick,
+                                                     bool small_readbacks) noexcept {
+    return small_readbacks && image.guest_size_bytes <= 0x1000 &&
+           image.modification_tick != download_tick;
 }
 
 /// Sets an image's modification tick and raises its aliases' newest_alias_tick to it.
