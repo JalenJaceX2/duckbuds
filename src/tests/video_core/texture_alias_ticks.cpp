@@ -141,3 +141,34 @@ TEST_CASE("Small GPU-written images download on every CPU read on Switch 2",
     CHECK_FALSE(VideoCommon::CpuReadDownloads(images[large], true));
     CHECK_FALSE(VideoCommon::CpuReadDownloads(images[small], false));
 }
+
+TEST_CASE("A small readback image's async download clears GpuModified only when current",
+          "[video_core][texture_cache]") {
+    Common::SlotVector<ImageBase> images;
+    ImageInfo exposure = Info();
+    exposure.format = PixelFormat::R32G32_FLOAT;
+    exposure.size = {8, 1, 1};
+    const ImageId small = images.insert(exposure, 0x10000, 0x10000);
+    const ImageId large = images.insert(Info(), 0x20000, 0x20000);
+    REQUIRE(images[large].guest_size_bytes > 0x1000);
+    // As PrepareImage after RefreshContents and MarkModification, then CommitAsyncFlushes.
+    for (const ImageId id : {small, large}) {
+        images[id].flags = ImageFlagBits::GpuModified;
+        images[id].modification_tick = 7;
+    }
+    ImageBase& image = images[small];
+    const u64 staged = 7;
+
+    CHECK(VideoCommon::AsyncReadbackLands(image, staged, true));
+    CHECK_FALSE(VideoCommon::AsyncReadbackLands(image, staged, false));
+    CHECK_FALSE(VideoCommon::AsyncReadbackLands(images[large], staged, true));
+
+    // Written again by the GPU after the copy was staged: the copy is older.
+    image.modification_tick = 8;
+    CHECK_FALSE(VideoCommon::AsyncReadbackLands(image, staged, true));
+
+    // The guest wrote its memory: what landed is not what the guest now holds.
+    image.modification_tick = staged;
+    image.flags |= ImageFlagBits::CpuModified;
+    CHECK_FALSE(VideoCommon::AsyncReadbackLands(image, staged, true));
+}

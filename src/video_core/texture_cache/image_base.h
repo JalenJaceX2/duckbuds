@@ -199,11 +199,24 @@ void NoteStorageWrite(ImageBase& image, u32 levels_before, const SubresourceRang
 
 /// Whether a guest CPU read of this GPU-written image downloads it, instead of trusting what its
 /// first read left in guest memory (later downloads are queued only when a view is bound anew).
-/// With `small_readbacks`, images of at most 4 KiB always download: The Duskbloods redraws its
-/// 8x1 RG32F auto-exposure ring into the same bound targets, so each slot kept its first-read
-/// value and the light intensity built from it flickered every 4th frame.
+/// With `small_readbacks`, images of at most 4 KiB always download: The Duskbloods writes its
+/// 8x1 RG32F auto-exposure ring with 2D blits, which bind no view, so each slot kept its
+/// first-read value and the light intensity built from it flickered every 4th frame. Usually
+/// the download PrepareImage queues at the write lands first (AsyncReadbackLands) and the read
+/// finds nothing GPU-modified; this covers a read that comes before it.
 [[nodiscard]] inline bool CpuReadDownloads(const ImageBase& image, bool small_readbacks) noexcept {
     return !image.info.forced_flushed || (small_readbacks && image.guest_size_bytes <= 0x1000);
+}
+
+/// Whether an asynchronous download of a small readback image (CpuReadDownloads), staged at
+/// modification tick `download_tick`, leaves guest memory with the image's current contents
+/// once written back, so the image is no longer GPU-modified. Not once the GPU wrote it again
+/// or the guest wrote its memory.
+[[nodiscard]] inline bool AsyncReadbackLands(const ImageBase& image, u64 download_tick,
+                                             bool small_readbacks) noexcept {
+    return small_readbacks && image.guest_size_bytes <= 0x1000 &&
+           image.modification_tick == download_tick &&
+           False(image.flags & ImageFlagBits::CpuModified);
 }
 
 /// Sets an image's modification tick and raises its aliases' newest_alias_tick to it.
