@@ -338,6 +338,21 @@ target_compile_definitions(tests PRIVATE
 
 add_test(NAME tests COMMAND tests)
 
+if (TARGET nvn_direct AND NOT WIN32)
+    set(NVN_DIRECT_DIR ../video_core/nvn_direct)
+    add_executable(nvn_tracking_tests
+        video_core/nvn_tracking.c
+        ${NVN_DIRECT_DIR}/nvn_tracking.c)
+    target_include_directories(nvn_tracking_tests PRIVATE
+        ${NVN_DIRECT_DIR}/bananative/gen
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/nvn
+        ${NVN_DIRECT_DIR}/bananative/dm/host)
+    set_target_properties(nvn_tracking_tests PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    target_compile_definitions(nvn_tracking_tests PRIVATE __ANDROID__ _GNU_SOURCE)
+    target_link_libraries(nvn_tracking_tests PRIVATE Threads::Threads Vulkan::Headers)
+    add_test(NAME nvn_tracking_tests COMMAND nvn_tracking_tests)
+endif()
+
 add_executable(profile_migration_tests
     common/profile_migration.cpp)
 target_link_libraries(profile_migration_tests PRIVATE common Catch2::Catch2WithMain)

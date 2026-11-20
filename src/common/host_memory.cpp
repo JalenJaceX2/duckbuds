@@ -252,7 +252,7 @@ public:
         }
     }
 
-    void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
+    bool Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
         DWORD new_flags{};
         if (read && write) {
             new_flags = PAGE_READWRITE;
@@ -275,20 +275,23 @@ public:
         {
             std::shared_lock protect_lock{protect_mutex};
             if (VirtualProtect(virtual_base + virtual_offset, length, new_flags, &old_flags)) {
-                return;
+                return true;
             }
         }
 
         std::scoped_lock lock{placeholder_mutex};
+        bool protected_all = true;
         auto [it, end] = placeholders.equal_range({virtual_offset, virtual_end});
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
             if (!VirtualProtect(virtual_base + offset, protect_length, new_flags, &old_flags)) {
                 LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
+                protected_all = false;
             }
             ++it;
         }
+        return protected_all;
     }
 
     /// Backing offset the view page at virtual_offset maps, or nullopt when it is not mapped.
@@ -998,13 +1001,13 @@ public:
         ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
     }
 
-    void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
+    bool Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
         // Intersect the range with our address space.
         AdjustMap(&virtual_offset, &length);
 
         if (page_states) {
             if (length == 0) {
-                return;
+                return true;
             }
             const u32 bits = (read ? PageRead : 0u) | (write ? PageWrite : 0u) |
                              (execute ? PageExecute : 0u);
@@ -1014,7 +1017,7 @@ public:
                 states[i] = (states[i] & ~PagePermissionMask) | bits;
             }
             UpdateHostPages(virtual_offset, length, false);
-            return;
+            return true;
         }
 
         int flags = PROT_NONE;
@@ -1031,6 +1034,7 @@ public:
 #endif
         int ret = mprotect(virtual_base + virtual_offset, length, flags);
         ASSERT_MSG(ret == 0, "mprotect failed: {}", strerror(errno));
+        return ret == 0;
     }
 
     /// HostMemory::MapBackingView: anonymous zero pages with each run mapped from the file over
@@ -1360,19 +1364,21 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
 #endif
 }
 
-void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission perm) {
+bool HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission perm) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
     ASSERT(virtual_offset % PageAlignment == 0);
     ASSERT(length % PageAlignment == 0);
     ASSERT(virtual_offset + length <= virtual_size);
     if (length == 0 || !virtual_base || !impl) {
-        return;
+        return true;
     }
     const bool read = True(perm & MemoryPermission::Read);
     const bool write = True(perm & MemoryPermission::Write);
     const bool execute = True(perm & MemoryPermission::Execute);
     g_mapped_bytes.fetch_add(length, std::memory_order_relaxed);
-    impl->Protect(virtual_offset + virtual_base_offset, length, read, write, execute);
+    return impl->Protect(virtual_offset + virtual_base_offset, length, read, write, execute);
+#else
+    return true;
 #endif
 }
 

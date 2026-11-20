@@ -304,8 +304,8 @@ TEST_CASE("HostMemory: Partial unmaps keep the protection of the rest of the vie
     REQUIRE(base[0x40000] == 1);
     REQUIRE(base[0x43000] == 4);
     // The kept pages can be made writable again.
-    mem.Protect(0x40000, Page, PERMS);
-    mem.Protect(0x43000, Page, PERMS);
+    REQUIRE(mem.Protect(0x40000, Page, PERMS));
+    REQUIRE(mem.Protect(0x43000, Page, PERMS));
     REQUIRE(PageProtection(base + 0x40000) == "rw");
     REQUIRE(PageProtection(base + 0x43000) == "rw");
     base[0x43000] = 0x44;
@@ -330,7 +330,7 @@ TEST_CASE("HostMemory: Partial unmaps keep the protection of the rest of the vie
     REQUIRE(base[0x85000] == 0x15);
     base[0x81000] = 0x21;
     REQUIRE(mem.BackingBasePointer()[0x21000] == 0x21);
-    mem.Protect(0x84000, 2 * Page, PERMS);
+    REQUIRE(mem.Protect(0x84000, 2 * Page, PERMS));
     REQUIRE(PageProtection(base + 0x84000) == "rw");
     REQUIRE(PageProtection(base + 0x85000) == "rw");
     base[0x84000] = 0x24;

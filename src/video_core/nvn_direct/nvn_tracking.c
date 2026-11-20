@@ -50,6 +50,10 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t g_rw = PTHREAD_RWLOCK_INITIALIZER;
 static _Atomic uint64_t g_now = 1;
 static _Atomic uint64_t g_faults, g_preps;
+// The generation of a page whose arming failed: writes to it may go unseen, so every texture over
+// it counts as written until a later arming of it succeeds (upstream's GEN_UNPROT).
+#define GEN_UNPROT UINT64_MAX
+static int g_unprot_seen; // an arming failed once: arming looks for GEN_UNPROT pages (under g_mu)
 
 static span_t* find_locked(uintptr_t a, size_t len) {
     int lo = 0, hi = g_nspans - 1, hit = -1;
@@ -97,19 +101,62 @@ fail:
     LOG("[RED] pool %p+%#zx: out of memory for its write tracking: CPU writes to its textures after their first upload are not seen", mem, size);
 }
 
-// Arms (on) or disarms the pages [p, q] of s that are not already so, in runs (caller holds g_mu)
+static void wlog_add(uintptr_t lo, uintptr_t hi);
+
+// Records whether arming (on) or disarming the pages [p, q) of s worked (caller holds g_mu). A page
+// counts as armed while it may be protected, so the next write or host write
+// (dm_guest_write_prepare) releases it. A failed arming is undone and a failed disarming tried
+// again, page by page where the whole run cannot be released (Windows may have changed part of
+// it, as upstream's nvn_dirty.c): pages left protected stay armed. The pages of a failed arming get
+// GEN_UNPROT and are logged as written, so the textures over them are uploaded again at each
+// check, whose upload tries to arm them again. Once that works, pages still GEN_UNPROT count as
+// written now (one more upload) and are tracked from there.
+static void track_result(span_t* s, uintptr_t p, uintptr_t q, int on, int done) {
+    uint64_t g = 0;
+    if (done) {
+        for (uintptr_t i = p; i < q; i++) {
+            s->armed[i] = (uint8_t)on;
+            if (on && g_unprot_seen && atomic_load(&s->gen[i]) == GEN_UNPROT) {
+                if (!g) g = atomic_load(&g_now) + 1;
+                atomic_store(&s->gen[i], g);
+            }
+        }
+    } else {
+        if (on) g_unprot_seen = 1;
+        const uint64_t lo = nvn_direct_guest_of(s->lo + (p << PAGE_SHIFT));
+        if (on && nvn_direct_track_pages(lo, (q - p) << PAGE_SHIFT, 0)) {
+            for (uintptr_t i = p; i < q; i++) {
+                s->armed[i] = 0;
+                atomic_store(&s->gen[i], GEN_UNPROT);
+            }
+        } else {
+            for (uintptr_t i = p; i < q; i++) {
+                const int released = nvn_direct_track_pages(lo + ((i - p) << PAGE_SHIFT), PAGE_SIZE, 0);
+                s->armed[i] = (uint8_t)!released;
+                if (on) atomic_store(&s->gen[i], GEN_UNPROT);
+            }
+        }
+        if (on) g = atomic_load(&g_now) + 1;
+    }
+    if (g) {
+        wlog_add(s->lo + (p << PAGE_SHIFT), s->lo + (q << PAGE_SHIFT));
+        atomic_store(&g_now, g);
+    }
+}
+
+// Arms (on) or disarms the pages [p, q] of s that are not already so, in runs, each run's result
+// recorded (caller holds g_mu)
 static void arm_pages(span_t* s, uintptr_t p, uintptr_t q, int on) {
     uintptr_t run = 0;
     int open = 0;
     for (uintptr_t i = p; i <= q + 1; i++) {
         const int change = i <= q && s->armed[i] != on && !(on && s->host[i]);
         if (change) {
-            s->armed[i] = (uint8_t)on;
             if (!open) { run = i; open = 1; }
             continue;
         }
         if (open) {
-            nvn_direct_track_pages(nvn_direct_guest_of(s->lo + (run << PAGE_SHIFT)), (i - run) << PAGE_SHIFT, on);
+            track_result(s, run, i, on, nvn_direct_track_pages(nvn_direct_guest_of(s->lo + (run << PAGE_SHIFT)), (i - run) << PAGE_SHIFT, on));
             open = 0;
         }
     }

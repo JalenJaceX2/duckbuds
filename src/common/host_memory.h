@@ -50,7 +50,9 @@ public:
 
     void Unmap(size_t virtual_offset, size_t length, bool separate_heap);
 
-    void Protect(size_t virtual_offset, size_t length, MemoryPermission perms);
+    /// false (logged) when the host refused to protect part of the range, which may then keep its
+    /// previous protection.
+    bool Protect(size_t virtual_offset, size_t length, MemoryPermission perms);
 
     void EnableDirectMappedAddress();
 

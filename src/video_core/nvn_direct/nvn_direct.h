@@ -209,8 +209,10 @@ typedef struct nvn_direct_memory {
     /// Takes down a view map_view made, of size bytes.
     void (*unmap_view)(void* context, void* view, uint64_t size);
     /// Arms (1) or disarms (0) Lichii's tracking of CPU writes to the pool pages [address,
-    /// address + size): a write to an armed page is reported (nvn_direct_cpu_written).
-    void (*track_pages)(void* context, uint64_t address, uint64_t size, int armed);
+    /// address + size): a write to an armed page is reported (nvn_direct_cpu_written). 0 when
+    /// the range is outside the guest's address space or the protection of part of it could not
+    /// be changed; a disarming that failed leaves the range armed.
+    int (*track_pages)(void* context, uint64_t address, uint64_t size, int armed);
     /// The backing memory of the guest page at address (never write-protected), NULL when the
     /// guest has not mapped it.
     void* (*backing)(void* context, uint64_t address);

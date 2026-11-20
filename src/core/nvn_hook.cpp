@@ -397,9 +397,9 @@ void UnmapPoolView(void* context, void* view, u64 size) {
 /// address: rasterizer-cached pages, which stay readable in direct mode (Core::Memory); a write
 /// to one reaches OnDirectCpuWrite. The pools stay out of the SMMU: with them mapped there MKW
 /// stalls.
-void TrackPages(void* context, u64 address, u64 size, int armed) {
-    static_cast<State*>(context)->process->GetMemory().RasterizerMarkRegionCached(address, size,
-                                                                                  armed != 0);
+int TrackPages(void* context, u64 address, u64 size, int armed) {
+    return static_cast<State*>(context)->process->GetMemory().RasterizerMarkRegionCached(
+        address, size, armed != 0);
 }
 
 /// nvn_direct_memory.backing: the backing memory of a guest page (never write-protected).

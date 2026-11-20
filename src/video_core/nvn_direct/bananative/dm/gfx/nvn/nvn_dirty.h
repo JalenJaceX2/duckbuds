@@ -24,3 +24,4 @@ void nvn_dirty_debug(const void *span, const void *addr, size_t len, uint64_t st
 // overflowed (the taker checks every image)
 typedef struct { uintptr_t lo, hi; } nvn_dirty_range;
 int nvn_dirty_take(nvn_dirty_range *out, int max);
+void nvn_tracking_destroy(void);                                  // Lichii: the teardown frees every span (nvn_tracking.c)

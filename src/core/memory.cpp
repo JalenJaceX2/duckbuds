@@ -495,11 +495,12 @@ struct Memory::Impl {
         }
     }
 
-    void RasterizerMarkRegionCached(u64 vaddr, u64 size, bool cached) {
+    bool RasterizerMarkRegionCached(u64 vaddr, u64 size, bool cached) {
         if (vaddr == 0 || !AddressSpaceContains(*current_page_table, vaddr, size)) {
-            return;
+            return false;
         }
 
+        bool protected_all = true;
         if (current_page_table->fastmem_arena) {
             Common::MemoryPermission perm{};
             // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
@@ -520,10 +521,15 @@ struct Memory::Impl {
             if (!cached) {
                 perm |= Common::MemoryPermission::Write;
             }
-            host_buffer->Protect(vaddr, size, perm);
+            protected_all = host_buffer->Protect(vaddr, size, perm);
             if (cached && perm != Common::MemoryPermission{}) {
                 ProtectArmedPages(vaddr, size);
             }
+        }
+        // Pages an uncaching could not unprotect stay cached: a write to them still faults, and
+        // the rasterizer path reports it.
+        if (!cached && !protected_all) {
+            return false;
         }
 
         // Iterate over a contiguous CPU address space, which corresponds to the specified GPU
@@ -582,6 +588,7 @@ struct Memory::Impl {
                 }
             }
         }
+        return protected_all;
     }
 
     /// Read traps replace reactive flushing's blanket read protection of every cached page: only
@@ -1233,8 +1240,8 @@ Result Memory::FlushDataCache(Common::ProcessAddress dest_addr, const std::size_
     return impl->FlushDataCache(dest_addr, size);
 }
 
-void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, bool cached) {
-    impl->RasterizerMarkRegionCached(GetInteger(vaddr), size, cached);
+bool Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, bool cached) {
+    return impl->RasterizerMarkRegionCached(GetInteger(vaddr), size, cached);
 }
 
 void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
