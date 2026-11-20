@@ -74,6 +74,7 @@
 #include "core/hle/service/sm/sm.h"
 #include "core/internal_network/local_redirect.h"
 #include "core/internal_network/network.h"
+#include "core/loader/deconstructed_rom_directory.h"
 #include "core/loader/loader.h"
 #include "core/loader/nx.h"
 #include "core/memory.h"
@@ -138,7 +139,7 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
     }
 
     if (Common::FS::IsDir(path)) {
-        return vfs->OpenFile(path + "/main", FileSys::OpenMode::Read);
+        return Loader::ResolveLooseProgram(vfs->OpenDirectory(path, FileSys::OpenMode::Read));
     }
 
     return vfs->OpenFile(path, FileSys::OpenMode::Read);
@@ -164,20 +165,9 @@ std::optional<u64> FindSwitch2Program(const FileSys::VirtualFile& file, u64 prog
     FileSys::ProgramMetadata metadata;
     if (FileSys::NupContainer::IsNupFile(file)) {
         FileSys::NupContainer nup{file};
-        if (nup.GetStatus() != Loader::ResultStatus::Success) {
-            return std::nullopt;
-        }
-        const auto base = nup.FindBasePackage();
-        const auto update = nup.FindBestUpdatePackage();
-        std::optional<std::size_t> program;
-        if (update && nup.GetExeFSDir(*update) != nullptr) {
-            program = update;
-        } else if (base && nup.GetExeFSDir(*base) != nullptr) {
-            program = base;
-        }
-        const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return Switch2ProgramId(metadata, npdm);
+        const auto program = nup.SelectProgram();
+        return program ? Switch2ProgramId(metadata, program->exefs->GetFile("main.npdm"))
+                       : std::nullopt;
     }
     const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
     if (type == Loader::FileType::NX) {
@@ -419,6 +409,10 @@ struct System::Impl {
             return SystemResultStatus::ErrorMemoryAllocation;
         }
         Kernel::Nx2ThreadStats::ReadSwitch();
+#if defined(ARCHITECTURE_x86_64)
+        core_timing.ConfigureInlineCntpct(!Kernel::Nx2ThreadStats::g_enabled &&
+                                         !system.DebuggerEnabled());
+#endif
         Service::FileSystem::ReadTraceScope::ReadSwitch();
         kernel.Initialize();
         return SystemResultStatus::Success;
@@ -837,8 +831,10 @@ struct System::Impl {
 
     /// Service manager
     std::shared_ptr<Service::SM::ServiceManager> service_manager;
-    /// ContentProviderUnion instance
-    std::unique_ptr<FileSys::ContentProviderUnion> content_provider;
+    /// ContentProviderUnion instance. Empty until a frontend sets its own, so a System nobody gave
+    /// a provider (tests, tools) still has one to look titles up in.
+    std::unique_ptr<FileSys::ContentProviderUnion> content_provider =
+        std::make_unique<FileSys::ContentProviderUnion>();
     /// AppLoader used to load the current executing application
     std::unique_ptr<Loader::AppLoader> app_loader;
     std::stop_source stop_event;
@@ -1382,6 +1378,9 @@ void System::NotifyApplicationChanged(u64 program_id) {
 }
 
 void System::ApplySettings() {
+#if defined(ARCHITECTURE_x86_64)
+    impl->core_timing.RefreshInlineCntpct();
+#endif
     impl->RefreshTime(*this);
 
     if (IsPoweredOn()) {
