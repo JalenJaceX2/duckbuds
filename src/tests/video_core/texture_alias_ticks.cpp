@@ -119,3 +119,25 @@ TEST_CASE("Only storage writes over every layer of a level make it hold shader r
     image.flags |= ImageFlagBits::CpuModified;
     CHECK_FALSE(HoldsStorageWrites(image, range(1, 1, 0, 4)));
 }
+
+TEST_CASE("Small GPU-written images download on every CPU read on Switch 2",
+          "[video_core][texture_cache]") {
+    Common::SlotVector<ImageBase> images;
+    ImageInfo exposure = Info();
+    exposure.format = PixelFormat::R32G32_FLOAT;
+    exposure.size = {8, 1, 1};
+    const ImageId small = images.insert(exposure, 0x10000, 0x10000);
+    const ImageId large = images.insert(Info(), 0x20000, 0x20000);
+    REQUIRE(images[small].guest_size_bytes <= 0x1000);
+    REQUIRE(images[large].guest_size_bytes > 0x1000);
+
+    // Before its first read, every image downloads (GetFlushArea sets forced_flushed after).
+    CHECK(VideoCommon::CpuReadDownloads(images[small], false));
+    CHECK(VideoCommon::CpuReadDownloads(images[large], true));
+    images[small].info.forced_flushed = true;
+    images[large].info.forced_flushed = true;
+
+    CHECK(VideoCommon::CpuReadDownloads(images[small], true));
+    CHECK_FALSE(VideoCommon::CpuReadDownloads(images[large], true));
+    CHECK_FALSE(VideoCommon::CpuReadDownloads(images[small], false));
+}

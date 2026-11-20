@@ -2554,11 +2554,18 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
         }
         area->start_address = (std::min)(area->start_address, image.cpu_addr);
         area->end_address = (std::max)(area->end_address, image.cpu_addr_end);
+        // Switch 2 titles only by default; EDEN_NX2_READBACK_TARGETS=0/1 forces it.
+        static const int forced = [] {
+            const char* value = std::getenv("EDEN_NX2_READBACK_TARGETS");
+            return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
+        }();
+        const bool small_readbacks =
+            forced >= 0 ? forced == 1 : Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
         for (auto image_view_id : image.image_view_ids) {
             auto& image_view = slot_image_views[image_view_id];
             image_view.flags |= ImageViewFlagBits::PreemtiveDownload;
         }
-        area->preemtive &= image.info.forced_flushed;
+        area->preemtive &= !CpuReadDownloads(image, small_readbacks);
         image.info.forced_flushed = true;
     });
     // Write-backs still on the GPU: DownloadMemory lands them.
