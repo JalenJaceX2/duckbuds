@@ -22,6 +22,7 @@ static uint64_t g_uwait_ns;   // waits for upload batches; cumulative
 void vka_qlock(void) { if (g_adopt.queue_lock) g_adopt.queue_lock(g_adopt.queue_context); else pthread_mutex_lock(&V.qmu); }
 void vka_qunlock(void) { if (g_adopt.queue_unlock) g_adopt.queue_unlock(g_adopt.queue_context); else pthread_mutex_unlock(&V.qmu); }
 int vka_async_pipelines(void) { return g_adopt.async_pipelines; }
+int vka_host_tick_done(uint64_t tick) { return !g_adopt.tick_done || g_adopt.tick_done(g_adopt.tick_context, tick); }
 uint32_t vka_scale_up = 1, vka_scale_shift;
 int nvn_direct_adopt_device(const nvn_direct_device *d) {
     // (the array of extension names is the caller's, for the call: the replay keeps its own copy; the names live as long as the device)
@@ -319,7 +320,7 @@ static uint64_t sub_ex(int q, VkCommandBuffer cb, uint64_t signal, uint32_t nwai
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, .pNext = &ti, .waitSemaphoreCount = nwait, .pWaitSemaphores = ws, .pWaitDstStageMask = wst,
                        .commandBufferCount = cb ? 1 : 0, .pCommandBuffers = &cb, .signalSemaphoreCount = ns, .pSignalSemaphores = sig};
     VkResult r = vka_hung() ? VK_ERROR_DEVICE_LOST : vk.vkQueueSubmit(host ? V.q : V.qs[q], 1, &si, VK_NULL_HANDLE);
-    if (signal && V.multi) { if (r) V.qseq[q]--; g_fq[signal % FQ_RING].fence = signal; g_fq[signal % FQ_RING].q = r ? -1 : q; g_fq[signal % FQ_RING].qv = qv; }
+    if (signal) { if (r && V.multi) V.qseq[q]--; g_fq[signal % FQ_RING].fence = signal; g_fq[signal % FQ_RING].q = r ? -1 : q; g_fq[signal % FQ_RING].qv = qv; }   // (Lichii: one queue too, for vka_fence_signal)
     if (!r && signal > V.tl_queued) __atomic_store_n(&V.tl_queued, signal, __ATOMIC_RELEASE);
     vka_qunlock();
     *res = r;
@@ -343,6 +344,16 @@ int vka_queue_idle(void) {
     return 1;
 }
 uint64_t vka_fence_queued(void) { return __atomic_load_n(&V.tl_queued, __ATOMIC_ACQUIRE); }
+// Lichii: the timeline semaphore and value the GPU signals at fence, set when its submission was handed to a queue: V.multi its queue's timeline, else V.tl at
+// the fence. 0: no queue submission signals it (it ran on the CPU, or vkQueueSubmit failed and the host signals it), or it is more than FQ_RING fences ago
+int vka_fence_signal(uint64_t fence, VkSemaphore *sem, uint64_t *val) {
+    if (!fence) return 0;
+    vka_qlock();
+    const int ok = g_fq[fence % FQ_RING].fence == fence && g_fq[fence % FQ_RING].q >= 0;
+    if (ok) { *sem = V.multi ? V.qtl[g_fq[fence % FQ_RING].q] : V.tl; *val = V.multi ? g_fq[fence % FQ_RING].qv : fence; }
+    vka_qunlock();
+    return ok;
+}
 int vka_fence_queue(uint64_t fence, int *q, VkSemaphore *sem, uint64_t *val) {   // (the slot holds the fence until FQ_RING later ones: an older one is not known)
     if (!V.multi || !fence) return 0;
     vka_qlock();
@@ -437,6 +448,8 @@ static void hang_declare(uint64_t want, uint64_t at, double s, const char *what)
     VRED("GPU hang: the host exits (DM_VK_HANG_EXIT=0 runs on without the GPU)");
     pthread_t th; if (!pthread_create(&th, NULL, hang_exit_main, NULL)) pthread_detach(th);
 }
+// Lichii: the host cannot go on with the replay (what): as a GPU hang
+void vka_hang(const char *what) { hang_declare(vka_fence_last(), vka_done(), vka_hang_ns() / 1e9, what); }
 
 // The CPU-side effects of fence f (its slot cleared after: vka_fence_post may wait for it), outside g_fmu
 static void post_run_one(uint64_t f) {

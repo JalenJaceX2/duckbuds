@@ -354,9 +354,19 @@ public:
         return *master_semaphore;
     }
 
+    /// The next submission also waits for the timeline semaphore to reach value, with all its
+    /// commands and every later one (NVN direct: the replay queue that drew the image a composite
+    /// samples). Recording thread.
+    void WaitOnNextSubmit(VkSemaphore timeline, u64 value) {
+        next_wait_timeline = timeline;
+        next_wait_value = value;
+    }
+
     std::mutex submit_mutex;
 
 private:
+    VkSemaphore next_wait_timeline{};
+    u64 next_wait_value{};
     std::chrono::steady_clock::time_point last_flush{};
     bool flush_pending{};
     u64 record_serial{};    ///< Commands recorded

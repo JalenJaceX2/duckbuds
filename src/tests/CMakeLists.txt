@@ -351,6 +351,25 @@ if (TARGET nvn_direct AND NOT WIN32)
     target_compile_definitions(nvn_tracking_tests PRIVATE __ANDROID__ _GNU_SOURCE)
     target_link_libraries(nvn_tracking_tests PRIVATE Threads::Threads Vulkan::Headers)
     add_test(NAME nvn_tracking_tests COMMAND nvn_tracking_tests)
+
+    add_executable(nvn_present_tests
+        video_core/nvn_present.c
+        ${NVN_DIRECT_DIR}/nvn_present.c)
+    target_include_directories(nvn_present_tests PRIVATE
+        ${NVN_DIRECT_DIR}/bananative/shim
+        ${NVN_DIRECT_DIR}/bananative/gen
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/nvn/include
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/nvn
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/vk_android
+        ${NVN_DIRECT_DIR}/bananative/dm/host
+        ${NVN_DIRECT_DIR})
+    set_target_properties(nvn_present_tests PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    target_compile_definitions(nvn_present_tests PRIVATE __ANDROID__ _GNU_SOURCE)
+    # nvn_present.c and the replay functions the test stubs declare each other where they are
+    # used, as the nvn_direct library does (built with -w)
+    target_compile_options(nvn_present_tests PRIVATE -Wno-missing-declarations)
+    target_link_libraries(nvn_present_tests PRIVATE Threads::Threads Vulkan::Headers)
+    add_test(NAME nvn_present_tests COMMAND nvn_present_tests)
 endif()
 
 add_executable(profile_migration_tests

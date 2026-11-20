@@ -775,9 +775,10 @@ void RunHaltedCall(Core::System& system, std::array<u64, 8>& args) {
     }
     state.halted_calls.fetch_add(1, std::memory_order_relaxed);
     const Slot& target = state.slots[slot];
-    // A wait for the replay's GPU (SyncWait, QueueFinish) sleeps in the guest kernel until it
-    // would not wait: a host wait here held the guest core, so the game's other
-    // threads there stopped (one of them may be the one whose submission the GPU waits for).
+    // A wait for the replay's GPU (SyncWait, QueueFinish) or for a composite still reading the
+    // image a window acquire hands out sleeps in the guest kernel until it would not wait: a host
+    // wait here held the guest core, so the game's other threads there stopped (one of them may
+    // be the one whose submission the GPU waits for).
     const bool sync_wait = std::string_view{nvn_direct_name(target.front)} == "nvnSyncWait";
     bool waited = false;
     if (nvn_direct_call_blocks(target.front, args.data())) {

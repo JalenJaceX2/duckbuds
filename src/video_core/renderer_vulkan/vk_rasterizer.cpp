@@ -4118,19 +4118,18 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
 #ifdef LICHII_NVN_DIRECT
     if (device.IsNvnDirect()) {
         // NVN2 direct mode: the replay's image of the frame the address names
-        // (core/nvn_hook.cpp PresentDirect), once the GPU finished it. Nothing else presents.
-        nvn_direct_frame frame{};
-        if ((framebuffer_addr & NVN_DIRECT_FRAME_TAG) == 0 ||
-            !nvn_direct_present_frame(framebuffer_addr & ~NVN_DIRECT_FRAME_TAG, &frame)) {
+        // (core/nvn_hook.cpp PresentDirect), taken by the composite in progress once the GPU
+        // finished it (RendererVulkan::Composite). Nothing else presents.
+        if ((framebuffer_addr & NVN_DIRECT_FRAME_TAG) == 0 || !direct_display_frame) {
             return {};
         }
         return FramebufferTextureInfo{
-            .image = frame.image,
-            .image_view = frame.view,
-            .width = frame.width,
-            .height = frame.height,
-            .scaled_width = frame.scaled_width,
-            .scaled_height = frame.scaled_height,
+            .image = direct_display_frame->image,
+            .image_view = direct_display_frame->view,
+            .width = direct_display_frame->width,
+            .height = direct_display_frame->height,
+            .scaled_width = direct_display_frame->scaled_width,
+            .scaled_height = direct_display_frame->scaled_height,
         };
     }
 #endif

@@ -227,6 +227,12 @@ int nvn_direct_call_blocks(int slot, const uint64_t x[8]) {
         return s->fenced && !(s->fenced == 2 ? mtl_wait_acq : mtl_wait)(s->fence, 0);   // (one not fenced yet answers at once: hle_nvn.c)
     }
     if (!strcmp(name, "nvnQueueFinish")) return !mtl_wait(((const queue_t*)host_ptr(x[0]))->last_fence, 0);
+    // The image the acquire hands out next (nvn_window.c), until Lichii's composite of it is done on the GPU
+    if (!strcmp(name, "nvnWindowAcquireTexture") || !strcmp(name, "nvnQueueAcquireTexture")) {
+        const win_t* const w = host_ptr(x[name[3] == 'W' ? 0 : 1]);
+        const NVNtexture* const t = w->ntex ? w->tex[w->next % w->ntex] : NULL;
+        return t && nvn_direct_present_composite_pending(((const tex_t*)t)->serial);
+    }
     // A texture the GPU wrote is read back once everything submitted is done (the game waited for its own work; the replay may still be behind it)
     if (!strcmp(name, "nvnTextureReadTexels") || !strcmp(name, "nvnTextureReadTexelsStrided"))
         return mtl_tex_gpu_owned(((const tex_t*)host_ptr(x[0]))->serial) && !mtl_wait_acq(mtl_last_fence(), 0);

@@ -13,6 +13,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <time.h>
 
 #include "bananative/dm/gfx/vk_android/vka.h"
 #include "nvn_direct.h"
@@ -23,6 +24,8 @@
 enum { NPRES = 8 };
 typedef struct {
     uint64_t ticket, fence;
+    VkSemaphore semaphore;   // the GPU signal of fence (vka_fence_signal), taken when filled: VK_NULL_HANDLE none
+    uint64_t semaphore_value;
     uint64_t serial;
     VkFormat format;   // the presenting texture's (UNORM for sRGB); its image may have been made in another (learned view formats)
     int32_t crop[4];
@@ -92,15 +95,24 @@ uint64_t vka_present_filled(void) { return g_filled; }   // (the replay thread, 
 void vka_present_fill(uint64_t tk, const tex_t* t, double period_s, const int crop[4]) {
     vka_perf_frame(period_s);
     frame_path_creation(tk);
+    // The presenting queue's last submission (handed to the queue: the worker fills presents in
+    // order with the submissions) and what the GPU signals there, taken now: the fence's slot in
+    // vka_dev.c's ring may be another's by the time Lichii composites it.
+    pthread_mutex_lock(&g_mu);
+    const uint64_t fence = vka_ok() ? g_queue_fence[tk % NPRES] : 0;
+    pthread_mutex_unlock(&g_mu);
+    VkSemaphore semaphore = VK_NULL_HANDLE;
+    uint64_t semaphore_value = 0;
+    if (fence && !vka_fence_signal(fence, &semaphore, &semaphore_value)) semaphore = VK_NULL_HANDLE;
     pthread_mutex_lock(&g_mu);
     pres_t* p = &g_pres[tk % NPRES];
     p->ticket = tk;
     p->serial = t->serial;
     vka_fmt f;
     p->format = vka_fmt_of(t->d.format, &f) ? f.vk : VK_FORMAT_UNDEFINED;
-    // The presenting queue's last submission (handed to the queue: the worker fills presents in
-    // order with the submissions).
-    p->fence = vka_ok() ? g_queue_fence[tk % NPRES] : 0;
+    p->fence = fence;
+    p->semaphore = semaphore;
+    p->semaphore_value = semaphore_value;
     p->has_crop = crop && crop[2] > 0 && crop[3] > 0;
     if (p->has_crop) memcpy(p->crop, crop, sizeof p->crop);
     if (tk > g_filled) g_filled = tk;
@@ -129,12 +141,18 @@ void mtl_present_flush(void) {
 
 // The images handed to Lichii, by frame id: each held (vka_tex_acquire) with a view of its own
 // until NHELD later frames were taken, long after Lichii's composite of it ran (the game's present
-// waits for the previous composite: GPU::WaitForComposite).
+// waits for the previous composite: GPU::WaitForComposite). Holding it keeps the image, not its
+// contents: the game's next acquire of the image waits (nvn_direct_present_composite_pending)
+// while Lichii's composite of it is queued (queued: from the present until Lichii's GPU thread
+// comes to it), being recorded (sampling) or submitted at composite_tick (Lichii's scheduler
+// tick) and the GPU not past it.
 enum { NHELD = 8 };
 typedef struct {
     uint64_t id;
     vka_img* im;
     nvn_direct_frame frame;
+    uint64_t composite_tick;
+    int queued, sampling;
 } held_t;
 static held_t g_held[NHELD];
 static uint64_t g_frames;
@@ -168,6 +186,14 @@ int nvn_direct_present_take(nvn_direct_frame* out) {
     pthread_mutex_unlock(&g_mu);
     if (vka_stopping()) return 0;   // the emulator shuts down (nvn_direct_stop): the worker may never fill it
     if (!vka_ok() || p.ticket != tk) return 0;
+    if (p.fence && !p.semaphore) {
+        // No GPU work signals the submission that drew it (it ran on the CPU: no command buffer,
+        // a failed vkQueueSubmit or a hang; or it was more than vka_dev.c's FQ_RING fences
+        // before the present): nothing Lichii's queue could wait on for its writes. Not shown.
+        static _Atomic int n;
+        if (atomic_fetch_add(&n, 1) < 8) VRED("present %llu: fence %llu has no GPU signal: dropped", (unsigned long long)tk, (unsigned long long)p.fence);
+        return 0;
+    }
     vka_img* im = vka_tex_acquire(p.serial);
     if (!im) return 0;   // the replay never drew or uploaded it (a boot frame): nothing to show
     int ok = im->inited && im->aspect == VK_IMAGE_ASPECT_COLOR_BIT && im->samples == 1 && (im->usage & VK_IMAGE_USAGE_SAMPLED_BIT);
@@ -193,30 +219,97 @@ int nvn_direct_present_take(nvn_direct_frame* out) {
     }
     h->id = id;
     h->im = im;
+    h->composite_tick = 0;
+    h->queued = 1;   // (Lichii's present queues its composite next: core/nvn_hook.cpp PresentDirect)
+    h->sampling = 0;
     h->frame = (nvn_direct_frame){.id = id, .image = im->img, .view = view, .format = format, .width = im->scaled ? im->d.width : im->w, .height = im->scaled ? im->d.height : im->h,
-                                  .scaled_width = im->w, .scaled_height = im->h, .interval = out->interval, .fence = p.fence};
+                                  .scaled_width = im->w, .scaled_height = im->h, .interval = out->interval, .fence = p.fence,
+                                  .semaphore = p.semaphore, .semaphore_value = p.semaphore_value};
     if (p.has_crop) memcpy(h->frame.crop, p.crop, sizeof p.crop);
     *out = h->frame;
     pthread_mutex_unlock(&g_held_mu);
     return 1;
 }
 
+// A composite is done with frame id: submitted at tick (0: it did not sample the frame).
+static void composite_done(uint64_t id, uint64_t tick) {
+    pthread_mutex_lock(&g_held_mu);
+    held_t* h = &g_held[id % NHELD];
+    if (h->id == id && h->im) {
+        h->sampling = 0;
+        if (tick > h->composite_tick) h->composite_tick = tick;
+    }
+    pthread_mutex_unlock(&g_held_mu);
+}
+
 int nvn_direct_present_frame(uint64_t id, nvn_direct_frame* out) {
     pthread_mutex_lock(&g_held_mu);
+    // This present's composite request is no longer queued (only its own: presents from several
+    // threads take frame ids in another order than they request their composites).
+    held_t* h = &g_held[id % NHELD];
+    if (h->id == id) h->queued = 0;
     // A frame dropped already (Lichii composited it late): the newest one held instead.
-    const held_t* h = &g_held[id % NHELD];
     if (h->id != id || !h->im) h = &g_held[g_frames % NHELD];
     const int ok = h->im != NULL;
-    if (ok) *out = h->frame;
+    if (ok) {
+        *out = h->frame;
+        h->sampling = 1;
+    }
     pthread_mutex_unlock(&g_held_mu);
     if (!ok) return 0;
     // Drawn on the replay's queues: Lichii samples it once the GPU is past its fence (bounded:
-    // a frame whose GPU work waits on the CPU is shown as far as it got).
+    // a frame whose GPU work waits on the CPU is shown as far as it got, without a GPU wait for
+    // its queue: Lichii's queue would wait as long).
     if (out->fence && !vka_wait_fence(out->fence, 1000000000ull)) {
         static _Atomic int n;
         if (atomic_fetch_add(&n, 1) < 8) VRED("present: frame %llu's fence %llu not reached in 1 s: shown as it is", (unsigned long long)out->id, (unsigned long long)out->fence);
+        out->semaphore = VK_NULL_HANDLE;
     }
+    // A stopped or hung replay reads every fence as done but may never signal it on the GPU.
+    if (vka_stopping() || vka_hung()) out->semaphore = VK_NULL_HANDLE;
+    // out->semaphore: the composite's submission also waits for it (its queue's own timeline, not
+    // every queue's), which makes the image's writes visible to Lichii's queue (the CPU wait above
+    // alone does not); its value is reached already.
     return 1;
+}
+
+void nvn_direct_present_composited(uint64_t id, uint64_t tick) { composite_done(id, tick); }
+
+// Since when Lichii's tick could not be read (0: it could): the image stays the composite's
+// meanwhile, and after the hang time the replay stops as after a GPU hang.
+static _Atomic uint64_t g_tick_fail_ns;
+static int tick_done(uint64_t tick) {
+    const int r = vka_host_tick_done(tick);
+    if (r >= 0) {
+        atomic_store(&g_tick_fail_ns, 0);
+        return r;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    const uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+    uint64_t since = 0;
+    if (!atomic_compare_exchange_strong(&g_tick_fail_ns, &since, now) && now - since >= vka_hang_ns())
+        vka_hang("Lichii's GPU tick could not be read: its composites' images are never free again");
+    return 0;
+}
+
+// The image of texture serial (a window's next one) is still read by a composite the GPU is not
+// past. A host-side check only: the acquire halts the guest thread meanwhile (nvn_dispatch.c), so
+// nothing that writes the image is submitted before.
+int nvn_direct_present_composite_pending(uint64_t serial) {
+    if (vka_stopping() || vka_hung() || !vka_ok()) return 0;
+    vka_img* im = vka_tex_acquire(serial);
+    if (!im) return 0;
+    uint64_t tick = 0;
+    int owned = 0;
+    pthread_mutex_lock(&g_held_mu);
+    for (int i = 0; i < NHELD; i++) if (g_held[i].im == im) {
+        owned |= g_held[i].queued || g_held[i].sampling;
+        if (g_held[i].composite_tick > tick) tick = g_held[i].composite_tick;
+    }
+    pthread_mutex_unlock(&g_held_mu);
+    vka_tex_drop(im);
+    return owned || (tick && !tick_done(tick));
 }
 
 // The teardown (vka_dev.c vka_destroy): the frames still held, their views and references

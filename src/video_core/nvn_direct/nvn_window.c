@@ -107,7 +107,8 @@ NVN(nvnWindowGetCrop, void, const NVNwindow* w, NVNrectangle* r) {
 // any queue, as upstream's default mtl_acquire_fence, may be another queue's that waits for an
 // event the game signals only after this acquire's wait (Mario Kart World's second queue: a GPU
 // hang). Only the presenting queue's own fence was too early: the game then rewrote data the
-// other queues still read (device lost at the title).
+// other queues still read (device lost at the title). Lichii's composite reads the image on its
+// own queue: the acquire runs once the GPU is past it (nvn_direct_call_blocks).
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow* w, NVNsync* s, int* idx) {
     win_t* o = (win_t*)w;
     *idx = o->ntex ? o->next++ % o->ntex : 0;

@@ -173,6 +173,12 @@ typedef struct nvn_direct_device {
     /// Whether the replay labels its command buffers with the game's debug groups and markers
     /// (VK_EXT_debug_utils), as Lichii labels its own: a debugging tool attached, or renderer debug.
     int debug_labels;
+    /// Whether Lichii's GPU work up to tick (its scheduler's tick) is done, without waiting: the
+    /// composites that sampled a presented image (nvn_direct_present_composited). 1 done (a lost
+    /// device too), 0 not yet, -1 not known (the query failed): the replay retries, and stops as
+    /// after a GPU hang when it stays unknown for the hang time. NULL: done.
+    int (*tick_done)(void* context, uint64_t tick);
+    void* tick_context;
 } nvn_direct_device;
 
 /// The push constants of a translated stage that Lichii's RescalingPass changed
@@ -274,6 +280,13 @@ typedef struct nvn_direct_frame {
     int32_t crop[4]; ///< x, y, width, height the game shows (nvnWindowSetCrop); width 0: all of it
     uint32_t interval; ///< the window's present interval (vblanks per frame)
     uint64_t fence;
+    /// The timeline semaphore and value the replay queue that drew the image signals on the GPU at
+    /// fence (reached once nvn_direct_present_frame gives the frame), for the composite's
+    /// submission to wait on. VK_NULL_HANDLE without a fence (nothing drew it), and when
+    /// nvn_direct_present_frame shows the frame as it is (its fence not reached in time, or the
+    /// replay stopped).
+    VkSemaphore semaphore;
+    uint64_t semaphore_value;
 } nvn_direct_frame;
 
 /// Lichii's framebuffer address of a direct-mode frame: id | NVN_DIRECT_FRAME_TAG (no device
@@ -285,14 +298,22 @@ typedef struct nvn_direct_frame {
 /// backend, or a texture the replay never drew or uploaded).
 int nvn_direct_present_take(nvn_direct_frame* frame);
 
-/// On Lichii's GPU thread: the frame taken with id (the newest one held if it was let go
-/// already), once the GPU finished drawing it (waits, bounded). 0: no frame was ever taken.
+/// On Lichii's GPU thread, once per composite: the frame taken with id (the newest one held if it
+/// was let go already), once the GPU finished drawing it (waits, bounded). 0: no frame was ever
+/// taken. From the present until then, and from a frame given here until
+/// nvn_direct_present_composited, the game's acquires of its image wait.
 int nvn_direct_present_frame(uint64_t id, nvn_direct_frame* frame);
+
+/// On Lichii's GPU thread, after nvn_direct_present_frame gave frame id: the composite that
+/// sampled its image was submitted with tick (nvn_direct_device.tick_done). The game's next
+/// acquire of that image waits until the tick is done.
+void nvn_direct_present_composited(uint64_t id, uint64_t tick);
 
 /// Whether an implemented slot's call would wait for the replay's GPU now:
 /// nvnSyncWait on a fenced sync the GPU has not reached, nvnQueueFinish on a queue whose last
-/// submission it has not. Lichii then sleeps the guest thread in the guest kernel until it would
-/// not, so the core runs the game's other threads meanwhile.
+/// submission it has not, a window acquire whose image Lichii's composite still reads. Lichii
+/// then sleeps the guest thread in the guest kernel until it would not, so the core runs the
+/// game's other threads meanwhile.
 int nvn_direct_call_blocks(int slot, const uint64_t x[8]);
 
 /// The emulator shuts down, before the guest's cores are suspended: nothing

@@ -144,6 +144,7 @@ uint64_t vka_fence_next(void);                      // reserve the next fence va
 uint64_t vka_fence_last(void);                      // the last fence reserved (its submission may still be recording on another thread)
 uint64_t vka_fence_queued(void);                    // the last fence handed to the queue: the most a submission (the present's) may wait for without a wait-before-signal on its own queue
 int vka_fence_queue(uint64_t fence, int *q, VkSemaphore *sem, uint64_t *val);   // Lichii (V.multi): the Vulkan queue a fence's submission went to and its timeline value there; 0: none known
+int vka_fence_signal(uint64_t fence, VkSemaphore *sem, uint64_t *val);   // Lichii: the timeline semaphore and value a queue submission signals on the GPU at fence; 0: none (vka_dev.c)
 // The replay (vka_exec.c), entered by the replay worker (vka_worker.c) or inline by the mtl_* calls of the submitting thread
 void vka_rp_sub_begin(void);
 void vka_rp_sub_wait(uint64_t fence);                // Lichii, after vka_rp_sub_begin: the submission's first part waits for the submission of that fence when it went to another Vulkan queue
@@ -159,11 +160,13 @@ void vka_present_fill(uint64_t tk, const tex_t *t, double period_s, const int cr
 uint64_t vka_present_inline(const tex_t *t, double period_s, const int crop[4]);
 uint64_t vka_hang_ns(void);                         // how long a fence may make no progress before it is a hang (DM_VK_HANG_S, default 6 s)
 int vka_hung(void);
+void vka_hang(const char *what);                   // Lichii: the host cannot go on with the replay: declared a GPU hang (vka_dev.c)
 // Lichii: the emulator shuts down (nvn_direct_stop / nvn_direct_park in nvn_shutdown.c)
 void vka_up_decoded(void);                          // vka_dev.c (Lichii): an ASTC decode went into the open upload batch
 void vka_heap_line(char *o, size_t n);               // vka_dev.c (Lichii): the driver's use and budget per heap, MiB
 int vka_dev_ext(const char *name);                  // vka_dev.c (Lichii): the host's device has the extension enabled
 int vka_async_pipelines(void);                     // vka_dev.c: Lichii's asynchronous shader building setting (nvn_direct_device.async_pipelines)
+int vka_host_tick_done(uint64_t tick);             // vka_dev.c: Lichii's GPU work up to its scheduler's tick is done: 1, not yet 0, not known -1 (nvn_direct_device.tick_done)
 void vka_pipeline_notify(int built);                // vka_dev.c: a pipeline made off the frame path starts (0) or is done (1): the host's "building shaders"
 void vka_stop(void);                                // vka_dev.c: as after a hang nothing more is submitted and every fence reads as done, silently; waits return at once
 int vka_stopping(void);

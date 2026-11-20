@@ -50,3 +50,6 @@ extern _Thread_local uint64_t nvn_direct_present_queue_fence;
 /// The ticket of the present this thread just made (nvn_window.c: mtl_present) and its window's
 /// present interval, for nvn_direct_present_take.
 void nvn_direct_present_note(uint64_t ticket, uint32_t interval);
+/// Whether Lichii's composite may still read the image of texture serial on the GPU
+/// (nvn_present.c): a window acquire of it waits (nvn_direct_call_blocks).
+int nvn_direct_present_composite_pending(uint64_t serial);
