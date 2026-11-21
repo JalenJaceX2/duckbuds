@@ -238,6 +238,8 @@ static int c2_off(const cs_layout* l, uint32_t bank, uint32_t off) {
     if (l && bank == 0 && off >= l->ib && off < l->size) return (int)(DMSH_C2_IMG + off - l->ib);
     return -1;
 }
+_Static_assert(NVN_DIRECT_POOL_SET == DMSH_VK_SET_POOL && NVN_DIRECT_POOL_TEXTURE_BINDING == DMSH_VK_POOL_TEX_BINDING &&
+               NVN_DIRECT_POOL_SAMPLER_BINDING == DMSH_VK_POOL_SAMP_BINDING, "the translator's pool set and bindings are the replay's");
 // One descriptor's record; 0 = the replay cannot fill it (why says what), the record UNKNOWN. l: an NVN2 compute shader's c[0] layout, else NULL
 static int rc_bind(const nvn_direct_shader_desc* s, int st, const cs_layout* l, dmsh_vk_bind* b, char* why, size_t whyn) {
     memset(b, 0, sizeof *b);
@@ -272,6 +274,9 @@ static int rc_bind(const nvn_direct_shader_desc* s, int st, const cs_layout* l, 
         return 1;
     case NVN_DIRECT_DESC_TEXTURE: case NVN_DIRECT_DESC_TEXTURE_BUFFER: {
         b->dim = dim_of(s);
+        if (s->pool) {   // the pools by the handle the shader computes: set 1, which the draw binds for it (vka_draw.c any_pool)
+            b->kind = DMSH_VK_KIND_TEX_POOL; b->set = DMSH_VK_SET_POOL; b->binding = DMSH_VK_POOL_TEX_BINDING; b->count = 0; return 1;
+        }
         if (s->unsupported == 2) { b->kind = DMSH_VK_KIND_TEX; b->flags |= DMSH_VK_BF_NOSLOT; return 1; }   // a pointer word, never a handle: bound as nothing
         if (s->shift_left || (s->has_secondary && s->secondary_shift_left)) NO("binding %u: a shifted handle", s->binding);
         if (b->count > 1 && s->size_shift != 3) NO("binding %u: an array of handles %u bytes apart", s->binding, 1u << s->size_shift);

@@ -244,6 +244,10 @@ struct TextureDescriptor {
     /// Whether the constant buffer word above reaches the handle only as the address of a load:
     /// a pointer, never a texture handle, which binds no texture (see HandleIsStoragePointer)
     bool handle_is_pointer_word{};
+    /// Whether the texture is read from the texture and sampler pools by the handle the shader
+    /// computes (HostTranslateInfo::support_pool_textures): no constant buffer word, the
+    /// instruction's index operand is the handle
+    bool is_pool{};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };

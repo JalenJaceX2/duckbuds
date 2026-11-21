@@ -372,19 +372,33 @@ private:
     std::array<u32, 3> workgroup_size{};
 };
 
-/// The binding after the last one a SPIR-V module decorates (0 = none)
+/// The binding after the last one a SPIR-V module decorates in set 0 (0 = none); the pools' set
+/// (NVN_DIRECT_POOL_SET) is left out
 u32 BindingEnd(std::span<const u32> spirv) {
+    const auto decorations = [&](auto&& visit) {
+        for (size_t at = 5; at < spirv.size();) {
+            const u32 count = spirv[at] >> 16, opcode = spirv[at] & 0xffff;
+            if (count == 0) {
+                break;
+            }
+            if (opcode == 71 /* OpDecorate */ && count >= 4 && at + 3 < spirv.size()) {
+                visit(spirv[at + 1], spirv[at + 2], spirv[at + 3]);
+            }
+            at += count;
+        }
+    };
+    std::vector<u32> other_set;
+    decorations([&](u32 target, u32 decoration, u32 value) {
+        if (decoration == 34 /* DescriptorSet */ && value != 0) {
+            other_set.push_back(target);
+        }
+    });
     u32 end = 0;
-    for (size_t at = 5; at < spirv.size();) {
-        const u32 count = spirv[at] >> 16, opcode = spirv[at] & 0xffff;
-        if (count == 0) {
-            break;
+    decorations([&](u32 target, u32 decoration, u32 value) {
+        if (decoration == 33 /* Binding */ && std::ranges::find(other_set, target) == other_set.end()) {
+            end = (std::max)(end, value + 1);
         }
-        if (opcode == 71 /* OpDecorate */ && count >= 4 && spirv[at + 2] == 33 /* Binding */) {
-            end = (std::max)(end, spirv[at + 3] + 1);
-        }
-        at += count;
-    }
+    });
     return end;
 }
 
@@ -395,6 +409,10 @@ NvnDirectShaders::NvnDirectShaders(const Device& device, const Shader::Profile& 
     : profile{profile_}, host_info{host_info_} {
     // The replay sets no VK_EXT_depth_clip_control: the GL depth mode is converted in the shader.
     profile.support_native_ndc = false;
+    // A texture handle no constant buffer word gives is read from the replay's pool tables by the
+    // value the shader computes (NVN_DIRECT_POOL_SET), as on the console, not by a handle program
+    // evaluated for each draw, which the replay has no means to run.
+    host_info.support_pool_textures = true;
     // The replay binds at most 512 descriptors a draw (vka_draw.c), over every stage: an array of
     // handles a shader indexes (the recompiler makes it up to 1,024 long) gets at most half of
     // them, which still covers the driver's c2 handle tables up into the separate samplers' from
@@ -504,6 +522,9 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
     bindings.texture_scaling_index = nvn_direct_scale_texture_bit(source.nvn_stage);
     bindings.image_scaling_index = nvn_direct_scale_image_bit(source.nvn_stage);
     bindings.render_area_offset = NVN_DIRECT_RENDER_AREA_OFFSET;
+    bindings.pool_set = NVN_DIRECT_POOL_SET;
+    bindings.pool_texture_binding = NVN_DIRECT_POOL_TEXTURE_BINDING;
+    bindings.pool_sampler_binding = NVN_DIRECT_POOL_SAMPLER_BINDING;
     const std::vector<u32> spirv{
         Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, bindings)};
 
@@ -583,6 +604,7 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
         if (texture.handle_is_pointer_word) {
             desc.unsupported = 2; // binds no texture (TextureDescriptor::handle_is_pointer_word)
         }
+        desc.pool = texture.is_pool;
         add(desc, 1);
     }
     for (const Shader::ImageDescriptor& image : info.image_descriptors) {

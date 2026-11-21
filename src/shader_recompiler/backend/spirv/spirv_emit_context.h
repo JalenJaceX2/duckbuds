@@ -45,6 +45,9 @@ struct TextureDefinition {
     u32 count;
     bool is_multisample;
     bool is_integer;
+    /// Read from the pools: id is the texture pool's array of image_type, pointer_type points to
+    /// one of its elements (EmitContext::pool_samplers holds the samplers)
+    bool is_pool{};
 };
 
 struct TextureBufferDefinition {
@@ -299,6 +302,9 @@ public:
     std::vector<ImageBufferDefinition> image_buffers;
     std::vector<TextureDefinition> textures;
     std::vector<ImageDefinition> images;
+    /// The sampler pool's array and a pointer to one of its elements (pool textures only)
+    Id pool_samplers{};
+    Id pool_sampler_pointer{};
 
     Id workgroup_id{};
     Id local_invocation_id{};
@@ -514,7 +520,8 @@ private:
     void DefineStorageBuffers(const Info& info, u32& binding);
     void DefineTextureBuffers(const Info& info, u32& binding);
     void DefineImageBuffers(const Info& info, u32& binding);
-    void DefineTextures(const Info& info, u32& binding, u32& scaling_index);
+    void DefineTextures(const Info& info, u32& binding, u32& scaling_index,
+                        const Bindings& bindings);
     void DefineImages(const Info& info, u32& binding, u32& scaling_index);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);

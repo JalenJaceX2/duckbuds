@@ -81,6 +81,12 @@ enum {
     NVN_DIRECT_DESC_LOOP_GUARD,     ///< storage buffer whose first word a loop's safety check sets when it ends a loop (at first_binding + NVN_DIRECT_LOOP_GUARD_SLOT)
 };
 #define NVN_DIRECT_LOOP_GUARD_SLOT 62
+/// The texture and sampler pools a texture with the pool flag is read from, by the texture and sampler
+/// IDs of the handle the shader computes: descriptor set 1, binding 0 (sampled images) and 1 (samplers)
+/// (dmsh_abi_vk.h DMSH_VK_SET_POOL, DMSH_VK_POOL_TEX_BINDING, DMSH_VK_POOL_SAMP_BINDING)
+#define NVN_DIRECT_POOL_SET 1
+#define NVN_DIRECT_POOL_TEXTURE_BINDING 0
+#define NVN_DIRECT_POOL_SAMPLER_BINDING 1
 typedef struct nvn_direct_shader_desc {
     uint8_t kind;              ///< NVN_DIRECT_DESC_*
     uint8_t vk_type;           ///< VkDescriptorType
@@ -95,6 +101,9 @@ typedef struct nvn_direct_shader_desc {
     /// Not a plain constant buffer word: a handle computed per draw, a pointer read from memory
     /// (the replay's bindings cannot fill it)
     uint8_t unsupported;
+    /// A texture read from the pools by the handle the shader computes (NVN_DIRECT_POOL_SET): its
+    /// binding in the stage's range stays unused
+    uint8_t pool;
 } nvn_direct_shader_desc;
 
 /// A translated stage. Everything is allocated by the translator and given back with shader_free.

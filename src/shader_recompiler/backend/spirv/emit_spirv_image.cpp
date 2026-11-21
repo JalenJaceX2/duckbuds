@@ -238,8 +238,42 @@ private:
     spv::ImageOperandsMask mask{};
 };
 
+// A texture read from the pools (TextureDefinition::is_pool) by the handle the shader computed:
+// the image at its texture ID (bits 0-19) and, when sampled, the sampler at its sampler ID
+// (bits 20-31), as the console's bindless texture instructions take them
+Id PoolTexture(EmitContext& ctx, const TextureDefinition& def, const IR::Value& handle,
+               bool sampled) {
+    const Id value{handle.IsImmediate() ? ctx.Const(handle.U32()) : ctx.Def(handle)};
+    const Id texture_id{ctx.OpBitwiseAnd(ctx.U32[1], value, ctx.Const(0xfffffU))};
+    const bool non_uniform{MarkNonUniform(ctx, texture_id, handle, NonUniformKind::SampledImage)};
+    const Id image_pointer{ctx.OpAccessChain(def.pointer_type, def.id, texture_id)};
+    const Id image{ctx.OpLoad(def.image_type, image_pointer)};
+    if (non_uniform) {
+        DecorateNonUniform(ctx, image_pointer);
+        DecorateNonUniform(ctx, image);
+    }
+    if (!sampled) {
+        return image;
+    }
+    const Id sampler_id{ctx.OpShiftRightLogical(ctx.U32[1], value, ctx.Const(20U))};
+    const Id sampler_pointer{
+        ctx.OpAccessChain(ctx.pool_sampler_pointer, ctx.pool_samplers, sampler_id)};
+    const Id sampler{ctx.OpLoad(ctx.TypeSampler(), sampler_pointer)};
+    const Id object{ctx.OpSampledImage(def.sampled_type, image, sampler)};
+    if (non_uniform) {
+        DecorateNonUniform(ctx, sampler_id);
+        DecorateNonUniform(ctx, sampler_pointer);
+        DecorateNonUniform(ctx, sampler);
+        DecorateNonUniform(ctx, object);
+    }
+    return object;
+}
+
 Id Texture(EmitContext& ctx, IR::TextureInstInfo info, [[maybe_unused]] const IR::Value& index) {
     const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+    if (def.is_pool) {
+        return PoolTexture(ctx, def, index, true);
+    }
     if (def.count > 1) {
         auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
         const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};
@@ -273,6 +307,9 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
         return ctx.OpLoad(ctx.image_buffer_type, def.id);
     } else {
         const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
+        if (def.is_pool) {
+            return PoolTexture(ctx, def, index, false);
+        }
         if (def.count > 1) {
             auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);
             const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::SampledImage)};

@@ -502,7 +502,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineStorageBuffers(program.info, storage_binding);
     DefineTextureBuffers(program.info, texture_binding);
     DefineImageBuffers(program.info, image_binding);
-    DefineTextures(program.info, texture_binding, bindings.texture_scaling_index);
+    DefineTextures(program.info, texture_binding, bindings.texture_scaling_index, bindings);
     DefineImages(program.info, image_binding, bindings.image_scaling_index);
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
@@ -1939,11 +1939,57 @@ void EmitContext::DefineImageBuffers(const Info& info, u32& binding) {
     }
 }
 
-void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_index) {
+void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_index,
+                                 const Bindings& bindings) {
     textures.reserve(info.texture_descriptors.size());
     for (const TextureDescriptor& desc : info.texture_descriptors) {
         const Id image_type{ImageType(*this, desc)};
         const Id sampled_type{TypeSampledImage(image_type)};
+        if (desc.is_pool) {
+            // The texture pool as an array of images of the type this descriptor samples (each
+            // pool texture's type aliases the same binding), and the sampler pool. The binding
+            // and rescaling bit the descriptor would take stay unused, so the others keep theirs.
+            if (profile.supported_spirv < 0x00010500) {
+                AddExtension("SPV_EXT_descriptor_indexing");
+            }
+            AddCapability(spv::Capability::RuntimeDescriptorArray);
+            const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
+            const Id id{AddGlobalVariable(
+                TypePointer(spv::StorageClass::UniformConstant, TypeRuntimeArray(image_type)),
+                spv::StorageClass::UniformConstant)};
+            Decorate(id, spv::Decoration::Binding, bindings.pool_texture_binding);
+            Decorate(id, spv::Decoration::DescriptorSet, bindings.pool_set);
+            Name(id, NameOf(stage, desc, "pool_tex"));
+            if (!pool_samplers.value) {
+                const Id sampler_type{TypeSampler()};
+                pool_sampler_pointer = TypePointer(spv::StorageClass::UniformConstant, sampler_type);
+                pool_samplers = AddGlobalVariable(
+                    TypePointer(spv::StorageClass::UniformConstant, TypeRuntimeArray(sampler_type)),
+                    spv::StorageClass::UniformConstant);
+                Decorate(pool_samplers, spv::Decoration::Binding, bindings.pool_sampler_binding);
+                Decorate(pool_samplers, spv::Decoration::DescriptorSet, bindings.pool_set);
+                Name(pool_samplers, "pool_samp");
+                if (profile.supported_spirv >= 0x00010400) {
+                    interfaces.push_back(pool_samplers);
+                }
+            }
+            textures.push_back({
+                .id = id,
+                .sampled_type = sampled_type,
+                .pointer_type = pointer_type,
+                .image_type = image_type,
+                .count = 1,
+                .is_multisample = desc.is_multisample,
+                .is_integer = desc.is_integer,
+                .is_pool = true,
+            });
+            if (profile.supported_spirv >= 0x00010400) {
+                interfaces.push_back(id);
+            }
+            ++binding;
+            ++scaling_index;
+            continue;
+        }
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, sampled_type)};
         const Id desc_type{DescType(*this, sampled_type, pointer_type, desc.count)};
         const Id id{AddGlobalVariable(desc_type, spv::StorageClass::UniformConstant)};
