@@ -627,7 +627,12 @@ vka_shader* vka_rc_by_key(uint64_t key, int gl_depth) {
 typedef struct { uint64_t key, data; const rc_control* control; } spec_item;
 static spec_item* g_spec; static size_t g_spec_n, g_spec_cap; static int g_spec_up;
 static pthread_mutex_t g_spec_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_spec_cv = PTHREAD_COND_INITIALIZER;
-static _Atomic unsigned g_spec_made, g_spec_skipped, g_spec_failed;
+static _Atomic unsigned g_spec_made, g_spec_skipped, g_spec_failed, g_spec_huge;
+// A translation over this many SPIR-V words is not made into a library ahead. Compile time grows about with the square of the size (NVIDIA 595, RTX 5080,
+// Splatoon Raiders 0400380020056000: 207k words 0.9 s, 770k 10.6 s, its eight ~2M-word uber-shaders more than 3 minutes), and a build still running
+// when the emulator stops keeps it from stopping (nvn_direct_park waits 3 s). 256k stays above every other shader of the game (largest 207k, then 75k).
+// A draw that meets the shader still makes its own
+enum { SPEC_MAX_WORDS = 256 * 1024 };
 static _Atomic int g_spec_busy;
 // One speculative translation (g_spec_busy counts it while it runs)
 static void spec_one(spec_item it) {
@@ -637,6 +642,10 @@ static void spec_one(spec_item it) {
     prog_t p; memset(&p, 0, sizeof p); p.nstage = 1; p.sd[0].data = it.data;
     nvn_direct_shader o; uint64_t vin_types; char why[300]; why[0] = 0;
     if (!rc_translate(&p, 0, it.control, NULL, 0, !vka_depth_zero(), &o, &vin_types, why, sizeof why)) { g_spec_failed++; disk_spec_done(it.key); return; }
+    if (o.spirv_words > SPEC_MAX_WORDS) {
+        VLOG("recompiler: %016llx (NVN stage %d) not made ahead: %zu SPIR-V words (over %d)", (unsigned long long)it.key, st, (size_t)o.spirv_words, (int)SPEC_MAX_WORDS);
+        g_spec_huge++; vka_shader_translated_free(&o); disk_spec_done(it.key); return;
+    }
     dmsh_vk_bind* b = rc_binds(&o, st, it.control, why, sizeof why);
     uint32_t a0, c1e; rc_c1_range(it.control, &a0, &c1e); uint32_t c1_len = a0 < c1e ? c1e - a0 : 0;
     const uint8_t* c1 = (const uint8_t*)(uintptr_t)nvn_direct_host_of(it.data) + a0;
@@ -650,7 +659,7 @@ static void spec_one(spec_item it) {
     disk_spec_done(it.key);
     if (!s) { g_spec_failed++; return; }
     unsigned n = ++g_spec_made;
-    if (n == 1 || !(n & (n - 1))) VLOG("recompiler: %u shaders translated speculatively and their libraries made (%u kept or drawn already, %u not translated without a draw)", n, (unsigned)g_spec_skipped, (unsigned)g_spec_failed);
+    if (n == 1 || !(n & (n - 1))) VLOG("recompiler: %u shaders translated speculatively and their libraries made (%u kept or drawn already, %u not translated without a draw, %u too large)", n, (unsigned)g_spec_skipped, (unsigned)g_spec_failed, (unsigned)g_spec_huge);
 }
 // The emulator shuts down (vka_stop): the threads drop what is queued and end, as what they use (the game's memory, Lichii's recompiler and device) goes away
 static void* spec_main(void* a) {
