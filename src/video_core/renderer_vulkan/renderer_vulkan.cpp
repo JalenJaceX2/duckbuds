@@ -324,9 +324,9 @@ bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const 
         // NVML's figure when there is one (it counts what the driver keeps for itself), else the
         // heap usage.
         .memory_usage = [](void* context) -> uint64_t {
-            auto* const memory = static_cast<NvnDirectMemory*>(context);
-            const u64 nvml = memory->nvml.Get();
-            return nvml != 0 ? nvml : memory->device->GetDeviceMemoryUsage();
+            auto* const direct_memory = static_cast<NvnDirectMemory*>(context);
+            const u64 nvml = direct_memory->nvml.Get();
+            return nvml != 0 ? nvml : direct_memory->device->GetDeviceMemoryUsage();
         },
         .memory_budget = [](void* context) -> uint64_t {
             return static_cast<NvnDirectMemory*>(context)->device->GetDeviceMemoryBudget();
