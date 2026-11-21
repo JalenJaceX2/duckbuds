@@ -73,7 +73,7 @@ typedef struct nvn_direct_shader_source {
 /// What a descriptor of a translated shader reads (Shader::Info's descriptor lists)
 enum {
     NVN_DIRECT_DESC_CBUF,           ///< constant buffer cbuf_index
-    NVN_DIRECT_DESC_STORAGE,        ///< storage buffer at the address in c[cbuf_index][cbuf_offset]
+    NVN_DIRECT_DESC_STORAGE,        ///< storage buffer at the address in c[cbuf_index][cbuf_offset] (or read through it: indirect_offset)
     NVN_DIRECT_DESC_TEXTURE_BUFFER, ///< texel buffers and textures: the handle in c[cbuf_index][cbuf_offset]
     NVN_DIRECT_DESC_IMAGE_BUFFER,
     NVN_DIRECT_DESC_TEXTURE,
@@ -87,6 +87,14 @@ enum {
 #define NVN_DIRECT_POOL_SET 1
 #define NVN_DIRECT_POOL_TEXTURE_BINDING 0
 #define NVN_DIRECT_POOL_SAMPLER_BINDING 1
+/// Why the replay's bindings cannot fill a descriptor (nvn_direct_shader_desc::unsupported)
+enum {
+    NVN_DIRECT_UNSUPPORTED_NONE,
+    NVN_DIRECT_UNSUPPORTED_HANDLE_PROGRAM, ///< a texture, texel buffer or image handle computed per draw (Shader::Info::handle_programs)
+    NVN_DIRECT_UNSUPPORTED_POINTER_WORD,   ///< a texture whose handle word is a pointer, never a handle: bound as nothing
+    NVN_DIRECT_UNSUPPORTED_ARRAY,          ///< an array of constant buffers, images or image buffers
+    NVN_DIRECT_UNSUPPORTED_BYTE_ADDRESSED, ///< an image addressed in bytes
+};
 typedef struct nvn_direct_shader_desc {
     uint8_t kind;              ///< NVN_DIRECT_DESC_*
     uint8_t vk_type;           ///< VkDescriptorType
@@ -98,9 +106,10 @@ typedef struct nvn_direct_shader_desc {
     uint8_t has_secondary;
     uint8_t texture_type;      ///< Shader::TextureType
     uint8_t is_depth, is_multisample, is_integer, is_written, is_atomic;
-    /// Not a plain constant buffer word: a handle computed per draw, a pointer read from memory
-    /// (the replay's bindings cannot fill it)
-    uint8_t unsupported;
+    uint8_t unsupported;       ///< NVN_DIRECT_UNSUPPORTED_*
+    /// A storage buffer whose address is the 64-bit word at its pointer + this offset (a table of
+    /// pointers in memory, Shader::StorageBufferDescriptor::indirect_offset); ~0: the pointer itself
+    uint32_t indirect_offset;
     /// A texture read from the pools by the handle the shader computes (NVN_DIRECT_POOL_SET): its
     /// binding in the stage's range stays unused
     uint8_t pool;

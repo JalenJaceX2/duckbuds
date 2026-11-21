@@ -576,16 +576,19 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
         desc.cbuf_offset = from.cbuf_offset;
         desc.count = from.count;
         desc.size_shift = from.size_shift;
-        desc.unsupported = from.handle_program != ~0U;
+        if (from.handle_program != ~0U) {
+            desc.unsupported = NVN_DIRECT_UNSUPPORTED_HANDLE_PROGRAM;
+        }
         return desc;
     };
     u32 cbuf_slots = 0;
     for (const Shader::ConstantBufferDescriptor& cbuf : info.constant_buffer_descriptors) {
         add({.kind = NVN_DIRECT_DESC_CBUF,
              .vk_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-             .count = 1,
+             .count = cbuf.count,
              .cbuf_index = cbuf.index,
-             .unsupported = cbuf.count != 1},
+             .unsupported = static_cast<u8>(cbuf.count != 1 ? NVN_DIRECT_UNSUPPORTED_ARRAY
+                                                            : NVN_DIRECT_UNSUPPORTED_NONE)},
             cbuf.count);
         cbuf_slots += cbuf.count;
     }
@@ -599,7 +602,7 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
              .cbuf_index = ssbo.cbuf_index,
              .cbuf_offset = ssbo.cbuf_offset,
              .is_written = ssbo.is_written,
-             .unsupported = ssbo.count != 1 || ssbo.indirect_offset != ~0U},
+             .indirect_offset = ssbo.indirect_offset},
             ssbo.count);
     }
     for (const Shader::TextureBufferDescriptor& texbuf : info.texture_buffer_descriptors) {
@@ -618,7 +621,9 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
                                     .is_integer = imgbuf.is_integer,
                                     .is_written = imgbuf.is_written};
         desc = handle(desc, imgbuf);
-        desc.unsupported |= imgbuf.count != 1;
+        if (!desc.unsupported && imgbuf.count != 1) {
+            desc.unsupported = NVN_DIRECT_UNSUPPORTED_ARRAY;
+        }
         add(desc, 1);
     }
     for (const Shader::TextureDescriptor& texture : info.texture_descriptors) {
@@ -635,7 +640,7 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
         desc.secondary_offset = texture.secondary_cbuf_offset;
         desc.secondary_shift_left = texture.secondary_shift_left;
         if (texture.handle_is_pointer_word) {
-            desc.unsupported = 2; // binds no texture (TextureDescriptor::handle_is_pointer_word)
+            desc.unsupported = NVN_DIRECT_UNSUPPORTED_POINTER_WORD;
         }
         desc.pool = texture.is_pool;
         add(desc, 1);
@@ -648,7 +653,11 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
                                     .is_written = image.is_written,
                                     .is_atomic = info.uses_atomic_image_u32 && image.is_integer};
         desc = handle(desc, image);
-        desc.unsupported |= image.count != 1 || image.is_byte_addressed;
+        if (!desc.unsupported && image.count != 1) {
+            desc.unsupported = NVN_DIRECT_UNSUPPORTED_ARRAY;
+        } else if (!desc.unsupported && image.is_byte_addressed) {
+            desc.unsupported = NVN_DIRECT_UNSUPPORTED_BYTE_ADDRESSED;
+        }
         add(desc, 1);
     }
     if (binding > source.first_binding + NVN_DIRECT_LOOP_GUARD_SLOT) {

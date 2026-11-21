@@ -370,6 +370,15 @@ if (TARGET nvn_direct AND NOT WIN32)
     target_compile_options(nvn_present_tests PRIVATE -Wno-missing-declarations)
     target_link_libraries(nvn_present_tests PRIVATE Threads::Threads Vulkan::Headers)
     add_test(NAME nvn_present_tests COMMAND nvn_present_tests)
+
+    add_executable(nvn_bind_tests
+        video_core/nvn_bind.c
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/vk_android/vka_bind.c)
+    target_include_directories(nvn_bind_tests PRIVATE
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/vk_android
+        ${NVN_DIRECT_DIR})
+    set_target_properties(nvn_bind_tests PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    add_test(NAME nvn_bind_tests COMMAND nvn_bind_tests)
 endif()
 
 add_executable(profile_migration_tests

@@ -60,6 +60,10 @@ typedef int (*vka_read_fn)(void *ctx, uint64_t addr, void *out, size_t n);
 #define VKA_BANK_NVN2_CS_C0 0x100
 // Lichii: a recompiled shader's loop guard word (nvn_recompile.c): a VKA_R_LOOP_GUARD the walk's caller binds from the shader
 #define VKA_KIND_LOOP_GUARD 65
+// Lichii: a storage buffer whose address is the 64-bit word at its pointer + soff (a table of pointers in memory: Shader::StorageBufferDescriptor::indirect_offset),
+// the pointer in storage slot reg (SBUF_IND) or in uniform slot reg at byte off (SBUF_UBO_IND); bound from that address to the end of its chunk, as SBUF_UBO
+#define VKA_KIND_SBUF_IND 67
+#define VKA_KIND_SBUF_UBO_IND 68
 
 #define VKA_WALK_REFUSE (-1)
 // Walks one stage's binding records (e->bind_count of them from b) for NVN stage nvn_stage. Writes at most max results to out and returns their count, or VKA_WALK_REFUSE with

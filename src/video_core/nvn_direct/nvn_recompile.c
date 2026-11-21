@@ -248,7 +248,13 @@ static int rc_bind(const nvn_direct_shader_desc* s, int st, const cs_layout* l, 
     if (s->is_written) b->flags |= DMSH_VK_BF_RW;
     if (s->is_atomic) b->flags |= DMSH_VK_BF_ATOMIC;
 #define NO(...) do { snprintf(why, whyn, __VA_ARGS__); return 0; } while (0)
-    if (s->unsupported == 1) NO("binding %u: a handle computed per draw or a pointer read from memory (c%u + %#x)", s->binding, s->cbuf_index, s->cbuf_offset);
+    static const char* const kind_name[] = {"constant buffer", "storage buffer", "texel buffer", "image buffer", "texture", "image", "loop guard"};
+    const char* kn = s->kind < sizeof kind_name / sizeof *kind_name ? kind_name[s->kind] : "descriptor";
+    switch (s->unsupported) {
+    case NVN_DIRECT_UNSUPPORTED_HANDLE_PROGRAM: NO("binding %u: %s handle computed per draw, not a constant buffer word", s->binding, kn);
+    case NVN_DIRECT_UNSUPPORTED_ARRAY: NO("binding %u: an array of %u %ss (c%u + %#x)", s->binding, s->count, kn, s->cbuf_index, s->cbuf_offset);
+    case NVN_DIRECT_UNSUPPORTED_BYTE_ADDRESSED: NO("binding %u: %s addressed in bytes (c%u + %#x)", s->binding, kn, s->cbuf_index, s->cbuf_offset);
+    }
     switch (s->kind) {
     case NVN_DIRECT_DESC_CBUF:
         if (s->cbuf_index == 0) { b->kind = l ? VKA_KIND_NVN2_CS_C0 : DMSH_VK_KIND_DRVCB; b->reg = 0; }
@@ -271,13 +277,18 @@ static int rc_bind(const nvn_direct_shader_desc* s, int st, const cs_layout* l, 
         } else if (s->cbuf_index >= 3 && s->cbuf_index < 19 && s->cbuf_offset < 0x10000) {
             b->kind = DMSH_VK_KIND_SBUF_UBO; b->reg = (int16_t)(s->cbuf_index - 3); b->off = (uint16_t)s->cbuf_offset;
         } else NO("binding %u: storage buffer pointer at c%u + %#x", s->binding, s->cbuf_index, s->cbuf_offset);
+        if (s->indirect_offset != ~0u) {   // the address is the word at the pointer + indirect_offset (vka_bind.c VKA_KIND_SBUF_IND)
+            if ((b->kind != DMSH_VK_KIND_SBUF && b->kind != DMSH_VK_KIND_SBUF_UBO) || s->indirect_offset > 0xFFFF)
+                NO("binding %u: a storage buffer address %#x past the pointer at c%u + %#x", s->binding, s->indirect_offset, s->cbuf_index, s->cbuf_offset);
+            b->kind = b->kind == DMSH_VK_KIND_SBUF ? VKA_KIND_SBUF_IND : VKA_KIND_SBUF_UBO_IND; b->soff = (uint16_t)s->indirect_offset;
+        }
         return 1;
     case NVN_DIRECT_DESC_TEXTURE: case NVN_DIRECT_DESC_TEXTURE_BUFFER: {
         b->dim = dim_of(s);
         if (s->pool) {   // the pools by the handle the shader computes: set 1, which the draw binds for it (vka_draw.c any_pool)
             b->kind = DMSH_VK_KIND_TEX_POOL; b->set = DMSH_VK_SET_POOL; b->binding = DMSH_VK_POOL_TEX_BINDING; b->count = 0; return 1;
         }
-        if (s->unsupported == 2) { b->kind = DMSH_VK_KIND_TEX; b->flags |= DMSH_VK_BF_NOSLOT; return 1; }   // a pointer word, never a handle: bound as nothing
+        if (s->unsupported == NVN_DIRECT_UNSUPPORTED_POINTER_WORD) { b->kind = DMSH_VK_KIND_TEX; b->flags |= DMSH_VK_BF_NOSLOT; return 1; }   // bound as nothing
         if (s->shift_left || (s->has_secondary && s->secondary_shift_left)) NO("binding %u: a shifted handle", s->binding);
         if (b->count > 1 && s->size_shift != 3) NO("binding %u: an array of handles %u bytes apart", s->binding, 1u << s->size_shift);
         int c2 = c2_off(l, s->cbuf_index, s->cbuf_offset);
