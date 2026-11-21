@@ -538,6 +538,7 @@ static pthread_cond_t g_lib_cv = PTHREAD_COND_INITIALIZER;
 static _Thread_local int t_ahead;   // gpl_link makes only these libraries (1 pre-rasterization, 2 fragment shader) and links nothing (lib_ahead_main)
 static _Thread_local int t_lib_peek;            // lib_make answers from the map only: a library not made yet is not made here (the link fails)
 static _Thread_local const char *t_how = "";    // appended to the build lines of this thread (" (asynchronous)")
+static _Thread_local uint64_t t_lib_vs, t_lib_fs;   // Lichii: the shaders of the pipeline gpl_link makes parts of, for vka_pso_wait_dump
 static _Atomic uint64_t g_async_made, g_async_ns, g_async_skips;   // made asynchronously, their time, the draws skipped meanwhile
 static _Atomic uint64_t g_async_claimed;   // pipelines the frame path took back from the asynchronous threads or waited for (async_claim)
 // Lichii: libraries the ahead threads made (and let go of), and the ones other threads compiled (over 20 ms: not a cache hit)
@@ -555,7 +556,7 @@ static VkPipeline lib_make(int kind, const void *key, size_t klen, VkGraphicsPip
         VkGraphicsPipelineLibraryCreateInfoEXT li = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, .pNext = shp && (g_pre_adapt & A_NORI) ? NULL : ci->pNext, .flags = part};
         VkGraphicsPipelineCreateInfo c = *ci; c.pNext = &li;
         c.flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | (g_pre_adapt & A_RETAIN ? VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT : 0);
-        int bs = build_begin(g_lib_name[kind], 0, 0);
+        int bs = build_begin(g_lib_name[kind], t_lib_vs, t_lib_fs);
         VkPipeline p = VK_NULL_HANDLE; VkResult r = vk.vkCreateGraphicsPipelines(V.dev, shp && (g_pre_adapt & A_NOCACHE) ? VK_NULL_HANDLE : g_pc, 1, &c, NULL, &p);
         build_end(bs);
         if (!r && p) { vk.vkDestroyPipeline(V.dev, p, NULL); atomic_fetch_add(&g_lib_ahead_made, 1); }
@@ -571,7 +572,7 @@ static VkPipeline lib_make(int kind, const void *key, size_t klen, VkGraphicsPip
     VkGraphicsPipelineLibraryCreateInfoEXT li = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, .pNext = shp && (g_pre_adapt & A_NORI) ? NULL : ci->pNext, .flags = part};
     ci->pNext = &li; ci->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | (g_pre_adapt & A_RETAIN ? VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT : 0);
     uint64_t t0 = now_ns();
-    int bs = build_begin(g_lib_name[kind], 0, 0);
+    int bs = build_begin(g_lib_name[kind], t_lib_vs, t_lib_fs);
     VkPipeline p = VK_NULL_HANDLE; VkResult r = vk.vkCreateGraphicsPipelines(V.dev, shp && (g_pre_adapt & A_NOCACHE) ? VK_NULL_HANDLE : g_pc, 1, ci, NULL, &p);
     build_end(bs);
     ci->pNext = li.pNext;
@@ -664,7 +665,8 @@ static unsigned pre_probe(const VkGraphicsPipelineCreateInfo *ci0, const pstate 
     return a;
 }
 // The parts of P, each made once; then the link. VK_NULL_HANDLE = a part failed (the caller makes the whole pipeline)
-static VkPipeline gpl_link(pstate *P, const vka_gkey *k) {
+static VkPipeline gpl_link(pstate *P, vka_shader *const sh[VKA_NSTAGE], const vka_gkey *k) {
+    t_lib_vs = sh[0] ? sh[0]->key : 0; t_lib_fs = sh[1] ? sh[1]->key : 0;
     VkDynamicState dl[NLIB][24]; VkPipelineDynamicStateCreateInfo dy[NLIB];
     for (int i = 0; i < NLIB; i++) dyn_of(P, i, dl[i], &dy[i]);
     VkPipeline part[4]; uint32_t nparts = 0;
@@ -1050,7 +1052,7 @@ static int gfx_make(gval *g, const gkey_full *fk, size_t len, vka_shader *const 
         if (mode == MK_FRAME && (gpl || async) && V.cache_ctl) p = cache_probe(P);   // (the cache-only try needs pipelineCreationCacheControl; without it, as a miss)
         if (!p && mode != MK_PREWARM && gpl) {
             uint64_t t1 = now_ns();
-            t_lib_peek = async; p = gpl_link(P, k); t_lib_peek = 0;
+            t_lib_peek = async; p = gpl_link(P, sh, k); t_lib_peek = 0;
             uint64_t d2 = now_ns() - t1;
             pthread_mutex_lock(&g_mu);
             if (p) { linked = 1; g_ngfx++; g_create_ms += d2 / 1e6; }
@@ -1230,7 +1232,7 @@ static void lib_ahead_make(vka_shader *s, int part, const vka_gkey *k, int scrat
     vka_layout lay; memset(&lay, 0, sizeof lay);
     if (!(scratch ? layout_slow(sh, 0, &lay) && lay.layout : vka_layout_of(sh, 0, &lay))) return;
     pstate *P = malloc(sizeof *P);
-    if (P && pstate_fill(P, sh, &lay, k)) { t_ahead = part; gpl_link(P, k); t_ahead = 0; }
+    if (P && pstate_fill(P, sh, &lay, k)) { t_ahead = part; gpl_link(P, sh, k); t_ahead = 0; }
     free(P);
 }
 static void lib_ahead_one(const ahead_item *it) {
