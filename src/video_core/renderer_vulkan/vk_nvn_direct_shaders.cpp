@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <span>
 #include <vector>
@@ -20,6 +22,7 @@
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
+#include "shader_recompiler/frontend/ampere/program_override.h"
 #include "shader_recompiler/frontend/ampere/trap_guards.h"
 #include "shader_recompiler/frontend/ir/attribute.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
@@ -213,6 +216,26 @@ private:
         if (native.empty()) {
             throw Shader::RuntimeError("No instructions");
         }
+        // EDEN_NX2_SHADER_DUMP=<dir>: the program as GPU emulation keeps it (shader_environment.cpp),
+        // so tools/nx2/shader_sweep.py tests the lowering offline on what direct mode translates too
+        if (static const char* const dump_directory = std::getenv("EDEN_NX2_SHADER_DUMP");
+            dump_directory != nullptr) {
+            dump_key = Shader::Ampere::NativeProgramKey(native);
+            const auto path = std::filesystem::path{dump_directory} /
+                              fmt::format("{:016x}-{}-{:x}.bin", dump_key, compute ? "cs" : "gfx",
+                                          source.code_address);
+            if (!std::filesystem::exists(path)) {
+                std::filesystem::create_directories(path.parent_path());
+                std::ofstream{path, std::ios::binary}.write(
+                    reinterpret_cast<const char*>(native.data()), native.size() * sizeof(Instruction));
+                if (header_size != 0) {
+                    auto header_path = path;
+                    header_path.replace_extension(".header.bin");
+                    std::ofstream{header_path, std::ios::binary}.write(
+                        reinterpret_cast<const char*>(source.code), header_size);
+                }
+            }
+        }
         const std::vector<u32> traps = VideoCommon::NativeTrapOffsets(native);
         const size_t trap_count = traps.empty() ? 0 : traps.back() / sizeof(Instruction) + 1;
         if (trap_count &&
@@ -336,6 +359,11 @@ public:
         return workgroup_size;
     }
 
+    /// The dumped program's key (EDEN_NX2_SHADER_DUMP), 0 when not dumped
+    u64 DumpKey() const {
+        return dump_key;
+    }
+
     bool HasHLEMacroState() const override {
         return true;
     }
@@ -368,6 +396,7 @@ private:
     std::vector<u64> code;
     u32 texture_bound{2};
     u32 local_memory_size{};
+    u64 dump_key{};
     u32 shared_memory_size{};
     std::array<u32, 3> workgroup_size{};
 };
@@ -527,6 +556,10 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
     bindings.pool_sampler_binding = NVN_DIRECT_POOL_SAMPLER_BINDING;
     const std::vector<u32> spirv{
         Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, bindings)};
+    if (env.DumpKey() != 0) {
+        LOG_INFO(Render_Vulkan, "NVN direct: dumped program {:016x} ({}): {} SPIR-V words",
+                 env.DumpKey(), static_cast<int>(stage), spirv.size());
+    }
 
     // The descriptors in the order the SPIR-V backend numbers them (EmitContext:
     // DefineConstantBuffers, DefineStorageBuffers, DefineTextureBuffers, DefineImageBuffers,
