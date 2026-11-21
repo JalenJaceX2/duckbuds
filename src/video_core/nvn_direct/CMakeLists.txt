@@ -93,8 +93,13 @@ target_include_directories(nvn_direct PRIVATE
     ${BN}/host
 )
 target_compile_definitions(nvn_direct PRIVATE __ANDROID__ _GNU_SOURCE)
-# Every C file's static variables in the sections nvn_direct_reset returns to their initial values
-# (nvn_direct_state.h); MSVC's form below
+# Every C file's static variables in the sections nvn_direct_reset returns to their initial values:
+# on ELF the linker collects them (nvn_direct.ld, in every binary that links the library), on COFF
+# the compiler (nvn_direct_state.h; MSVC's form below)
+if (NOT WIN32)
+    target_link_options(nvn_direct INTERFACE "LINKER:-T,${CMAKE_CURRENT_SOURCE_DIR}/nvn_direct.ld")
+    set_property(TARGET nvn_direct APPEND PROPERTY INTERFACE_LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/nvn_direct.ld)
+endif()
 if (NOT MSVC)
     target_compile_options(nvn_direct PRIVATE $<$<COMPILE_LANGUAGE:C>:-include ${CMAKE_CURRENT_SOURCE_DIR}/nvn_direct_state.h>)
 endif()

@@ -3,9 +3,9 @@
 
 // The front end and the replay as a new process has them, for the next game in the process.
 // Upstream's code keeps its state in static variables for the life of its process (about two
-// thousand of them, with the call sites' cached switches and once flags); nvn_direct_state.h puts
-// all of them in sections of their own, whose initial bytes are kept here when the library loads
-// and copied back by nvn_direct_reset. Its threads are joined and its Vulkan objects, pool imports
+// thousand of them, with the call sites' cached switches and once flags); nvn_direct.ld (ELF) and
+// nvn_direct_state.h (COFF) put all of them in sections of their own, whose initial bytes are kept
+// here when the library loads and copied back by nvn_direct_reset. Its threads are joined and its Vulkan objects, pool imports
 // and views of guest memory are destroyed before that (nvn_direct_park, nvn_direct_destroy).
 
 #include <stdint.h>
@@ -26,20 +26,22 @@ static char g_bss_end, g_data_end = 1;
 #define BSS_END (&g_bss_end)
 #define DATA_BEGIN (&g_data_begin + 1)
 #define DATA_END (&g_data_end)
+#define KEPT
 #else
-#pragma clang section bss = "" data = ""
-// (weak: a section that holds nothing has no bounds)
+// (weak: without nvn_direct.ld the sections have no bounds)
 extern char __start_nvn_direct_bss[] __attribute__((weak)), __stop_nvn_direct_bss[] __attribute__((weak));
 extern char __start_nvn_direct_data[] __attribute__((weak)), __stop_nvn_direct_data[] __attribute__((weak));
 #define BSS_BEGIN __start_nvn_direct_bss
 #define BSS_END __stop_nvn_direct_bss
 #define DATA_BEGIN __start_nvn_direct_data
 #define DATA_END __stop_nvn_direct_data
+// Out of the library's .data and .bss, which nvn_direct.ld collects
+#define KEPT __attribute__((section("nvn_direct_kept")))
 #endif
 
 int nvn_direct_threads_left(void); // nvn_shutdown.c
 
-static unsigned char* g_initial_data;
+static unsigned char* g_initial_data KEPT;
 
 __attribute__((constructor)) static void keep_initial_data(void) {
     const size_t size = (size_t)(DATA_END - DATA_BEGIN);
@@ -48,9 +50,12 @@ __attribute__((constructor)) static void keep_initial_data(void) {
 }
 
 int nvn_direct_reset(void) {
-    // A compiler that ignores "#pragma clang section" (GCC) leaves the sections empty: nothing can
-    // be reset, and the next boot in the process falls back (Core::NvnHook, RendererChoice::NotReset)
-    if (!g_initial_data || (DATA_END == DATA_BEGIN && BSS_END == BSS_BEGIN)) return 0;
+    // Without its sections nothing can be reset, and the next boot in the process falls back
+    // (Core::NvnHook, RendererChoice::NotReset)
+    if (!g_initial_data || (DATA_END == DATA_BEGIN && BSS_END == BSS_BEGIN)) {
+        VRED("the library's static state was not found (a binary linked without nvn_direct.ld): it is not reset");
+        return 0;
+    }
     if (!nvn_direct_threads_left()) {
         VRED("a thread of the replay did not leave: its state is not reset");
         return 0;

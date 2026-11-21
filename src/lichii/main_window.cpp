@@ -2505,7 +2505,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             case RendererChoice::NoNvn:
                 return tr("the game does not use NVN");
             case RendererChoice::NotReset:
-                return tr("an earlier game used it and this build cannot reset it");
+                return tr("an earlier game used it and it could not be reset");
             case RendererChoice::ReplayFailed:
             default:
                 return tr("it could not start on this GPU");

@@ -22,7 +22,7 @@ enum class RendererChoice : u8 {
     Not64Bit,    ///< a 32-bit game: the NVN hook covers A64 code only
     NoNvn,       ///< the game exports no nvnBootstrapLoader
     ReplayFailed, ///< the direct renderer could not start on the Vulkan device (in this process)
-    NotReset,     ///< an earlier game's direct renderer could not be reset (a build without Clang)
+    NotReset,     ///< an earlier game's direct renderer could not be reset (its log says why)
 };
 
 struct RendererInputs {
@@ -97,7 +97,7 @@ struct RendererInputs {
                "1.3; the replay's log lines say what is missing)";
     case RendererChoice::NotReset:
         return "fallback: an earlier game in this process used the NVN direct renderer and this "
-               "build cannot reset it (its C code was not compiled with Clang)";
+               "could not be reset (the NVN direct log lines at its stop say why)";
     }
     return "?";
 }
