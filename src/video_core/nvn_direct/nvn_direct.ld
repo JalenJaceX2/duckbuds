@@ -5,8 +5,9 @@
    two thousand, most of them upstream's) in output sections of their own, so nvn_direct_reset
    (nvn_reset.c) returns every one of them to its initial value when a game stops. Placed by the
    linker, so any compiler's objects are collected (GNU ld and lld augment their default layout
-   with INSERT). Before .data and .bss: GNU ld gives an input section to the first statement
-   that matches it, and .data.rel.ro and the thread-local sections come earlier. */
+   with INSERT). After .data and .bss: before .data they would share the last page of RELRO,
+   which -z now (nixpkgs' hardening) makes read-only. The linker still gives these statements
+   their input sections before the default script's, wherever INSERT places them. */
 
 SECTIONS
 {
@@ -17,7 +18,7 @@ SECTIONS
         __stop_nvn_direct_data = .;
     }
 }
-INSERT BEFORE .data;
+INSERT AFTER .data;
 
 SECTIONS
 {
@@ -28,4 +29,4 @@ SECTIONS
         __stop_nvn_direct_bss = .;
     }
 }
-INSERT BEFORE .bss;
+INSERT AFTER .bss;
