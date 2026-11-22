@@ -267,6 +267,10 @@ struct ImageDescriptor {
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
     /// storage buffer), ~0 when it is the constant buffer word.
     u32 handle_program{~0U};
+    /// Whether the image is read from the image pool by the handle the shader computes
+    /// (HostTranslateInfo::support_pool_textures): no constant buffer word, the instruction's
+    /// index operand is the handle
+    bool is_pool{};
 
     auto operator<=>(const ImageDescriptor&) const = default;
 };

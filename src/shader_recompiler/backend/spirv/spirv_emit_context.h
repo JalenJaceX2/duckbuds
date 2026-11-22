@@ -69,6 +69,9 @@ struct ImageDefinition {
     Id pointer_type;
     u32 count;
     bool is_integer;
+    /// Read from the image pool: id is the pool's array of image_type, pointer_type points to one
+    /// of its elements
+    bool is_pool{};
 };
 
 struct UniformDefinitions {
@@ -522,7 +525,8 @@ private:
     void DefineImageBuffers(const Info& info, u32& binding);
     void DefineTextures(const Info& info, u32& binding, u32& scaling_index,
                         const Bindings& bindings);
-    void DefineImages(const Info& info, u32& binding, u32& scaling_index);
+    void DefineImages(const Info& info, u32& binding, u32& scaling_index,
+                      const Bindings& bindings);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);
     void DefineGlobalMemoryFunctions(const IR::Program& program);

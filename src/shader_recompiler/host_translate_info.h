@@ -50,10 +50,10 @@ struct HostTranslateInfo {
     /// array of the table's entries (not OpenGL: its pipelines bind at most 64 textures; Vulkan
     /// only with nonuniform sampled image array indexing)
     bool support_handle_table_arrays{};
-    /// True when a sampled texture whose handle no constant buffer word gives is read from the
-    /// texture and sampler pools by the handle the shader computes, as the console's bindless
-    /// texture instructions do (NVN direct mode's replay, which binds the pools as descriptor
-    /// arrays indexed by texture and sampler ID)
+    /// True when a sampled texture or a storage image whose handle no constant buffer word gives
+    /// is read from the pools by the handle the shader computes, as the console's bindless
+    /// texture and surface instructions do (NVN direct mode's replay, which binds the texture,
+    /// sampler and image pools as descriptor arrays indexed by texture and sampler ID)
     bool support_pool_textures{};
     bool needs_lrz_disable{}; ///< True when fragment shaders must write depth to turn off LRZ
 

@@ -83,14 +83,17 @@ enum {
 #define NVN_DIRECT_LOOP_GUARD_SLOT 62
 /// The texture and sampler pools a texture with the pool flag is read from, by the texture and sampler
 /// IDs of the handle the shader computes: descriptor set 1, binding 0 (sampled images) and 1 (samplers)
-/// (dmsh_abi_vk.h DMSH_VK_SET_POOL, DMSH_VK_POOL_TEX_BINDING, DMSH_VK_POOL_SAMP_BINDING)
+/// (dmsh_abi_vk.h DMSH_VK_SET_POOL, DMSH_VK_POOL_TEX_BINDING, DMSH_VK_POOL_SAMP_BINDING); an image with
+/// the pool flag, by the texture ID of its handle: binding 2 (storage images: the IDs registered as
+/// images, vka_tex.c bindless_init)
 #define NVN_DIRECT_POOL_SET 1
 #define NVN_DIRECT_POOL_TEXTURE_BINDING 0
 #define NVN_DIRECT_POOL_SAMPLER_BINDING 1
+#define NVN_DIRECT_POOL_IMAGE_BINDING 2
 /// Why the replay's bindings cannot fill a descriptor (nvn_direct_shader_desc::unsupported)
 enum {
     NVN_DIRECT_UNSUPPORTED_NONE,
-    NVN_DIRECT_UNSUPPORTED_HANDLE_PROGRAM, ///< a texture, texel buffer or image handle computed per draw (Shader::Info::handle_programs)
+    NVN_DIRECT_UNSUPPORTED_HANDLE_PROGRAM, ///< a texel buffer or image buffer handle computed per draw (Shader::Info::handle_programs; textures and images are read from the pools)
     NVN_DIRECT_UNSUPPORTED_POINTER_WORD,   ///< a texture whose handle word is a pointer, never a handle: bound as nothing
     NVN_DIRECT_UNSUPPORTED_ARRAY,          ///< an array of constant buffers, images or image buffers
     NVN_DIRECT_UNSUPPORTED_BYTE_ADDRESSED, ///< an image addressed in bytes
@@ -110,8 +113,8 @@ typedef struct nvn_direct_shader_desc {
     /// A storage buffer whose address is the 64-bit word at its pointer + this offset (a table of
     /// pointers in memory, Shader::StorageBufferDescriptor::indirect_offset); ~0: the pointer itself
     uint32_t indirect_offset;
-    /// A texture read from the pools by the handle the shader computes (NVN_DIRECT_POOL_SET): its
-    /// binding in the stage's range stays unused
+    /// A texture or image read from the pools by the handle the shader computes (NVN_DIRECT_POOL_SET):
+    /// its binding in the stage's range stays unused
     uint8_t pool;
 } nvn_direct_shader_desc;
 

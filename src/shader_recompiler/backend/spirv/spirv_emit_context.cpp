@@ -503,7 +503,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineTextureBuffers(program.info, texture_binding);
     DefineImageBuffers(program.info, image_binding);
     DefineTextures(program.info, texture_binding, bindings.texture_scaling_index, bindings);
-    DefineImages(program.info, image_binding, bindings.image_scaling_index);
+    DefineImages(program.info, image_binding, bindings.image_scaling_index, bindings);
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
     DefineGlobalMemoryFunctions(program);
@@ -2031,12 +2031,45 @@ void EmitContext::DefineTextures(const Info& info, u32& binding, u32& scaling_in
     }
 }
 
-void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_index) {
+void EmitContext::DefineImages(const Info& info, u32& binding, u32& scaling_index,
+                               const Bindings& bindings) {
     images.reserve(info.image_descriptors.size());
     for (const ImageDescriptor& desc : info.image_descriptors) {
         const Id sampled_type{desc.is_integer ? U32[1] : F32[1]};
         const Id image_type{ImageType(*this, desc, sampled_type)};
         const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, image_type)};
+        if (desc.is_pool) {
+            // The image pool as an array of images of this descriptor's type (each pool image's
+            // type aliases the same binding). The binding and rescaling bit the descriptor would
+            // take stay unused, so the others keep theirs.
+            if (profile.supported_spirv < 0x00010500) {
+                AddExtension("SPV_EXT_descriptor_indexing");
+            }
+            AddCapability(spv::Capability::RuntimeDescriptorArray);
+            const Id id{AddGlobalVariable(
+                TypePointer(spv::StorageClass::UniformConstant, TypeRuntimeArray(image_type)),
+                spv::StorageClass::UniformConstant)};
+            Decorate(id, spv::Decoration::Binding, bindings.pool_image_binding);
+            Decorate(id, spv::Decoration::DescriptorSet, bindings.pool_set);
+            Name(id, NameOf(stage, desc, "pool_img"));
+            if (info.requires_coherent_image_memory) {
+                Decorate(id, spv::Decoration::Coherent);
+            }
+            images.push_back({
+                .id = id,
+                .image_type = image_type,
+                .pointer_type = pointer_type,
+                .count = 1,
+                .is_integer = desc.is_integer,
+                .is_pool = true,
+            });
+            if (profile.supported_spirv >= 0x00010400) {
+                interfaces.push_back(id);
+            }
+            ++binding;
+            ++scaling_index;
+            continue;
+        }
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding);
         Decorate(id, spv::Decoration::DescriptorSet, 0U);

@@ -345,6 +345,15 @@ std::pair<Id, bool> Image(EmitContext& ctx, const IR::Value& index, IR::TextureI
         return {ctx.OpLoad(def.image_type, def.id), def.is_integer};
     } else {
         const ImageDefinition def{ctx.images.at(info.descriptor_index)};
+        if (def.is_pool) {
+            const Id pointer{PoolImagePointer(ctx, info.descriptor_index, index)};
+            const Id image{ctx.OpLoad(def.image_type, pointer)};
+            if (!index.IsImmediate() &&
+                IsNonUniformSupported(ctx.profile, NonUniformKind::StorageImage)) {
+                DecorateNonUniform(ctx, image);
+            }
+            return {image, def.is_integer};
+        }
         if (def.count > 1) {
             const Id idx{index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index)};
             const bool non_uniform{MarkNonUniform(ctx, idx, index, NonUniformKind::StorageImage)};
@@ -525,6 +534,18 @@ void AddOffsetToCoordinates(EmitContext& ctx, const IR::TextureInstInfo& info, I
     coords = ctx.OpIAdd(result_type, coords, offset);
 }
 } // Anonymous namespace
+
+Id PoolImagePointer(EmitContext& ctx, u32 descriptor_index, const IR::Value& handle) {
+    const ImageDefinition& def{ctx.images.at(descriptor_index)};
+    const Id value{handle.IsImmediate() ? ctx.Const(handle.U32()) : ctx.Def(handle)};
+    const Id texture_id{ctx.OpBitwiseAnd(ctx.U32[1], value, ctx.Const(0xfffffU))};
+    const bool non_uniform{MarkNonUniform(ctx, texture_id, handle, NonUniformKind::StorageImage)};
+    const Id pointer{ctx.OpAccessChain(def.pointer_type, def.id, texture_id)};
+    if (non_uniform) {
+        DecorateNonUniform(ctx, pointer);
+    }
+    return pointer;
+}
 
 Id EmitBindlessImageSampleImplicitLod(EmitContext&) {
     throw LogicError("Unreachable instruction");

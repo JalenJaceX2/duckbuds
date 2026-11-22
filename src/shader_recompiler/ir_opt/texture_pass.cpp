@@ -1333,9 +1333,12 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
         // as written.
         const bool sampled{!IsStorageImageOpcode(IndexedInstruction(inst)) &&
                            inst.Flags<IR::TextureInstInfo>().type != TextureType::Buffer};
+        // A storage image (not a texel buffer, which no pool holds)
+        const bool storage_image{IsStorageImageOpcode(IndexedInstruction(inst)) &&
+                                 inst.Flags<IR::TextureInstInfo>().type != TextureType::Buffer};
         if (track_addr) {
             addr = *track_addr;
-        } else if (sampled && host_info.support_pool_textures) {
+        } else if ((sampled || storage_image) && host_info.support_pool_textures) {
             // Read from the pools by the handle the shader computes, as the console does.
             addr = ConstBufferAddr{
                 .index = 0,
@@ -1536,7 +1539,8 @@ public:
                    desc.cbuf_index == existing.cbuf_index &&
                    desc.cbuf_offset == existing.cbuf_offset && desc.count == existing.count &&
                    desc.size_shift == existing.size_shift &&
-                   desc.handle_program == existing.handle_program;
+                   desc.handle_program == existing.handle_program &&
+                   desc.is_pool == existing.is_pool;
         })};
         image_descriptors[index].is_written |= desc.is_written;
         image_descriptors[index].is_read |= desc.is_read;
@@ -1819,7 +1823,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 if (inst->GetOpcode() != IR::Opcode::ImageWrite ||
                     flags.image_format != ImageFormat::R32_UINT ||
                     flags.type != TextureType::Color2D || count != 1 ||
-                    cbuf.handle_program != ~0U) {
+                    cbuf.handle_program != ~0U || cbuf.pool) {
                     throw NotImplementedException("Byte-addressed image store descriptor mode");
                 }
                 const auto pixel_format{ReadTexturePixelFormatCached(env, cbuf)};
@@ -1844,8 +1848,11 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 const IR::U32 y{ir.CompositeExtract(coords, 1)};
                 inst->SetArg(1, ir.CompositeConstruct(ir.ShiftRightArithmetic(x, ir.Imm32(2)), y));
             }
+            // A pool image has no texture to read a format from: a typed access (only integer
+            // formats) is integer, a formatted one float.
             const bool is_integer{flags.image_byte_address != 0 ||
-                                  is_texture_pixel_format_integer(cbuf)};
+                                  (cbuf.pool ? flags.image_format != ImageFormat::Typeless
+                                             : is_texture_pixel_format_integer(cbuf))};
             if (flags.type == TextureType::Buffer) {
                 index = descriptors.Add(ImageBufferDescriptor{
                     .format = flags.image_format,
@@ -1871,6 +1878,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .size_shift = size_shift,
                     .is_byte_addressed = flags.image_byte_address != 0,
                     .handle_program = cbuf.handle_program,
+                    .is_pool = cbuf.pool,
                 });
             }
             break;

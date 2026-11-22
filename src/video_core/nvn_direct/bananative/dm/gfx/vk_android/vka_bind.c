@@ -78,8 +78,9 @@ int vka_walk(const vka_bstate *s, int st, const dmsh_vk_entry *e, const dmsh_vk_
                 uint64_t a = noslot ? 0 : ubo_word(s, st, reg, b->off, 8, rd, ctx);
                 if (a) { r.what = VKA_R_BUF; r.addr = a; r.size = 0; }   // the size is not known: to the end of the chunk
                 break; }
-            case VKA_KIND_SBUF_IND: case VKA_KIND_SBUF_UBO_IND: {   // Lichii: the address is the word at the pointer + soff, read as the CPU sees it now
-                uint64_t p = noslot ? 0 : b->kind == VKA_KIND_SBUF_IND ? (reg < 16 ? s->ssbo[st][reg].addr : 0) : ubo_word(s, st, reg, b->off, 8, rd, ctx), a = 0;
+            case VKA_KIND_SBUF_IND: case VKA_KIND_SBUF_UBO_IND: case VKA_KIND_UBO_PTR_IND: {   // Lichii: the address is the word at the pointer + soff, read as the CPU sees it now
+                uint64_t p = noslot ? 0 : b->kind == VKA_KIND_SBUF_IND ? (reg < 16 ? s->ssbo[st][reg].addr : 0) : b->kind == VKA_KIND_UBO_PTR_IND ? (reg < 16 ? s->ubo[st][reg].addr : 0)
+                           : ubo_word(s, st, reg, b->off, 8, rd, ctx), a = 0;
                 if (p && rd && rd(ctx, p + b->soff, &a, 8) && a) { r.what = VKA_R_BUF; r.addr = a; r.size = 0; }   // the size is not known: to the end of the chunk
                 break; }
             case DMSH_VK_KIND_TEX: case DMSH_VK_KIND_TEX_UBO: case DMSH_VK_KIND_TEX_C2A: {
@@ -93,8 +94,8 @@ int vka_walk(const vka_bstate *s, int st, const dmsh_vk_entry *e, const dmsh_vk_
                 int tid = noslot ? 0 : (int)(vka_tex_slot(s, st, (unsigned)reg) & 0xfffff);
                 if (tid) { r.what = VKA_R_TBUF; r.tid = tid; }
                 break; }
-            case DMSH_VK_KIND_IMG: {
-                int tid = noslot || reg >= 32 ? 0 : (int)(s->img[st][reg] & 0xfffff);
+            case DMSH_VK_KIND_IMG: case VKA_KIND_IMG_UBO: {
+                int tid = noslot ? 0 : b->kind == VKA_KIND_IMG_UBO ? ubo_tex_id(s, (uint32_t)ubo_word(s, st, reg, b->off, 4, rd, ctx)) : reg >= 32 ? 0 : (int)(s->img[st][reg] & 0xfffff);
                 if (tid) { r.what = VKA_R_IMG; r.tid = tid; }
                 break; }
             case DMSH_VK_KIND_SAMP: case DMSH_VK_KIND_SAMP_TEX: case DMSH_VK_KIND_SAMP_ID: case DMSH_VK_KIND_SAMP_UBO: case DMSH_VK_KIND_SAMP_C2A: {

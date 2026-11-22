@@ -438,9 +438,9 @@ NvnDirectShaders::NvnDirectShaders(const Device& device, const Shader::Profile& 
     : profile{profile_}, host_info{host_info_} {
     // The replay sets no VK_EXT_depth_clip_control: the GL depth mode is converted in the shader.
     profile.support_native_ndc = false;
-    // A texture handle no constant buffer word gives is read from the replay's pool tables by the
-    // value the shader computes (NVN_DIRECT_POOL_SET), as on the console, not by a handle program
-    // evaluated for each draw, which the replay has no means to run.
+    // A texture or image handle no constant buffer word gives is read from the replay's pool tables
+    // by the value the shader computes (NVN_DIRECT_POOL_SET), as on the console, not by a handle
+    // program evaluated for each draw, which the replay has no means to run.
     host_info.support_pool_textures = true;
     // The replay binds at most 512 descriptors a draw (vka_draw.c), over every stage: an array of
     // handles a shader indexes (the recompiler makes it up to 1,024 long) gets at most half of
@@ -554,6 +554,7 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
     bindings.pool_set = NVN_DIRECT_POOL_SET;
     bindings.pool_texture_binding = NVN_DIRECT_POOL_TEXTURE_BINDING;
     bindings.pool_sampler_binding = NVN_DIRECT_POOL_SAMPLER_BINDING;
+    bindings.pool_image_binding = NVN_DIRECT_POOL_IMAGE_BINDING;
     const std::vector<u32> spirv{
         Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, bindings)};
     if (env.DumpKey() != 0) {
@@ -658,6 +659,7 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
         } else if (!desc.unsupported && image.is_byte_addressed) {
             desc.unsupported = NVN_DIRECT_UNSUPPORTED_BYTE_ADDRESSED;
         }
+        desc.pool = image.is_pool;
         add(desc, 1);
     }
     if (binding > source.first_binding + NVN_DIRECT_LOOP_GUARD_SLOT) {

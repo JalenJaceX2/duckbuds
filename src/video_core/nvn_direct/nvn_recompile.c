@@ -240,6 +240,7 @@ static int c2_off(const cs_layout* l, uint32_t bank, uint32_t off) {
 }
 _Static_assert(NVN_DIRECT_POOL_SET == DMSH_VK_SET_POOL && NVN_DIRECT_POOL_TEXTURE_BINDING == DMSH_VK_POOL_TEX_BINDING &&
                NVN_DIRECT_POOL_SAMPLER_BINDING == DMSH_VK_POOL_SAMP_BINDING, "the translator's pool set and bindings are the replay's");
+_Static_assert(NVN_DIRECT_POOL_IMAGE_BINDING != DMSH_VK_POOL_TEX_BINDING && NVN_DIRECT_POOL_IMAGE_BINDING != DMSH_VK_POOL_SAMP_BINDING, "the image pool's own binding");
 // One descriptor's record; 0 = the replay cannot fill it (why says what), the record UNKNOWN. l: an NVN2 compute shader's c[0] layout, else NULL
 static int rc_bind(const nvn_direct_shader_desc* s, int st, const cs_layout* l, dmsh_vk_bind* b, char* why, size_t whyn) {
     memset(b, 0, sizeof *b);
@@ -278,9 +279,9 @@ static int rc_bind(const nvn_direct_shader_desc* s, int st, const cs_layout* l, 
             b->kind = DMSH_VK_KIND_SBUF_UBO; b->reg = (int16_t)(s->cbuf_index - 3); b->off = (uint16_t)s->cbuf_offset;
         } else NO("binding %u: storage buffer pointer at c%u + %#x", s->binding, s->cbuf_index, s->cbuf_offset);
         if (s->indirect_offset != ~0u) {   // the address is the word at the pointer + indirect_offset (vka_bind.c VKA_KIND_SBUF_IND)
-            if ((b->kind != DMSH_VK_KIND_SBUF && b->kind != DMSH_VK_KIND_SBUF_UBO) || s->indirect_offset > 0xFFFF)
-                NO("binding %u: a storage buffer address %#x past the pointer at c%u + %#x", s->binding, s->indirect_offset, s->cbuf_index, s->cbuf_offset);
-            b->kind = b->kind == DMSH_VK_KIND_SBUF ? VKA_KIND_SBUF_IND : VKA_KIND_SBUF_UBO_IND; b->soff = (uint16_t)s->indirect_offset;
+            if (s->indirect_offset > 0xFFFF)
+                NO("binding %u: a storage buffer address %#x past the pointer at c%u + %#x (an offset over 0xffff)", s->binding, s->indirect_offset, s->cbuf_index, s->cbuf_offset);
+            b->kind = b->kind == DMSH_VK_KIND_SBUF ? VKA_KIND_SBUF_IND : b->kind == DMSH_VK_KIND_UBO_PTR ? VKA_KIND_UBO_PTR_IND : VKA_KIND_SBUF_UBO_IND; b->soff = (uint16_t)s->indirect_offset;
         }
         return 1;
     case NVN_DIRECT_DESC_TEXTURE: case NVN_DIRECT_DESC_TEXTURE_BUFFER: {
@@ -319,6 +320,12 @@ static int rc_bind(const nvn_direct_shader_desc* s, int st, const cs_layout* l, 
     case NVN_DIRECT_DESC_LOOP_GUARD: b->kind = VKA_KIND_LOOP_GUARD; b->flags |= DMSH_VK_BF_RW; return 1;
     case NVN_DIRECT_DESC_IMAGE: case NVN_DIRECT_DESC_IMAGE_BUFFER: {
         b->dim = dim_of(s);
+        if (s->pool) {   // the image pool by the handle the shader computes: set 1, which the dispatch binds for it (vka_draw.c any_pool)
+            b->kind = VKA_KIND_IMG_POOL; b->set = DMSH_VK_SET_POOL; b->binding = NVN_DIRECT_POOL_IMAGE_BINDING; b->count = 0; return 1;
+        }
+        if (s->cbuf_index >= 3 && s->cbuf_index < 19 && s->kind == NVN_DIRECT_DESC_IMAGE) {   // a handle in a uniform buffer (vka_bind.c VKA_KIND_IMG_UBO)
+            b->kind = VKA_KIND_IMG_UBO; b->reg = (int16_t)(s->cbuf_index - 3); b->off = (uint16_t)s->cbuf_offset; return 1;
+        }
         int c2 = c2_off(l, s->cbuf_index, s->cbuf_offset);
         if (c2 < DMSH_C2_IMG || c2 >= DMSH_C2_IMG + DMSH_C2_ROW * 32 || (c2 - DMSH_C2_IMG) % DMSH_C2_ROW) NO("binding %u: an image handle at c%u + %#x", s->binding, s->cbuf_index, s->cbuf_offset);
         b->kind = DMSH_VK_KIND_IMG; b->reg = (int16_t)((c2 - DMSH_C2_IMG) / DMSH_C2_ROW);

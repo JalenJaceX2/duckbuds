@@ -64,12 +64,18 @@ typedef int (*vka_read_fn)(void *ctx, uint64_t addr, void *out, size_t n);
 // the pointer in storage slot reg (SBUF_IND) or in uniform slot reg at byte off (SBUF_UBO_IND); bound from that address to the end of its chunk, as SBUF_UBO
 #define VKA_KIND_SBUF_IND 67
 #define VKA_KIND_SBUF_UBO_IND 68
+// Lichii: the same with the pointer in compute uniform slot reg, as UBO_PTR reads it (NVN2 compute's c0 uniform table)
+#define VKA_KIND_UBO_PTR_IND 69
+// Lichii: an image whose handle is in uniform slot reg at byte off (as TEX_UBO for textures)
+#define VKA_KIND_IMG_UBO 70
+// Lichii: the image pool, set 1 binding NVN_DIRECT_POOL_IMAGE_BINDING, by the texture ID of the handle the shader computes (as TEX_POOL for textures)
+#define VKA_KIND_IMG_POOL 71
 
 #define VKA_WALK_REFUSE (-1)
 // Walks one stage's binding records (e->bind_count of them from b) for NVN stage nvn_stage. Writes at most max results to out and returns their count, or VKA_WALK_REFUSE with
 // *why set when the draw cannot run correctly. Storage buffers of global memory (SBUF, SBUF_UBO, UBO_PTR): with the library's ssbo_align (header; DMSH_VK_SSBO_ALIGN) they are
 // bound at their address rounded down to it, the range grown by the difference (the shader adds it back); with 0 (an older library) at the exact address, and one off the
-// device's dev_align refuses the draw. An UNKNOWN record refuses it too. *uses_pool is set when the shader reads set 1 (the texture or sampler pool)
+// device's dev_align refuses the draw. An UNKNOWN record refuses it too. *uses_pool is set when the shader reads set 1 (the texture, sampler or image pool)
 int vka_walk(const vka_bstate *s, int nvn_stage, const dmsh_vk_entry *e, const dmsh_vk_bind *b, uint32_t ssbo_align, uint64_t dev_align, vka_read_fn rd, void *rd_ctx,
              vka_res *out, int max, int *uses_pool, char *why, size_t whyn);
 // Fills a driver segment as the GPU's driver would (nvn_mtl.m encode_args NVN_RB_DRV0 / DRV2 / PUSH): DMSH_DRV_SIZE bytes for banks 0 and 2, DMSH_PUSH_SIZE for the push bank.

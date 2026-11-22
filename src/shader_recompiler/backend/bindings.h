@@ -17,11 +17,13 @@ struct Bindings {
     /// Push-constant offset of the render area: 0 its own block, else a member at that offset,
     /// in the rescaling block when the stage uses both (NVN direct mode's layout)
     u32 render_area_offset{};
-    /// The descriptor set and bindings of the texture and sampler pools, arrays indexed by texture
-    /// and sampler ID, for textures read from them (TextureDescriptor::is_pool)
+    /// The descriptor set and bindings of the texture, sampler and image pools, arrays indexed by
+    /// texture and sampler ID, for textures and images read from them (TextureDescriptor::is_pool,
+    /// ImageDescriptor::is_pool)
     u32 pool_set{};
     u32 pool_texture_binding{};
     u32 pool_sampler_binding{};
+    u32 pool_image_binding{};
 };
 
 } // namespace Shader::Backend
