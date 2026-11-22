@@ -305,7 +305,7 @@ static int same_shape(const vka_img *a, const tex_t *t, const vka_fmt *f, int le
 // the image right from its first use. Meanwhile the texture gets its own image (same_shape), and a view keeps the fallback to the image's own format ([RED]) for the life
 // of an image made before the pair was learned (its views are in use; replacing it would mean rebinding every view and descriptor); so it stays in a run without DM_TEMP,
 // once the table is full (64 pairs) or with 4 formats learned for that image format and size (VL_PER_IMAGE).
-// A pair is taken (learned, or read from the file) only when both formats are uncompressed colour formats (kind 0) of one texel size: a format list may hold only formats
+// A pair is taken (learned, or read from the file) only when both formats are uncompressed colour formats (kind 0-2) of one texel size: a format list may hold only formats
 // compatible with the image's, and a bad pair in the file (an older build's, a hand edit) would break that rule on every image of its format in every run. The file is
 // written whole (a temporary file renamed over it), so a run that ends while writing leaves the old one. DM_VK_VIEW_LEARN=0: nothing learned or read (views in the image's
 // own format, as before)
@@ -313,11 +313,11 @@ typedef struct { VkFormat a, b; uint32_t w, h; } vlearn;
 enum { NVL = 64 };
 static vlearn g_vl[NVL]; static int g_nvl, g_vl_loaded; static char g_vl_path[1024]; static pthread_mutex_t g_vlmu = PTHREAD_MUTEX_INITIALIZER;
 enum { VL_PER_IMAGE = 4 };   // learned formats one image takes at most (vka_img.xfmt)   // under g_vlmu
-static int vl_bytes(VkFormat v) {   // bytes per texel of an uncompressed colour (kind 0) format of the textures (an image's own format or its sRGB view format), else 0
+static int vl_bytes(VkFormat v) {   // bytes per texel of an uncompressed colour (kind 0-2) format of the textures (an image's own format or its sRGB view format), else 0
     for (int nf = 1; nf < 0x100; nf++) {
         fmt_ent e = fmt_ent_of(nf); int bw = 0, bh = 0, bpb;
         if (e.vk == VK_FORMAT_UNDEFINED || !(e.vk == v || (e.srgb && srgb_twin(e.vk) == v))) continue;
-        return e.kind == 0 && (bpb = nvn_fmt_bpb(nf, &bw, &bh)) && bw == 1 && bh == 1 ? bpb : 0;
+        return e.kind <= 2 && (bpb = nvn_fmt_bpb(nf, &bw, &bh)) && bw == 1 && bh == 1 ? bpb : 0;   // (Lichii: integer views too, OoT's R32UI shader images of RGBA8 and R11G11B10F targets)
     }
     return 0;
 }
@@ -1501,22 +1501,22 @@ void vka_tex_drop(vka_img *im) {
 vka_img *vka_tex_ref(vka_img *im) { if (im) { pthread_mutex_lock(&g_tmu); im->refs++; im->holds++; pthread_mutex_unlock(&g_tmu); } return im; }
 int vka_img_lists(vka_img *im, VkFormat v) { pthread_mutex_lock(&g_tmu); int r = img_lists(im, v); pthread_mutex_unlock(&g_tmu); return r; }
 
+// A view of im in fmt, outside its format list (img_create), is not made: the pair is learned for the images made from now on (Learned view formats). Caller holds g_tmu
+static void view_unlisted(const vka_img *im, VkFormat fmt) {
+    int learned = 0;   // (only uncompressed colour formats of one texel size: vl_learn checks the pair)
+    if (im->f.kind == 0 && !compressed(&im->f)) { pthread_mutex_lock(&g_vlmu); learned = vl_learn(im->f.vk, fmt, im->w, im->h); pthread_mutex_unlock(&g_vlmu); }
+    if (learned)
+        VLOG("image VkFormat %d (NVN %#x, %ux%u) asked for a view as VkFormat %d, which its format list does not have: viewed in its own format; learned (images of this format and size made from now on, and in the next runs, take it)", im->f.vk, im->d.format, im->w, im->h, fmt);
+    else { static struct { VkFormat a, b; } seen[32]; static int ns; int k = 0;
+        while (k < ns && !(seen[k].a == im->f.vk && seen[k].b == fmt)) k++;
+        if (k == ns && ns < 32) { seen[ns].a = im->f.vk; seen[ns++].b = fmt;
+            VRED("image VkFormat %d (NVN %#x, %ux%u) asked for a view as VkFormat %d, which its format list does not have: viewed in its own format%s", im->f.vk, im->d.format, im->w, im->h, fmt,
+                 VKA_ENV("DM_VK_VIEW_LEARN", 1) ? " (an image made before the pair was learned, or the table is full)" : " (DM_VK_VIEW_LEARN=0)"); } }
+}
 VkImageView vka_view(vka_img *im, VkFormat fmt, VkImageViewType type, VkImageAspectFlags asp, uint32_t level, uint32_t nlevels, uint32_t layer, uint32_t nlayers, const VkComponentMapping *swz) {
     VkComponentMapping id = {0}; if (!swz) swz = &id;
     pthread_mutex_lock(&g_tmu);
-    int listed = fmt == im->f.vk || fmt == im->alt || im->any_fmt; for (int k = 0; k < im->nx; k++) listed |= fmt == im->xfmt[k];
-    if (!listed) {   // a format outside the image's format list (img_create): its own format instead; the pair is learned for the images made from now on (Learned view formats)
-        int learned = 0;   // (only uncompressed colour formats of one texel size: vl_learn checks the pair)
-        if (im->f.kind == 0 && !compressed(&im->f)) { pthread_mutex_lock(&g_vlmu); learned = vl_learn(im->f.vk, fmt, im->w, im->h); pthread_mutex_unlock(&g_vlmu); }
-        if (learned)
-            VLOG("image VkFormat %d (NVN %#x, %ux%u) asked for a view as VkFormat %d, which its format list does not have: viewed in its own format; learned (images of this format and size made from now on, and in the next runs, take it)", im->f.vk, im->d.format, im->w, im->h, fmt);
-        else { static struct { VkFormat a, b; } seen[32]; static int ns; int k = 0;
-            while (k < ns && !(seen[k].a == im->f.vk && seen[k].b == fmt)) k++;
-            if (k == ns && ns < 32) { seen[ns].a = im->f.vk; seen[ns++].b = fmt;
-                VRED("image VkFormat %d (NVN %#x, %ux%u) asked for a view as VkFormat %d, which its format list does not have: viewed in its own format%s", im->f.vk, im->d.format, im->w, im->h, fmt,
-                     VKA_ENV("DM_VK_VIEW_LEARN", 1) ? " (an image made before the pair was learned, or the table is full)" : " (DM_VK_VIEW_LEARN=0)"); } }
-        fmt = im->f.vk;
-    }
+    if (!img_lists(im, fmt)) { view_unlisted(im, fmt); fmt = im->f.vk; }   // its own format instead
     // Moved to the front when found: an image shared by many textures (one storage, many views) has a long list, and the draws ask for the same few views again and again
     for (view_ent **pv = &VIEWS(im), *v; (v = *pv); pv = &v->next)
         if (v->f == fmt && v->t == type && v->asp == asp && v->l0 == level && v->nl == nlevels && v->a0 == layer && v->na == nlayers && !memcmp(&v->swz, swz, sizeof *swz)) {
@@ -2286,8 +2286,16 @@ static VkImageView id_view(int id, VkCommandBuffer cb, uint8_t dim, int storage,
     if (storage) vka_img_written(im);
     if (!storage && !(im->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) return VK_NULL_HANDLE;
     // The sampled type must be the image format's class (float / sint / uint): another class is undefined in Vulkan
-    int want = dim & DMSH_VK_DIM_SINT ? 2 : dim & DMSH_VK_DIM_UINT ? 1 : 0, have = im->f.kind == 1 ? 1 : im->f.kind == 2 ? 2 : 0;
-    if (want != have && !(im->f.kind >= 3 && want == 0) && !(want == 0 && int_as_float())) return VK_NULL_HANDLE;
+    // Lichii: the class of the format the view takes (view_of: the texture view's or the texture's), as the console reads it: an R32UI view of an RGBA8 image is uint
+    // (OoT's lighting writes its RGBA8 and R11G11B10F targets as R32UI shader images). A view format outside the image's format list falls back to the image's own (vka_view)
+    vka_fmt vf; int vkind = im->f.kind;
+    if (vka_fmt_of(e.has_v && e.v.set_format ? e.v.format : e.t.d.format, &vf) && vf.kind != im->f.kind && vf.kind <= 2 && im->f.kind <= 2) {
+        pthread_mutex_lock(&g_tmu);
+        if (img_lists(im, vf.vk)) vkind = vf.kind; else view_unlisted(im, vf.vk);   // (unlisted: unbound in this run; the pair is learned for the next images)
+        pthread_mutex_unlock(&g_tmu);
+    }
+    int want = dim & DMSH_VK_DIM_SINT ? 2 : dim & DMSH_VK_DIM_UINT ? 1 : 0, have = vkind == 1 ? 1 : vkind == 2 ? 2 : 0;
+    if (want != have && !(vkind >= 3 && want == 0) && !(want == 0 && int_as_float())) return VK_NULL_HANDLE;
     if (imo) *imo = im;
     return view_of(&e, im, vt, storage);
 }
