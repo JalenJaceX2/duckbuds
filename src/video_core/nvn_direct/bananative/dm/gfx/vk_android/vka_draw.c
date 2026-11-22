@@ -1611,6 +1611,11 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     if (lg) VLOG("dispatch %llu: %016llx groups %d,%d,%d%s local %u,%u,%u shared %u flags %#x%s", di, (unsigned long long)sh[5]->key, dp->x, dp->y, dp->z, dp->ind ? " (indirect)" : "",
                  sh[5]->e->local[0], sh[5]->e->local[1], sh[5]->e->local[2], sh[5]->e->shared, sh[5]->e->flags, skip ? " SKIPPED" : "");
     if (skip) { vka_barrier(g_cb); g_dispatches++; return; }
+    if (vka_gp_active) {   // Lichii: DM_VK_GPUPROF: what the dispatch is, for the step its barrier ends
+        char b[96]; snprintf(b, sizeof b, "dispatch %016llx %dx%dx%d%s local %ux%ux%u shared %u%s", (unsigned long long)sh[5]->key, dp->x, dp->y, dp->z, dp->ind ? " ind" : "",
+                             sh[5]->e->local[0], sh[5]->e->local[1], sh[5]->e->local[2], sh[5]->e->shared, sb ? " spill" : "");
+        vka_gp_pass(b);
+    }
     vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     if (dp->ind) vk.vkCmdDispatchIndirect(g_cb, ib, io);
     else if (dp->x > 0 && dp->y > 0 && dp->z > 0) {

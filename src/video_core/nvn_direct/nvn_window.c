@@ -129,7 +129,8 @@ NVN(nvnQueueAcquireTexture, NVNqueueAcquireTextureResult, NVNqueue* q, NVNwindow
 NVN(nvnQueuePresentTexture, void, NVNqueue* q, NVNwindow* w, int idx) {
     win_t* o = (win_t*)w;
     o->presents++;
-    atomic_fetch_add(&g_frame, 1);
+    // The replay's frame number, as upstream's present sets it (hle_nvn.c): its per-frame statistics, GPU times (DM_VK_GPUPROF) and live switches count by it
+    mtl_set_frame(atomic_fetch_add(&g_frame, 1) + 1);
     if (idx < 0 || idx >= o->ntex || !o->tex[idx]) return;
     o->pfence[idx] = o->last_pfence = nvn_direct_present_queue_fence = ((const queue_t*)q)->last_fence;
     const int interval = o->interval > 0 ? o->interval : 1;

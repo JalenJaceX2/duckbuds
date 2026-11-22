@@ -57,7 +57,9 @@ static void report(void) {
         if (g_m[i].kind == 1 || g_m[i].kind == 2) continue;   // the gap before a submission or part: the GPU waited for recording
         double ms = t[i] > t[i - 1] ? (t[i] - t[i - 1]) * g_tick_ns / 1e6 : 0;
         tot += ms; s[ns++] = (step){i, ms};
-        if (g_m[i].passes > g_m[i - 1].passes) { pass += ms; npass++; } else if (g_m[i].ops > g_m[i - 1].ops || g_m[i].draws > g_m[i - 1].draws) xfer += ms; else bare += ms;
+        if (g_m[i].passes > g_m[i - 1].passes) { pass += ms; npass++; }
+        else if (g_m[i].ops > g_m[i - 1].ops || g_m[i].draws > g_m[i - 1].draws || !strncmp(g_m[i].desc, "dispatch ", 9)) xfer += ms;   // (Lichii: a dispatch, vka_dispatch)
+        else bare += ms;
         if (g_m[i - 1].kind == 1) first += ms;
     }
     VLOG("gpu prof: frame %llu: %d timestamps, %.2f ms GPU: passes %.2f ms (%d), clears / copies / dispatches %.2f ms, steps with nothing recorded (barriers, uploads, writebacks) %.2f ms",
