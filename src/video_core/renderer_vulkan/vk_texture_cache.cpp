@@ -2249,6 +2249,16 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                           ImageView* depth, std::array<u32, 2> render_size,
                                           std::array<f32, 2> jitter,
                                           std::array<f32, 2> motion_scale, bool use_history) {
+    // Which backend drew the DLSS output and why, logged when that changes. A rejection is not
+    // logged: the caller may retry without history or depth, and the retry reports what drew.
+    const auto report = [this](std::string_view backend, std::string_view reason) {
+        if (backend == last_upscale_backend && reason == last_upscale_reason) {
+            return;
+        }
+        last_upscale_backend = backend;
+        last_upscale_reason = reason;
+        LOG_INFO(Render_Vulkan, "DLSS replacement drawn by {}: {}", backend, reason);
+    };
     if (dst.Samples() != VK_SAMPLE_COUNT_1_BIT || ImageAspectMask(dst.format) != VK_IMAGE_ASPECT_COLOR_BIT) {
         return false;
     }
@@ -2292,12 +2302,14 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                         !same_size(motion_vectors))) {
         return false;
     }
-    if (use_history && depth && (!plain(*depth) || !fits(*depth, render_size) ||
-                                depth->format != PixelFormat::D32_FLOAT || !same_size(*depth))) {
+    if (use_history && depth &&
+        (!VideoCommon::DlssContract::IsUpscalerDepthFormat(depth->format) || !plain(*depth) ||
+         !fits(*depth, render_size) || !same_size(*depth))) {
         return false;
     }
     if (use_history && depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
                                  jitter, motion_scale)) {
+        report(UsesNvidiaDlss() ? "NVIDIA DLSS" : "FSR 3.1", "all inputs present");
         return true;
     }
     const VkFormat format =
@@ -2477,6 +2489,11 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
                                           dst_region, sharpness);
     }
     temporal_history.current = write_index;
+    report("the stand-in", !use_history                  ? "no history"
+                           : fsr3_unsupported             ? "FSR 3.1 unsupported or failed"
+                           : !WantsTemporalUpscaleDepth() ? "stand-in forced"
+                           : !depth                       ? "no depth"
+                                                          : "FSR 3.1 declined");
     return true;
 }
 
@@ -4894,12 +4911,16 @@ bool CustomBorderColorBudget::TryAcquire(const Device& device, size_t count) {
     return true;
 }
 
+void CustomBorderColorBudget::Release(size_t count) noexcept {
+    device_ptr->ReleaseCustomBorderColorSamplers(count);
+    held -= count;
+}
+
 void CustomBorderColorBudget::Release() noexcept {
     if (device_ptr != nullptr) {
-        device_ptr->ReleaseCustomBorderColorSamplers(held);
+        Release(held);
     }
     device_ptr = nullptr;
-    held = 0;
 }
 
 f32 TextureCacheRuntime::OcarinaFsrLodBias() {
@@ -5013,7 +5034,10 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
         .unnormalizedCoordinates = VK_FALSE,
     };
     variants.reserve(1);
-    Emplace(VariantKey{});
+    Emplace(VariantKey{}, &runtime.fallback_sampler);
+    if (!runtime.fallback_sampler.handle) {
+        runtime.fallback_sampler = variants.front().binding;
+    }
 }
 
 Sampler::VariantKey Sampler::MakeKey(const ImageView& image_view, bool is_depth) const noexcept {
@@ -5049,10 +5073,10 @@ VkSampler Sampler::Find(const VariantKey& key) const noexcept {
     if (it == variants.end()) {
         return VK_NULL_HANDLE;
     }
-    return *it->sampler;
+    return it->binding.handle;
 }
 
-VkSampler Sampler::Emplace(VariantKey key) {
+VkSampler Sampler::Emplace(VariantKey key, const SamplerBinding* fallback) {
     bool custom_border = has_custom_border_colors && !key.drop_custom_border;
     if (custom_border && !custom_border_color_budget.TryAcquire(*device_ptr, 1)) {
         static bool warned_budget = false;
@@ -5120,11 +5144,57 @@ VkSampler Sampler::Emplace(VariantKey key) {
     if (!custom_border) {
         create_info.borderColor = ConvertBorderColor(color);
     }
-    variants.push_back(Variant{
+    Variant variant{
         .key = key,
-        .sampler = device_ptr->GetLogical().CreateSampler(create_info),
-    });
-    return *variants.back().sampler;
+        .sampler = {},
+        .binding = {.compatibility = {
+                        .mag_linear = create_info.magFilter == VK_FILTER_LINEAR,
+                        .min_linear = create_info.minFilter == VK_FILTER_LINEAR,
+                        .mipmap_linear = create_info.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                        .anisotropy = create_info.anisotropyEnable != VK_FALSE,
+                        .compare = create_info.compareEnable != VK_FALSE,
+                        .minmax = has_minmax_reduction && !key.drop_reduction,
+                        .clamp_to_border =
+                            create_info.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+                            create_info.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+                            create_info.addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+                        .custom_border = custom_border,
+                    }},
+    };
+    try {
+        variant.sampler = device_ptr->GetLogical().CreateSampler(create_info);
+        variant.binding.handle = *variant.sampler;
+    } catch (const vk::Exception& exception) {
+        if (custom_border) {
+            custom_border_color_budget.Release(1);
+        }
+        const VkResult result = exception.GetResult();
+        if (result != VK_ERROR_TOO_MANY_OBJECTS && result != VK_ERROR_OUT_OF_HOST_MEMORY &&
+            result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            throw;
+        }
+        const auto compatible = std::ranges::find_if(variants, [&](const Variant& existing) {
+            return existing.binding.compatibility == variant.binding.compatibility &&
+                   (!custom_border || existing.key.swizzle == key.swizzle);
+        });
+        if (compatible != variants.end()) {
+            variant.binding.handle = compatible->binding.handle;
+        } else if (fallback && fallback->compatibility == variant.binding.compatibility &&
+                   !custom_border) {
+            variant.binding.handle = fallback->handle;
+        }
+        if (!variant.binding.handle) {
+            throw;
+        }
+        static std::atomic<u32> warnings{0};
+        if (warnings.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_Vulkan,
+                      "The driver refused a sampler ({}, its limit is {}): using another one",
+                      exception.what(), device_ptr->GetMaxSamplerAllocationCount());
+        }
+    }
+    variants.push_back(std::move(variant));
+    return variants.back().binding.handle;
 }
 
 VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {
@@ -5436,20 +5506,21 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // 11 levels is ~890 MiB in one allocation. On a full card that allocation failed on every use
     // of the texture, forever (#1035). When the whole array does not fit, decode and encode it a
     // few layers at a time through a smaller image; the encoded output is the same.
+    // An over-budget decode image is not refused: VMA places it in system RAM instead (#2365: a
+    // 915 MiB image on a 6 GiB GTX 1660 Super spilled 1258 MiB and forced a collect), and on an
+    // integrated GPU device memory is system RAM (#1756: two ~890 MiB images on a 15 GiB Meteor
+    // Lake laptop just before it froze). Start with as many layers as the free pool keeps, so the
+    // next upload of the texture reuses the image.
     u32 batch = layers;
-    if (device.IsIntegrated()) {
-        // Device memory is host RAM here, and an over-budget decode image is still allocated
-        // (#1756: two ~890 MiB images on a 15 GiB Meteor Lake laptop just before it froze). Start
-        // with as many layers as the free pool keeps.
-        u64 layer_bytes{};
-        for (u32 level = 0; level < levels; ++level) {
-            layer_bytes +=
-                u64{(std::max)(width >> level, 1U)} * (std::max)(height >> level, 1U) * 4;
-        }
-        while (batch > 1 && layer_bytes * batch > MaxFreeTranscodeBytes) {
-            batch = Common::DivCeil(batch, 2U);
-        }
+    u64 decode_layer_bytes{};
+    for (u32 level = 0; level < levels; ++level) {
+        decode_layer_bytes +=
+            u64{(std::max)(width >> level, 1U)} * (std::max)(height >> level, 1U) * 4;
     }
+    while (batch > 1 && decode_layer_bytes * batch > MaxFreeTranscodeBytes) {
+        batch = Common::DivCeil(batch, 2U);
+    }
+    const u32 pool_batch = batch;
     PendingTranscode pending;
     bool reused = take_free(batch, pending);
     if (!reused) {
@@ -5486,7 +5557,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             TransitionImageLayout(image);
             return;
         }
-        if (batch != layers) {
+        if (batch != pool_batch) {
             static u32 batch_logged{};
             if (batch_logged++ < 32) {
                 LOG_WARNING(Render_Vulkan,
@@ -5519,6 +5590,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u64 block_bytes = bc3 ? 16 : 8;
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
     boost::container::small_vector<u64, 16> layer_bytes; // one encoded layer of each level
+    boost::container::small_vector<u64, 16> level_offsets;
     u64 total = 0;
     for (u32 level = 0; level < levels; ++level) {
         const u32 level_width = (std::max)(width >> level, 1U);
@@ -5527,6 +5599,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         const u32 blocks_y = Common::DivCeil(level_height, 4U);
         layer_bytes.push_back(u64{blocks_x} * blocks_y * block_bytes);
         const u64 size = layer_bytes.back() * layers;
+        level_offsets.push_back(total);
         copies.push_back({
             .buffer_offset = total,
             .buffer_size = size,
@@ -5548,45 +5621,9 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     // was past the decode, and two textures' blocks met in one buffer.
     auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal, true);
 
-    const u64 layer_stride = info.layer_stride;
-    const size_t guest_size = image.guest_size_bytes;
-    for (u32 base = 0; base < layers; base += batch) {
-        const u32 count = (std::min)(batch, layers - base);
-        // The swizzles describe one layer's levels and the decoder steps layer_stride per layer
-        // from the start of its input, so a batch is the same info with fewer layers, read from
-        // its first layer on. The swizzle math does not depend on the layer count.
-        ImageInfo batch_info = info;
-        batch_info.resources.layers = static_cast<s32>(count);
-        StagingBufferRef batch_map = map;
-        batch_map.offset += u64{base} * layer_stride;
-        const size_t guest_offset = static_cast<size_t>(u64{base} * layer_stride);
-        const size_t batch_size =
-            batch == layers
-                ? guest_size
-                : (std::min)(static_cast<size_t>(u64{count} * layer_stride),
-                             guest_size - (std::min)(guest_size, guest_offset));
-        astc_decoder_pass->AssembleInto(
-            batch_info, 0, batch_size,
-            ASTCDecoderPass::Target{
-                .image = *pending.image,
-                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                // A later batch overwrites what the previous batch's encode read: its barrier
-                // waits for that (initialized).
-                .initialized = base != 0,
-                .level_view = [&pending](s32 level) { return *pending.views[level]; },
-                // Only the last batch submits. `map` carries this tick: a later batch reading it
-                // after a submit could find it freed, or refilled with the next upload.
-                .wait = base + count >= layers,
-                .levels = levels,
-            },
-            batch_map, swizzles);
-        for (u32 level = 0; level < levels; ++level) {
-            bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
-                                    copies[level].image_extent.height, count, bc3, output.buffer,
-                                    output.offset, total,
-                                    copies[level].buffer_offset + layer_bytes[level] * base);
-        }
-    }
+    TranscodeAstcBatches(*astc_decoder_pass, *bc_encoder_pass, info, image.guest_size_bytes, map,
+                         swizzles, *pending.image, pending.views, batch, bc3, output.buffer,
+                         output.offset, total, level_offsets, layer_bytes);
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
         const VkMemoryBarrier barrier{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,

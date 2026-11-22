@@ -28,6 +28,7 @@
 #include "core/nvn_hook.h"
 #include "video_core/capture.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/shader_notify.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/present.h"
@@ -556,6 +557,9 @@ try
 
 RendererVulkan::~RendererVulkan() {
     scheduler.RegisterOnSubmit([] {});
+#ifdef HAS_FLYHIGH
+    frame_gen.DrainFlyHighSubmissions();
+#endif
 #ifdef LICHII_NVN_DIRECT
     // NVN2 direct mode: the replay's threads leave the device (and the ASTC
     // decode it calls back into) before both go away, and its objects go once the device is idle.
@@ -569,6 +573,10 @@ RendererVulkan::~RendererVulkan() {
 }
 
 void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {
+    if (VideoCommon::GpuSplit::LendsToRender()) [[unlikely]] {
+        VideoCommon::GpuSplit::Get().LendRender([&] { Composite(framebuffers); });
+        return;
+    }
 #ifdef LICHII_NVN_DIRECT
     // NVN2 direct mode: the replay's frame is taken once for the whole composite (every layer,
     // screenshot and applet capture shows it): from here until nvn_direct_present_composited the
@@ -857,6 +865,11 @@ void RendererVulkan::RenderScreenshot(std::span<const Tegra::FramebufferConfig> 
 }
 
 std::vector<u8> RendererVulkan::GetAppletCaptureBuffer() {
+    if (VideoCommon::GpuSplit::LendsToRender()) [[unlikely]] {
+        std::vector<u8> lent;
+        VideoCommon::GpuSplit::Get().LendRender([&] { lent = GetAppletCaptureBuffer(); });
+        return lent;
+    }
     using namespace VideoCore::Capture;
 
     std::vector<u8> out(VideoCore::Capture::TiledSize);

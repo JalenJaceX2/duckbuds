@@ -168,7 +168,15 @@ public:
         const bool timer_paced = Nx2VsyncRateHz() != 60;
         const bool speed_limited = !timer_paced && Settings::values.use_speed_limit.GetValue() &&
                                    Settings::SpeedLimit() != 0;
-        if (!speed_limited && fps_limit == 0) {
+        const u32 unpaced_cap = UnpacedFpsCap(process != nullptr && process->IsFrameRateUnlocked(),
+                                              speed_limited || timer_paced, fps_limit);
+        if (unpaced_cap != 0 && !std::exchange(m_unpaced_cap_logged, true)) {
+            LOG_INFO(Service,
+                     "nx2:vi2 the frame rate is unlocked with neither the speed limit nor an FPS "
+                     "limit: presents are held to {} fps, the most its frame step patch is made for",
+                     unpaced_cap);
+        }
+        if (!speed_limited && fps_limit == 0 && unpaced_cap == 0) {
             Tegra::g_nx2_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
             return;
         }
@@ -182,10 +190,11 @@ public:
                         : std::chrono::nanoseconds{100'000'000'000LL * swap_interval /
                                                    refresh_rate /
                                                    (speed_limited ? Settings::SpeedLimit() : 100)};
-        const auto interval = PacedInterval(vblank_interval, fps_limit);
+        const auto interval = unpaced_cap != 0
+                                  ? std::chrono::nanoseconds{1'000'000'000LL / unpaced_cap}
+                                  : PacedInterval(vblank_interval, fps_limit);
         Tegra::g_nx2_guest_frame_interval_ns.store(
-            static_cast<u64>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(interval).count()),
+            unpaced_cap == 0 ? static_cast<u64>(interval.count()) : 0,
             std::memory_order_relaxed);
         if (trace) {
             frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();
@@ -324,6 +333,7 @@ private:
     // present faster than that. Every slot is reported free here: hold each present until the
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
+    bool m_unpaced_cap_logged{};
     u32 m_swap_word{};
     std::shared_ptr<std::atomic<bool>> m_capture_pending = std::make_shared<std::atomic<bool>>(false);
 };
