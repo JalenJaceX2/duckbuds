@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -21,6 +22,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_thread.h"
@@ -70,6 +72,19 @@ constexpr std::array HaltingCalls{
     std::string_view{"nvnTextureReadTexelsStrided"},
 };
 
+/// A direct present in the layer's frame history (ListFrameHistory): its frame number (the
+/// numbering of GetLatestFrameNumber, from 1) and its guest ticks when the game queued it and when
+/// it was shown (0 while it is not yet).
+struct PresentedFrame {
+    u64 number{};
+    u64 queued_tick{};
+    u64 shown_tick{};
+};
+
+/// How many presents nn::vi's layer history keeps: the SDK's ListFrameHistory answers this for a
+/// null buffer.
+constexpr size_t FrameHistorySize = 8;
+
 struct State {
     u64 program_id{}; ///< DirectProgramId()
     std::map<u64, std::string> modules; ///< by base
@@ -95,6 +110,15 @@ struct State {
 
     std::mutex mutex; ///< slots' creation, lookups
     std::unordered_map<std::string, u32> slot_by_name;
+
+    /// nn::vi::ListFrameHistory and nn::vi::GetLatestFrameNumber in the game's SDK (0: none),
+    /// answered from the direct presents (ListFrameHistory, GetLatestFrameNumber)
+    u64 list_frame_history{};
+    u64 get_latest_frame_number{};
+    std::mutex frames_mutex;
+    std::array<PresentedFrame, FrameHistorySize> frames{}; ///< by number % FrameHistorySize
+    u64 latest_frame{};
+    bool frame_history_logged{};
 };
 
 /// EDEN_NX2_NVN_DIRECT=0/1 overrides the nvn_direct_renderer setting for a launch.
@@ -138,6 +162,9 @@ BlockEntryHook HookOf(u64 pc) {
     const State& state = *state_pointer;
     if (IsBootstrap(state, pc)) {
         // nvnBootstrapLoader is answered here and the driver's never runs.
+        return BlockEntryHook::Thunk;
+    }
+    if (pc != 0 && (pc == state.list_frame_history || pc == state.get_latest_frame_number)) {
         return BlockEntryHook::Thunk;
     }
     if (pc >= state.synthetic_base && (pc & 3) == 0 && state.synthetic_base != 0 &&
@@ -421,9 +448,67 @@ void ReadArguments(Dynarmic::A64::Jit& jit, std::array<u64, 8>& x, std::array<u6
 thread_local u32 t_halted_slot = MaxSlots;
 thread_local u64 t_halted_lr = 0;
 
+/// nn::vi::ListFrameHistory(FrameInfo* out, int count, const Layer*) of the game's SDK, answered
+/// from the direct presents (port of seedds/nxnative's dm/gfx/hle_vi.c). The SDK's version reads
+/// the history its layer's native window keeps as the NVN driver presents to it, which a replaced
+/// driver never does: Unreal's Switch RHI (Orbitals' Viewport Thread, main+0x1540460) learns its
+/// flips only from it, so with no frames listed its frame-end sync waited for ever right after the
+/// Unreal logo. A 40-byte FrameInfo per present, newest first: status (2 shown, 1 queued), frame
+/// number, queued tick and shown tick twice. A null buffer asks for the history's size.
+int ListFrameHistory(State& state, Core::Memory::Memory& memory, u64 out, s32 count) {
+    if (out == 0 || count <= 0) {
+        return static_cast<int>(FrameHistorySize);
+    }
+    std::array<std::array<u64, 5>, FrameHistorySize> infos{};
+    int listed = 0;
+    {
+        std::scoped_lock lock{state.frames_mutex};
+        for (u64 number = state.latest_frame;
+             number > 0 && state.latest_frame - number < FrameHistorySize && listed < count;
+             --number) {
+            const PresentedFrame& frame = state.frames[number % FrameHistorySize];
+            if (frame.number != number) {
+                continue;
+            }
+            infos[listed++] = {frame.shown_tick != 0 ? 2U : 1U, number, frame.queued_tick,
+                               frame.shown_tick, frame.shown_tick};
+        }
+        if (listed != 0 && !std::exchange(state.frame_history_logged, true)) {
+            LOG_INFO(Core, "NVN direct: nn::vi::ListFrameHistory answered from the direct "
+                           "presents ({} of the last {}, up to frame {})",
+                     listed, FrameHistorySize, state.latest_frame);
+        }
+    }
+    memory.WriteBlock(out, infos.data(), listed * sizeof(infos[0]));
+    return listed;
+}
+
+/// nn::vi::GetLatestFrameNumber(u64* out, const Layer*): the frames presented so far, numbered as
+/// ListFrameHistory lists them.
+void GetLatestFrameNumber(State& state, Core::Memory::Memory& memory, u64 out) {
+    u64 latest;
+    {
+        std::scoped_lock lock{state.frames_mutex};
+        latest = state.latest_frame;
+    }
+    memory.Write64(out, latest);
+}
+
 /// Direct mode's block entries. Returns whether the JIT halts for the call (HaltedCallSvc).
 bool DirectEntry(State& state, u64 pc, Dynarmic::A64::Jit& jit, Core::Memory::Memory& memory) {
     const u64 lr = jit.GetRegister(30);
+    if (pc == state.list_frame_history || pc == state.get_latest_frame_number) {
+        if (pc == state.list_frame_history) {
+            jit.SetRegister(0, static_cast<u64>(ListFrameHistory(
+                                   state, memory, jit.GetRegister(0),
+                                   static_cast<s32>(jit.GetRegister(1)))));
+        } else {
+            GetLatestFrameNumber(state, memory, jit.GetRegister(0));
+            jit.SetRegister(0, 0); // ResultSuccess
+        }
+        jit.SetRegister(16, lr);
+        return false;
+    }
     const bool bootstrap = IsBootstrap(state, pc);
     const u32 slot = bootstrap ? MaxSlots : static_cast<u32>((pc - state.synthetic_base) / 4);
     if (bootstrap || slot == LookupSlot) {
@@ -529,6 +614,15 @@ void ScanModules(Core::System& system, Kernel::KProcess& process, State& state) 
         if (const auto [address, size] = find("nvnPrivate0"); address != 0) {
             state.private0_address = address;
             state.private0_size = size;
+        }
+        if (const auto [address, size] =
+                find("_ZN2nn2vi16ListFrameHistoryEPNS0_9FrameInfoEiPKNS0_5LayerE");
+            address != 0) {
+            state.list_frame_history = address;
+        }
+        if (const auto [address, size] = find("_ZN2nn2vi20GetLatestFrameNumberEPmPKNS0_5LayerE");
+            address != 0) {
+            state.get_latest_frame_number = address;
         }
     }
     // Older SDKs ship the driver as a module of its own (Breath of the Wild 1.6.0: "nvn", which
@@ -683,6 +777,12 @@ void PresentDirect(Core::System& system, State& state) {
     auto& present = *state.present;
     const u64 own = ++state.presents;
     const u64 number = present.Count(Kernel::GetCurrentThread(system.Kernel()));
+    {
+        std::scoped_lock lock{state.frames_mutex};
+        state.frames[own % FrameHistorySize] = {.number = own,
+                                                .queued_tick = system.CoreTiming().GetClockTicks()};
+        state.latest_frame = own;
+    }
     nvn_direct_frame frame{};
     const bool shown = nvn_direct_present_take(&frame) != 0;
     if (own <= 4 || own % 600 == 0) {
@@ -729,6 +829,11 @@ void PresentDirect(Core::System& system, State& state) {
     }
     present.Finish(own);
     present.PaceToVblank((frame.interval << 16) | 60, system.ApplicationProcess(), own, nullptr);
+    {
+        // Shown once paced to its vblank, as nx2:vi2's present records its timestamp recorder.
+        std::scoped_lock lock{state.frames_mutex};
+        state.frames[own % FrameHistorySize].shown_tick = system.CoreTiming().GetClockTicks();
+    }
     LogStubCensus(state, number);
 }
 } // namespace

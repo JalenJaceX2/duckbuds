@@ -14,6 +14,8 @@
 // overrides it; see nvn_direct_choice.h). The game's NVN driver never runs: names the front end
 // lacks get a stub that answers 0. Calls that may block halt the JIT and run from the kernel
 // (RunHaltedCall). Every 600 presents a line counts the halted calls and the stubs called.
+// nn::vi::ListFrameHistory and GetLatestFrameNumber, which read what the replaced driver's
+// presents would have recorded, are answered the same way, from the direct presents.
 
 #pragma once
 
