@@ -12,6 +12,7 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -193,6 +194,12 @@ int nvn_direct_present_take(nvn_direct_frame* out) {
         static _Atomic int n;
         if (atomic_fetch_add(&n, 1) < 8) VRED("present %llu: fence %llu has no GPU signal: dropped", (unsigned long long)tk, (unsigned long long)p.fence);
         return 0;
+    }
+    {   // DM_VK_RTDUMP=<present>:<dir> (vka_tex.c vka_tex_rt_dump)
+        static const char* dump = (const char*)1;
+        if (dump == (const char*)1) dump = getenv("DM_VK_RTDUMP");
+        char* colon;
+        if (dump && strtoull(dump, &colon, 10) == tk && *colon == ':') { void vka_tex_rt_dump(const char*); vka_tex_rt_dump(colon + 1); }
     }
     vka_img* im = vka_tex_acquire(p.serial);
     if (!im) return 0;   // the replay never drew or uploaded it (a boot frame): nothing to show

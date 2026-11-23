@@ -58,6 +58,7 @@ vka_img* vka_tex_acquire(uint64_t serial) {
     return NULL;
 }
 void vka_tex_drop(vka_img* im) { im->holds--; }
+void vka_tex_rt_dump(const char* dir) { (void)dir; }
 // The fence alone: every earlier fence of the other queues (vka_wait_done) is not the composite's to wait for
 int vka_wait_fence(uint64_t fence, uint64_t timeout_ns) {
     CHECK(fence && timeout_ns);

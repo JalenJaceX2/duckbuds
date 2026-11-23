@@ -558,6 +558,12 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
     const std::vector<u32> spirv{
         Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, bindings)};
     if (env.DumpKey() != 0) {
+        // (beside the program: its translation as the replay builds it, for spirv-dis)
+        std::ofstream{std::filesystem::path{std::getenv("EDEN_NX2_SHADER_DUMP")} /
+                          fmt::format("{:016x}-direct-{}.spv", env.DumpKey(), source.first_binding),
+                      std::ios::binary}
+            .write(reinterpret_cast<const char*>(spirv.data()),
+                   static_cast<std::streamsize>(spirv.size() * sizeof(u32)));
         LOG_INFO(Render_Vulkan, "NVN direct: dumped program {:016x} ({}): {} SPIR-V words",
                  env.DumpKey(), static_cast<int>(stage), spirv.size());
     }

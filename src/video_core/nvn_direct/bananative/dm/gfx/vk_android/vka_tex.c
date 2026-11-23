@@ -1880,6 +1880,27 @@ static void read_texels_storage(const tex_t *t, unsigned level, unsigned layer0,
     }
     free(lin); free(part);
 }
+// Lichii: DM_VK_RTDUMP=<present>:<dir> (diagnostic): at that present, once the GPU has done everything submitted, level 0 / layer 0 of every colour image the GPU has
+// written is read back into <dir>/rt-<serial>-<w>x<h>-nvn<format>-vk<VkFormat>.raw (rows packed, as tools/nx2 can convert), for finding the first wrong render target of a frame
+void vka_tex_rt_dump(const char *dir) {
+    pthread_mutex_lock(&g_tmu);
+    vka_img **l = malloc(sizeof *l * (size_t)(g_nlive ? g_nlive : 1)); int n = 0;
+    for (int i = 0; l && i < g_nlive; i++) { vka_img *im = g_live[i];
+        if (im->gpu_owned && im->f.kind < 3 && im->samples == 1 && !im->scaled && im->f.bw == 1 && (im->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT))) { im->refs++; l[n++] = im; } }
+    pthread_mutex_unlock(&g_tmu);
+    mtl_wait(mtl_last_fence(), 5000000000ull);
+    int ok = 0;
+    for (int i = 0; i < n; i++) { vka_img *im = l[i];
+        const int nz = im->d.target == NVN_TEXTURE_TARGET_3D ? (int)im->depth : 1;   // (a 3D image whole: its slices one after the other)
+        NVNcopyRegion r = {0, 0, 0, (int)im->w, (int)im->h, nz}; size_t row = (size_t)im->w * im->f.bpb, bytes = row * im->h;
+        uint8_t *buf = malloc(bytes * (size_t)nz);
+        if (buf && read_texels_gpu(im, 0, 0, &r, buf, row, bytes, 1, 1, im->f.bpb)) {
+            char fn[512]; snprintf(fn, sizeof fn, "%s/rt-%llu-%ux%u%s%.0d-nvn%x-vk%d.raw", dir, (unsigned long long)im->serial, im->w, im->h, nz > 1 ? "x" : "", nz > 1 ? nz : 0, im->d.format, im->f.vk);
+            FILE *fo = fopen(fn, "wb"); if (fo) { fwrite(buf, 1, bytes * (size_t)nz, fo); fclose(fo); ok++; } }
+        free(buf); vka_tex_drop(im); }
+    free(l);
+    VLOG("DM_VK_RTDUMP: %d of %d GPU-written colour images read back into %s", ok, n, dir);
+}
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb || !t->mem || r->width <= 0 || r->height <= 0 || r->xoffset < 0 || r->yoffset < 0 || level >= t->d.levels) {
