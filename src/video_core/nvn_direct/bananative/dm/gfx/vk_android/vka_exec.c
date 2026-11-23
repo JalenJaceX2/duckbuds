@@ -949,7 +949,10 @@ typedef struct { uint32_t w; int eq, q; uint32_t wn; VkSemaphore sem; uint64_t v
 // qs[q]: the event's semaphore for Vulkan queue q (made at its first signal there), qv[q] its last value. Invariant: only parts on queue q signal qs[q], with the next
 // value, and the host never does, so it goes up in queue order. w: values written since the last CPU write (q -1: the CPU's, t 0: reached); g: gates
 typedef struct { volatile uint32_t *val; VkSemaphore qs[NVN_DIRECT_MAX_QUEUES]; uint64_t qv[NVN_DIRECT_MAX_QUEUES]; uint32_t cur; int nw, ng; struct { uint32_t v; int q; uint64_t t; } w[EVW]; evgate g[EVG]; } evsem;
-static evsem g_evs[NEVV]; static int g_nevs;
+// Lichii: room for NEVS events (until 2026-11-23 NEVV, 256): Duskbloods signals more than 256 events from the CPU before its first submission, and the later ones'
+// waits were let through. Entries never move (the completion thread reads them: vka_exec_stall); g_evk holds their keys for evsem_of's scan
+enum { NEVS = 4096 };
+static evsem g_evs[NEVS]; static volatile uint32_t *g_evk[NEVS]; static int g_nevs;
 static int gate_met(const evgate *g, uint32_t v) { return g->eq ? v == g->w : v >= g->w; }
 static int gate_ran(const evgate *g) { uint64_t c = 0; vk.vkGetSemaphoreCounterValue(V.dev, g->sem, &c); return c >= g->val; }   // its last signal has run
 static evgate *gate_of(evsem *e, uint32_t w, int eq) {
@@ -1013,9 +1016,10 @@ static void evtr_report(void) {
     if (vka_up_timeline()) { uint64_t c = 0; vk.vkGetSemaphoreCounterValue(V.dev, vka_up_timeline(), &c); VRED("GPU hang: upload timeline at %llu of %llu", (unsigned long long)c, (unsigned long long)vka_up_last()); }
 }
 static evsem *evsem_of(volatile uint32_t *val) {
-    for (int i = 0; i < g_nevs; i++) if (g_evs[i].val == val) return &g_evs[i];
-    if (g_nevs == NEVV) { VRED_ONCE("more than %d queue events: the later ones are not waited for", NEVV); return NULL; }
-    evsem *e = &g_evs[g_nevs]; memset(e, 0, sizeof *e); e->val = val;
+    for (int i = 0; i < g_nevs; i++) if (g_evk[i] == val) return &g_evs[i];
+    if (g_nevs == NEVS) { VRED_ONCE("more than %d queue events: the later ones are not waited for", NEVS); return NULL; }
+    evsem *e = &g_evs[g_nevs]; memset(e, 0, sizeof *e); e->val = val; g_evk[g_nevs] = val;
+    if (g_nevs >= 128 && !(g_nevs & (g_nevs - 1))) VLOG("%d queue events (distinct event addresses met so far; none are given back)", g_nevs);
     // The value the event holds when the replay first meets it (a CPU signal before the replay was up, the last signal of a queue walked before it was waited for) is
     // reached already: a wait for it is met, as on the console
     evsem_wrote(e, ev_get(val), -1, 0);
