@@ -94,11 +94,23 @@ static void frame_path_creation(uint64_t tk) {
 }
 uint64_t vka_present_filled(void) { return g_filled; }   // (the replay thread, which fills them)
 void vka_present_fill(uint64_t tk, const tex_t* t, double period_s, const int crop[4]) {
-    {   // DM_VK_RTDUMP=<present>:<dir> (vka_tex.c vka_tex_rt_dump): on the replay worker, where the present stands in replay order, nothing more submitted meanwhile
+    {   // DM_VK_RTDUMP=<present>:<dir> (vka_tex.c vka_tex_rt_dump): on the replay worker, where the present stands in replay order, nothing more submitted meanwhile;
+        // at the first present from that one on at which the GPU has done everything handed to it (none is waited for), tried for 600 presents
         static const char* dump = (const char*)1;
+        static uint64_t at;
+        static int done;
         if (dump == (const char*)1) dump = getenv("DM_VK_RTDUMP");
-        char* colon;
-        if (dump && strtoull(dump, &colon, 10) == tk && *colon == ':') { void vka_tex_rt_dump(const char*); vka_tex_rt_dump(colon + 1); }
+        char* colon = NULL;
+        if (dump && !done && !at) at = strtoull(dump, &colon, 10);
+        if (dump && !done && at && tk >= at) {
+            int vka_tex_rt_dump(const char*);
+            const char* dir = strchr(dump, ':');
+            if (!dir || tk >= at + 600 || vka_tex_rt_dump(dir + 1)) {
+                done = 1;
+                if (!dir || tk >= at + 600) VRED("DM_VK_RTDUMP: the GPU was never idle at a present from %llu to %llu: nothing read back", (unsigned long long)at, (unsigned long long)tk);
+                else if (tk > at) VLOG("DM_VK_RTDUMP: read back at present %llu (asked for %llu: the GPU was busy at the presents before)", (unsigned long long)tk, (unsigned long long)at);
+            }
+        }
     }
     vka_perf_frame(period_s);
     frame_path_creation(tk);
