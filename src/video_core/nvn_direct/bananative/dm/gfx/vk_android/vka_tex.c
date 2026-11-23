@@ -1823,7 +1823,7 @@ void vka_img_written_at(vka_img *im, const char *file, int line) {
     if (!im->gpu_owned && im->m.size >= big_min()) { static _Atomic int n; if (atomic_fetch_add(&n, 1) < 64)   // large images: the first GPU write (DM_VK_BIGIMG_MB)
         VLOG("large image serial %llu %ux%u layers %u format %#x (%.1f MiB): first GPU write at frame %llu (%s:%d), sampled by %u draws before, %u other textures over its storage", (unsigned long long)im->serial,
              im->w, im->h, im->layers, im->d.format, im->m.size / 1048576.0, (unsigned long long)vka_frame(), file, line, im->nsamp, im->novl); }
-    im->gpu_owned = 1;
+    im->gpu_owned = 1; { uint64_t vka_rp_fence(void); im->w_fence = vka_rp_fence(); }
     if ((im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && im->mem && !im->wb_pending && im->samples == 1 && im->f.kind < 3 && im->f.bw == 1 && !im->f.rgb32) {   // (RGB32: no copy back, the image's texels are 16 bytes)
         if (g_nwb == g_wbcap) { g_wbcap = g_wbcap ? 2 * g_wbcap : 32; g_wb = realloc(g_wb, (size_t)g_wbcap * sizeof *g_wb); }
         im->wb_pending = 1; im->refs++; g_wb[g_nwb++] = im;
@@ -1848,12 +1848,16 @@ void vka_tex_writeback(VkCommandBuffer cb) {
     g_nwb = 0;
     pthread_mutex_unlock(&g_tmu);
 }
+static _Atomic uint64_t g_rt_gpu, g_rt_store_gpu, g_rt_store, g_rt_blocked, g_rt_ns, g_rt_nchk, g_rt_same, g_rt_diff;   // ReadTexels counts (vka_rt_stats)
 // Lichii: CPU texture reads (nvnTextureReadTexels / ReadTexelsStrided, hle_nvn.c read_texels), region r of level / layer0 into dst with row / img byte strides. A texture
 // the GPU wrote is read back from its image (the call waited for the GPU first: nvn_dispatch.c nvn_direct_call_blocks); any other has its content in its storage, read there
 // undoing its layout, on the calling thread (after nxnative's mtl_read_texels, MIT)
-static int read_texels_gpu(vka_img *im, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img, int bw, int bh, int bpb) {
+static int read_texels_gpu(vka_img *im, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img, int bw, int bh, int bpb, const char **why) {
     uint32_t lv = level;
-    if (im->samples > 1 || im->scaled || im->f.astc_bw || im->f.bpb != (im->f.rgb32 ? 16 : bpb) || (im->f.rgb32 && bpb != 12) || im->f.bw != bw || im->f.bh != bh || !vka_img_lv(im, &lv)) return 0;
+    *why = im->samples > 1 ? "multisampled" : im->scaled ? "at the render scale" : im->f.astc_bw ? "ASTC as BC" : im->f.bpb != (im->f.rgb32 ? 16 : bpb) || (im->f.rgb32 && bpb != 12) ? "another texel size"
+         : im->f.bw != bw || im->f.bh != bh ? "another block size" : !vka_img_lv(im, &lv) ? "level not in the image" : NULL;
+    if (*why) return 0;
+    *why = "aspect, layers or copy";
     VkImageAspectFlags asp = im->f.kind < 3 ? VK_IMAGE_ASPECT_COLOR_BIT : im->f.vk == VK_FORMAT_D16_UNORM || im->f.vk == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT
                            : im->f.vk == VK_FORMAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0;   // (a packed depth-stencil one: its buffer layout interleaves what Vulkan copies by aspect)
     const int is3d = im->d.target == NVN_TEXTURE_TARGET_3D, nz = r->depth > 0 ? r->depth : 1;
@@ -1909,12 +1913,59 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     if (!bpb || !t->mem || r->width <= 0 || r->height <= 0 || r->xoffset < 0 || r->yoffset < 0 || level >= t->d.levels) {
         VRED_ONCE("ReadTexels of texture %ux%u format %#x: unknown format, no storage or region out of range; nothing read", t->d.width, t->d.height, t->d.format); return; }
     vka_img *im = vka_tex_acquire(t->serial);
-    const int gpu = im && im->gpu_owned, ok = gpu && read_texels_gpu(im, level, layer0, r, dst, row, img, bw, bh, bpb);
+    const char *why = NULL;
+    const int gpu = im && im->gpu_owned, ok = gpu && read_texels_gpu(im, level, layer0, r, dst, row, img, bw, bh, bpb, &why);
+    const int lin = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;
+    // DM_VK_RT_FENCE=2 waited only for the image's last write: every 64th read (its full wait costs ~0.2 ms a frame on average) is read again after everything submitted is done, and the two compared (a 2D region of up to 4 KB)
+    if (ok && VKA_ENV("DM_VK_RT_FENCE", 2) == 2 && !(atomic_fetch_add_explicit(&g_rt_nchk, 1, memory_order_relaxed) % 64)) {
+        const size_t wb = (size_t)((r->width + bw - 1) / bw) * (size_t)bpb, hb = (size_t)((r->height + bh - 1) / bh); uint8_t again[4096]; const char *w2;
+        if ((r->depth <= 1) && wb * hb <= sizeof again && mtl_wait_acq(mtl_last_fence(), 2000000000ull) && read_texels_gpu(im, level, layer0, r, again, wb, wb * hb, bw, bh, bpb, &w2)) {
+            int same = 1; for (size_t y = 0; y < hb && same; y++) same = !memcmp(dst + y * row, again + y * wb, wb);
+            atomic_fetch_add_explicit(same ? &g_rt_same : &g_rt_diff, 1, memory_order_relaxed);
+            if (!same) { static _Atomic int nd; if (atomic_fetch_add(&nd, 1) < 8) VRED("ReadTexels of texture serial %llu %ux%u format %#x: read after its last write's fence differs from the read after everything submitted (DM_VK_RT_FENCE=2 reads early)",
+                                                                                    (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format); }
+        }
+    }
     vka_tex_drop(im);
+    atomic_fetch_add_explicit(ok ? &g_rt_gpu : gpu ? &g_rt_store_gpu : &g_rt_store, 1, memory_order_relaxed);
+    { static uint64_t seen[8]; static _Atomic int nseen; int i = 0, n = atomic_load(&nseen);   // the first few textures read (game thread: the race only repeats a line)
+      while (i < n && seen[i] != t->serial) i++;
+      if (i == n && n < 8) { seen[n] = t->serial; atomic_store(&nseen, n + 1);
+          VLOG("ReadTexels texture serial %llu %ux%u format %#x%s, region %dx%d: %s", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, lin ? " linear" : "", r->width, r->height,
+               ok ? "copied from its image" : !gpu ? "CPU content, read from its storage" : lin ? "GPU-written, image not copyable, read from its storage (the GPU's copy-back fills it)" : "GPU-written, image not copyable, read from its storage (without the GPU's writes)");
+          if (why && !ok) VLOG("ReadTexels texture serial %llu: image not copyable: %s", (unsigned long long)t->serial, why); } }
     if (ok) return;
-    if (gpu) VRED_ONCE("ReadTexels of GPU-written texture serial %llu (format %#x): its image cannot be copied as NVN lays it out (multisampled, at the render scale, ASTC as BC, packed depth-stencil "
-                       "or another block size): read from its storage, which lacks the GPU's writes", (unsigned long long)t->serial, t->d.format);
+    if (gpu && !lin) VRED_ONCE("ReadTexels of GPU-written texture serial %llu (format %#x): its image cannot be copied as NVN lays it out (%s): read from its storage, which lacks the GPU's writes",
+                               (unsigned long long)t->serial, t->d.format, why ? why : "?");
     read_texels_storage(t, level, layer0, r, dst, row, img, bw, bh, bpb);
+}
+// Lichii: the wait before a ReadTexels of a GPU-written texture (nvn_dispatch.c nvn_direct_call_blocks, polled on the game's thread until it answers 0). DM_VK_RT_FENCE (live):
+// 1 until the GPU is past the fence reserved at the call's first check, the work submitted before the read; 0 the newest fence at every check, a target a busy replay
+// keeps moving (as before); 2 (default: run readtexels2, 95 of 95 checks the same) the fence of the image's last write (vka_img.w_fence; Duskbloods reads a ring of 4 1x1 RG32F results, each written frames before), checked by
+// mtl_read_texels against a read after everything submitted
+static _Thread_local uint64_t t_rt_fence, t_rt_t0;
+int mtl_read_texels_blocks(uint64_t serial) {
+    if (!mtl_tex_gpu_owned(serial)) return 0;
+    const int mode = VKA_ENV("DM_VK_RT_FENCE", 2), first = !t_rt_fence;
+    if (first) t_rt_t0 = now_ns();
+    if (first && mode == 2) {
+        pthread_mutex_lock(&g_tmu); smap_ent *e = map_get(serial); t_rt_fence = e && e->im ? e->im->w_fence : 0; pthread_mutex_unlock(&g_tmu);
+        if (!t_rt_fence) t_rt_fence = mtl_last_fence();   // (not written since it was made: as mode 1)
+    } else if (first || mode == 0) t_rt_fence = mtl_last_fence();
+    if (!t_rt_fence) return 0;   // (nothing submitted yet)
+    if (!mtl_wait_acq(t_rt_fence, 0)) return 1;
+    if (!first) { atomic_fetch_add_explicit(&g_rt_blocked, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_rt_ns, now_ns() - t_rt_t0, memory_order_relaxed); }
+    t_rt_fence = 0;
+    return 0;
+}
+void vka_rt_stats(char *b, size_t n, double frames) {   // vka_exec.c mtl_set_frame: per frame since the last call
+    const uint64_t g = atomic_exchange(&g_rt_gpu, 0), sg = atomic_exchange(&g_rt_store_gpu, 0), s = atomic_exchange(&g_rt_store, 0), nb = atomic_exchange(&g_rt_blocked, 0), ns = atomic_exchange(&g_rt_ns, 0);
+    if (!(g + sg + s + nb)) { b[0] = 0; return; }
+    const int mode = VKA_ENV("DM_VK_RT_FENCE", 2);
+    snprintf(b, n, "ReadTexels per frame: %.1f copied from the image, %.1f GPU-written read from storage, %.1f CPU content; %.1f waited for the GPU, %.2f ms (DM_VK_RT_FENCE=%d: %s); "
+             "since the start, checks of early reads %llu the same, %llu different",
+             g / frames, sg / frames, s / frames, nb / frames, ns / frames / 1e6, mode, mode == 2 ? "the image's last write" : mode ? "kept from the first check" : "newest at every check",
+             (unsigned long long)atomic_load(&g_rt_same), (unsigned long long)atomic_load(&g_rt_diff));
 }
 int mtl_tex_gpu_owned(uint64_t serial) {   // hle_nvn.c nvn_ft_poll: the GPU has written the image (render target, copy or clear destination)
     pthread_mutex_lock(&g_tmu); smap_ent *e = map_get(serial); int r = e && e->im && e->im->gpu_owned; pthread_mutex_unlock(&g_tmu); return r;

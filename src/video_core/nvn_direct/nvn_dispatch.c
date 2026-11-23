@@ -260,9 +260,9 @@ int nvn_direct_call_blocks(int slot, const uint64_t x[8]) {
         const NVNtexture* const t = w->ntex ? w->tex[w->next % w->ntex] : NULL;
         return t && nvn_direct_present_composite_pending(((const tex_t*)t)->serial);
     }
-    // A texture the GPU wrote is read back once everything submitted is done (the game waited for its own work; the replay may still be behind it)
+    // A texture the GPU wrote is read back once what was submitted before the read is done (the game waited for its own work; the replay may still be behind it)
     if (!strcmp(name, "nvnTextureReadTexels") || !strcmp(name, "nvnTextureReadTexelsStrided"))
-        return mtl_tex_gpu_owned(((const tex_t*)host_ptr(x[0]))->serial) && !mtl_wait_acq(mtl_last_fence(), 0);
+        return mtl_read_texels_blocks(((const tex_t*)host_ptr(x[0]))->serial);
     return 0;
 }
 uint64_t nvn_direct_call(int slot, const uint64_t x[8], const uint64_t v[8], uint64_t sp, uint64_t lr, uint64_t* v0) {
