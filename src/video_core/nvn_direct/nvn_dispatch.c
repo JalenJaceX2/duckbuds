@@ -108,6 +108,17 @@ void* nvn_direct_writable(uint64_t host) {
     void* const backing = g_memory.backing(g_memory.context, guest);
     return backing ? backing : (void*)(uintptr_t)host_addr(host);
 }
+// The backing memory of [host, host + n) when it is one consecutive run there, else NULL. Write tracking protects the guest view only, never the backing: a host write there
+// cannot fault on a page another thread armed after the writer's dm_guest_write_prepare (hle_nvn.c write_texels)
+void* nvn_direct_writable_run(const void* host, size_t n) {
+    const uint64_t guest = guest_addr((uint64_t)(uintptr_t)host);
+    if (!n || guest >= g_guest_size || n > g_guest_size - guest || !g_memory.backing) return NULL;
+    uint8_t* const b = (uint8_t*)g_memory.backing(g_memory.context, guest);
+    if (!b) return NULL;
+    for (uint64_t o = 0x1000 - (guest & 0xFFF); o < n; o += 0x1000)
+        if ((uint8_t*)g_memory.backing(g_memory.context, guest + o) != b + o) return NULL;
+    return b;
+}
 int nvn_vpool_page_unmapped(uint64_t a); // hle_nvn.c
 const void* nvn_direct_readable(uint64_t host) {
     if (host < g_arena || host - g_arena >= g_guest_size) {
@@ -284,3 +295,33 @@ int dm_sdk_nvn2_item(unsigned item, int* out) {
     *out = g_item_value[item];
     return 1;
 }
+
+// Lichii: runs fn(arg), and on Windows catches an access violation inside it: 0 and where (*at, *wr: 1 = a write), the page's
+// state and protection as VirtualQuery sees it (diagnostics: hle_nvn.c write_texels). Elsewhere it only runs fn.
+#if defined(_WIN32)
+#include <windows.h>
+static DWORD guard_filter(const EXCEPTION_POINTERS* e, uintptr_t* at, int* wr) {
+    const EXCEPTION_RECORD* const r = e->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    *wr = (int)r->ExceptionInformation[0];
+    *at = (uintptr_t)r->ExceptionInformation[1];
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+int nvn_direct_guarded(void (*fn)(void*), void* arg, uintptr_t* at, int* wr, unsigned* state, unsigned* prot) {
+    *at = 0; *wr = 0; *state = *prot = 0;
+    __try {
+        fn(arg);
+    } __except (guard_filter(GetExceptionInformation(), at, wr)) {
+        MEMORY_BASIC_INFORMATION m;
+        if (VirtualQuery((const void*)*at, &m, sizeof m)) { *state = (unsigned)m.State; *prot = (unsigned)m.Protect; }
+        return 0;
+    }
+    return 1;
+}
+#else
+int nvn_direct_guarded(void (*fn)(void*), void* arg, uintptr_t* at, int* wr, unsigned* state, unsigned* prot) {
+    *at = 0; *wr = 0; *state = *prot = 0;
+    fn(arg);
+    return 1;
+}
+#endif

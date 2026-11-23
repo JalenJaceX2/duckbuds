@@ -2293,7 +2293,7 @@ NVN(nvnCommandBufferDownsampleTextureView, void, NVNcommandBuffer *c, const NVNt
 // Write protection is lifted and the range marked dirty first, so the replay layer re-uploads it the next time it is used
 // Non-3D textures: only the bytes inside the region are written, by block-linear address, without decoding the whole level. Metroid Dread's minimap (main+0x160e80) calls WriteTexels once per texel (a 1×1 region);
 // previously every call decoded, patched and re-encoded the whole level, and after a few minutes the main thread spent whole frames there (frames stopped from 175 s). Returns −1 when the region is out of range or the format unsupported, falling back to the whole-level path
-static int write_region_bl(const tex_t *t, unsigned level, unsigned layer, const NVNcopyRegion *r, const uint8_t *src, size_t row, int bw, int bh, int bpb) {
+static int write_region_bl(const tex_t *t, uint8_t *mem, unsigned level, unsigned layer, const NVNcopyRegion *r, const uint8_t *src, size_t row, int bw, int bh, int bpb) {
     uint32_t row_bytes, rows, slices, gbpb; uint64_t base; unsigned th, td;
     if (nvn_deswizzle_geom(&t->d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &gbpb) || (int)gbpb != bpb || r->xoffset < 0 || r->yoffset < 0) return -1;
     uint32_t x0 = (uint32_t)(r->xoffset / bw) * (uint32_t)bpb, y0 = (uint32_t)(r->yoffset / bh);
@@ -2303,22 +2303,43 @@ static int write_region_bl(const tex_t *t, unsigned level, unsigned layer, const
     for (size_t y = 0; y < hb; y++)
         for (size_t x = 0; x < wb;) {   // 16-byte runs are contiguous within a GOB
             uint32_t bx = x0 + (uint32_t)x; size_t n = 16 - bx % 16; if (n > wb - x) n = wb - x;
-            memcpy(t->mem + base + nvn_bl_offset(bx, y0 + (uint32_t)y, 0, lb, rows, th, td), src + y * row + x, n); x += n;
+            memcpy(mem + base + nvn_bl_offset(bx, y0 + (uint32_t)y, 0, lb, rows, th, td), src + y * row + x, n); x += n;
         }
     return 0;
 }
+static void write_texels_(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);
+// Lichii: a WriteTexels that faulted on its storage (Duskbloods direct mode, the lobby: an 8-byte write in write_region_bl, 2026-11-23) is logged with what its page and pool were,
+// instead of ending the process. shortcut: what it wrote so far stays (the deswizzle buffer of the slow path is lost), the rest of the region is dropped; fix the cause once the log names it
+struct wt_args { const tex_t *t; const view_t *v; const NVNcopyRegion *r; const uint8_t *src; size_t row, img; };
+static void wt_run(void *p) { const struct wt_args *a = p; write_texels_(a->t, a->v, a->r, a->src, a->row, a->img); }
 static void write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
+    struct wt_args a = {t, v, r, src, row, img}; uintptr_t at; int wr; unsigned st, pr;
+    if (nvn_direct_guarded(wt_run, &a, &at, &wr, &st, &pr)) return;
+    unsigned pflags; int sparse; const uint64_t live = nvn_pool_live(t->pool, &pflags, &sparse);
+    const uintptr_t m = (uintptr_t)t->mem; const int in_tex = at >= m && at < m + t->L.size;
+    static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16)
+        LOG("[RED] WriteTexels: %s fault at %p (%s: offset %#llx of %#llx), page state %#x protection %#x; texture serial %llu %ux%u format %#x target %d, region %d,%d %dx%d; pool %p live %llu flags %#x sparse %d, "
+            "page in a virtual pool and unmapped %d, write-tracked %d; src %p",
+            wr == 1 ? "write" : wr == 8 ? "execute" : "read", (void *)at, in_tex ? "in the texture's storage" : "outside its storage", (unsigned long long)(at - m), (unsigned long long)t->L.size, st, pr,
+            (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.target, r->xoffset, r->yoffset, r->width, r->height, (const void *)t->pool, (unsigned long long)live, pflags, sparse,
+            nvn_vpool_page_unmapped((uint64_t)at), nvn_dirty_tracked((const void *)at, 1), (const void *)src);
+    mtl_tex_cpu_written(t);   // (what was written before the fault)
+}
+static void write_texels_(const tex_t *t, const view_t *v, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
     if (!t->mem) { LOG("[RED] WriteTexels: texture has no storage"); return; }
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) { ONCE_LOG("[RED] WriteTexels: unknown format %#x", t->d.format); return; }
+    // Lichii: written through the backing memory when the storage is one run there (never protected: another thread may arm a page of the guest view between the disarm and
+    // the write, a fault on the host's write: run readtexels2), stamped after the write so an upload in between is made again. Else the guest view, disarmed first, as before
+    uint8_t *const back = nvn_direct_writable_run(t->mem, t->L.size), *const mem = back ? back : t->mem;
+    if (!back) dm_guest_write_prepare(t->mem, t->L.size);
     unsigned level = v && v->set_levels ? (unsigned)v->base_level : 0, layer0 = v && v->set_layers ? (unsigned)v->min_layer : 0;
     int is3d = t->d.target == NVN_TEXTURE_TARGET_3D, nz = r->depth ? r->depth : 1;
     if (!is3d) {
         size_t wb0 = (size_t)((r->width + bw - 1) / bw) * bpb, row0 = row ? row : wb0, img0 = img ? img : row0 * (size_t)((r->height + bh - 1) / bh);
-        dm_guest_write_prepare(t->mem, t->L.size);
         int ok = 1;
-        for (int z = 0; z < nz && ok; z++) ok = !write_region_bl(t, level, layer0 + (unsigned)(r->zoffset + z), r, src + (size_t)z * img0, row0, bw, bh, bpb);
-        if (ok) { mtl_tex_cpu_written(t); return; }
+        for (int z = 0; z < nz && ok; z++) ok = !write_region_bl(t, mem, level, layer0 + (unsigned)(r->zoffset + z), r, src + (size_t)z * img0, row0, bw, bh, bpb);
+        if (ok) { dm_guest_write_prepare(t->mem, t->L.size); mtl_tex_cpu_written(t); return; }
     }
     uint32_t lw = t->d.width >> level ? t->d.width >> level : 1, lh = t->d.height >> level ? t->d.height >> level : 1, lz = is3d ? (t->d.depth >> level ? t->d.depth >> level : 1) : 1;
     size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
@@ -2326,7 +2347,6 @@ static void write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r
     if (!row) row = wb;
     if (!img) img = row * hb;
     uint8_t *lin = malloc(lp * lr * lz); if (!lin) die("WriteTexels allocation failed");
-    dm_guest_write_prepare(t->mem, t->L.size);
     // when the region is exactly the whole level (2D) every texel is overwritten, so the old content need not be decoded first (movies write whole frames; saves one deswizzle per 1080p frame)
     int whole = !is3d && !r->xoffset && !r->yoffset && (uint32_t)r->width == lw && (uint32_t)r->height == lh;
     for (int z = 0; z < nz; z++) {
@@ -2334,9 +2354,10 @@ static void write_texels(const tex_t *t, const view_t *v, const NVNcopyRegion *r
         if (((is3d && z == 0) || !is3d) && !whole) if (nvn_deswizzle(&t->d, level, layer, t->mem, lin, lp)) { ONCE_LOG("[RED] WriteTexels deswizzle failed (format %#x target %d)", t->d.format, t->d.target); free(lin); return; }
         uint8_t *dst = lin + (is3d ? (size_t)(r->zoffset + z) * lp * lr : 0) + (size_t)(r->yoffset / bh) * lp + (size_t)(r->xoffset / bw) * bpb;
         for (size_t y = 0; y < hb; y++) memcpy(dst + y * lp, src + (size_t)z * img + y * row, wb);
-        if (!is3d || z == nz - 1) nvn_swizzle(&t->d, level, layer, lin, lp, t->mem);
+        if (!is3d || z == nz - 1) nvn_swizzle(&t->d, level, layer, lin, lp, mem);
     }
     free(lin);
+    dm_guest_write_prepare(t->mem, t->L.size);
     mtl_tex_cpu_written(t);
 }
 NVN(nvnTextureWriteTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const void *src) { write_texels(CTX(t), (const view_t *)v, r, src, 0, 0); }
@@ -2362,7 +2383,7 @@ int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NV
     int nz = r->depth ? r->depth : 1;
     for (int z = 0; z < nz; z++) {
         unsigned layer = layer0 + (unsigned)(r->zoffset + z);
-        if (mirror_prepare(t, level, layer) || write_region_bl(t, level, layer, r, src + (size_t)z * img, row, bw, bh, bpb)) return -1;
+        if (mirror_prepare(t, level, layer) || write_region_bl(t, t->mem, level, layer, r, src + (size_t)z * img, row, bw, bh, bpb)) return -1;
     }
     return 0;
 }
@@ -2377,7 +2398,7 @@ int nvn_tex_mirror_t2t(const tex_t *s, unsigned sl, unsigned ss, const NVNcopyRe
     int nz = sr->depth ? sr->depth : 1, ok = 1;
     for (int z = 0; z < nz && ok; z++) {
         unsigned layer = ds + (unsigned)(dr->zoffset + z);
-        ok = !nvn_deswizzle(&s->d, sl, ss + (unsigned)(sr->zoffset + z), s->mem, lin, lp) && !mirror_prepare(d, dl, layer) && !write_region_bl(d, dl, layer, dr, lin + y0 * lp + x0, lp, bw, bh, bpb);
+        ok = !nvn_deswizzle(&s->d, sl, ss + (unsigned)(sr->zoffset + z), s->mem, lin, lp) && !mirror_prepare(d, dl, layer) && !write_region_bl(d, d->mem, dl, layer, dr, lin + y0 * lp + x0, lp, bw, bh, bpb);
     }
     free(lin);
     return ok ? 0 : -1;
