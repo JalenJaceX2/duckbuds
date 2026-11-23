@@ -90,13 +90,13 @@ int vka_walk(const vka_bstate *s, int st, const dmsh_vk_entry *e, const dmsh_vk_
                 int sid = b->skind ? samp_of(s, st, b, k, rd, ctx) : 0;
                 if (tid) { r.what = VKA_R_TEX; r.tid = tid; r.sid = sid; }
                 break; }
-            case DMSH_VK_KIND_TBUF: {
-                int tid = noslot ? 0 : (int)(vka_tex_slot(s, st, (unsigned)reg) & 0xfffff);
+            case DMSH_VK_KIND_TBUF: case VKA_KIND_TBUF_UBO: {
+                int tid = noslot ? 0 : b->kind == VKA_KIND_TBUF_UBO ? ubo_tex_id(s, (uint32_t)ubo_word(s, st, reg, b->off, 4, rd, ctx)) : (int)(vka_tex_slot(s, st, (unsigned)reg) & 0xfffff);
                 if (tid) { r.what = VKA_R_TBUF; r.tid = tid; }
                 break; }
             case DMSH_VK_KIND_IMG: case VKA_KIND_IMG_UBO: {
                 int tid = noslot ? 0 : b->kind == VKA_KIND_IMG_UBO ? ubo_tex_id(s, (uint32_t)ubo_word(s, st, reg, b->off, 4, rd, ctx)) : reg >= 32 ? 0 : (int)(s->img[st][reg] & 0xfffff);
-                if (tid) { r.what = VKA_R_IMG; r.tid = tid; }
+                if (tid) { r.what = b->desc == 5 /* STORAGE_TEXEL_BUFFER */ ? VKA_R_TBUF : VKA_R_IMG; r.tid = tid; }   // (Lichii: an image buffer is a texel buffer)
                 break; }
             case DMSH_VK_KIND_SAMP: case DMSH_VK_KIND_SAMP_TEX: case DMSH_VK_KIND_SAMP_ID: case DMSH_VK_KIND_SAMP_UBO: case DMSH_VK_KIND_SAMP_C2A: {
                 dmsh_vk_bind sb = *b; sb.skind = b->kind; sb.sreg = b->reg; sb.soff = b->kind == DMSH_VK_KIND_SAMP_C2A ? b->soff : b->off;   // a sampler on its own: its own fields name it

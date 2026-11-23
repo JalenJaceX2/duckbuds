@@ -2366,6 +2366,28 @@ int vka_tex_id_format(int id) {
     pthread_mutex_unlock(&g_tmu);
     return f;
 }
+// Lichii: texture ID id as a texel buffer (vka_draw.c tbuf_view): a buffer texture's storage address (*addr) and bytes (*bytes: its width in texels, at most the device's
+// texel buffer elements), and the Vulkan format of its NVN format (its view's) when the device makes texel buffers of it (storage: storage texel buffers, else uniform
+// ones); VK_FORMAT_UNDEFINED otherwise (not registered, not a buffer texture, its pool finalized, no such format)
+VkFormat vka_tex_id_buffer(int id, int storage, uint64_t *addr, uint64_t *bytes) {
+    pthread_mutex_lock(&g_tmu);
+    treg_ent e = id > 0 && id < g_ntreg && g_treg[id].t.serial ? g_treg[id] : (treg_ent){0};
+    pthread_mutex_unlock(&g_tmu);
+    if (!e.t.serial || e.t.d.target != NVN_TEXTURE_TARGET_BUFFER || !e.t.mem || treg_dead(id, &e)) return VK_FORMAT_UNDEFINED;
+    int nf = e.has_v && e.v.set_format ? e.v.format : e.t.d.format, bw, bh, bpb = nvn_fmt_bpb(nf, &bw, &bh);
+    VkFormat f = fmt_ent_of(nf).vk;
+    static _Atomic uint32_t known[512];   // by NVN format: the format's buffer features | bit 31 once asked
+    uint32_t bf = nf >= 0 && nf < 512 ? atomic_load_explicit(&known[nf], memory_order_relaxed) : 0;
+    if (!(bf >> 31) && f != VK_FORMAT_UNDEFINED) {
+        VkFormatProperties p; vk.vkGetPhysicalDeviceFormatProperties(V.pd, f, &p);
+        bf = (uint32_t)p.bufferFeatures | 1u << 31;
+        if (nf >= 0 && nf < 512) atomic_store_explicit(&known[nf], bf, memory_order_relaxed);
+    }
+    if (f == VK_FORMAT_UNDEFINED || bpb <= 0 || !(bf & (storage ? VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT : VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT))) return VK_FORMAT_UNDEFINED;
+    uint64_t texels = e.t.d.width < V.props.limits.maxTexelBufferElements ? e.t.d.width : V.props.limits.maxTexelBufferElements;
+    *addr = (uint64_t)(uintptr_t)e.t.mem; *bytes = texels * (uint64_t)bpb;
+    return f;
+}
 int vka_tex_id_storage_pending(int id) {
     pthread_mutex_lock(&g_tmu);
     smap_ent *e = id > 0 && id < g_ntreg && g_treg[id].t.serial ? map_get(g_treg[id].t.serial) : NULL;

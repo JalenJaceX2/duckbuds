@@ -315,6 +315,9 @@ static int rc_bind(const nvn_direct_shader_desc* s, int st, const cs_layout* l, 
             }
             return 1;
         }
+        if (s->cbuf_index >= 3 && s->cbuf_index < 19 && b->count == 1 && s->kind == NVN_DIRECT_DESC_TEXTURE_BUFFER) {   // a texel buffer's handle in a uniform buffer (vka_bind.c VKA_KIND_TBUF_UBO)
+            b->kind = VKA_KIND_TBUF_UBO; b->reg = (int16_t)(s->cbuf_index - 3); b->off = (uint16_t)s->cbuf_offset; return 1;
+        }
         NO("binding %u: a handle at c%u + %#x", s->binding, s->cbuf_index, s->cbuf_offset);
     }
     case NVN_DIRECT_DESC_LOOP_GUARD: b->kind = VKA_KIND_LOOP_GUARD; b->flags |= DMSH_VK_BF_RW; return 1;
@@ -323,7 +326,7 @@ static int rc_bind(const nvn_direct_shader_desc* s, int st, const cs_layout* l, 
         if (s->pool) {   // the image pool by the handle the shader computes: set 1, which the dispatch binds for it (vka_draw.c any_pool)
             b->kind = VKA_KIND_IMG_POOL; b->set = DMSH_VK_SET_POOL; b->binding = NVN_DIRECT_POOL_IMAGE_BINDING; b->count = 0; return 1;
         }
-        if (s->cbuf_index >= 3 && s->cbuf_index < 19 && s->kind == NVN_DIRECT_DESC_IMAGE) {   // a handle in a uniform buffer (vka_bind.c VKA_KIND_IMG_UBO)
+        if (s->cbuf_index >= 3 && s->cbuf_index < 19) {   // a handle in a uniform buffer (vka_bind.c VKA_KIND_IMG_UBO; an image buffer's binds a texel buffer)
             b->kind = VKA_KIND_IMG_UBO; b->reg = (int16_t)(s->cbuf_index - 3); b->off = (uint16_t)s->cbuf_offset; return 1;
         }
         int c2 = c2_off(l, s->cbuf_index, s->cbuf_offset);

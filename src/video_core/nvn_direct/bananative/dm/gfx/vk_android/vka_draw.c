@@ -815,6 +815,51 @@ static inline uint64_t cntvct(void) { struct timespec ts; clock_gettime(CLOCK_MO
 #else
 static inline uint64_t cntvct(void) { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
 #endif
+// Lichii: texel buffers. A view of a buffer texture's storage where it lies in placed guest RAM, in its NVN format (vka_tex_id_buffer), as the console's texture header
+// describes it to the shader. Views are made on the recording thread, once per submission for the same range and format, and destroyed once the GPU reached the
+// fence of the submission that made them (vka_tbuf_retire at its commit). Orbitals' (Unreal Engine 5) particle and compute shaders read and write theirs this way
+typedef struct { VkBuffer buf; VkDeviceSize off, range; VkFormat f; VkBufferView v; uint64_t fence; } tbv_ent;
+static tbv_ent *g_tbv; static size_t g_ntbv, g_ctbv, g_tbv_open;   // [g_tbv_open, g_ntbv): the views of the submission being recorded
+static pthread_mutex_t g_tbv_mu = PTHREAD_MUTEX_INITIALIZER;
+static VkBufferView tbv_get(VkBuffer buf, VkDeviceSize off, VkDeviceSize range, VkFormat f) {
+    pthread_mutex_lock(&g_tbv_mu);
+    for (size_t i = g_tbv_open; i < g_ntbv; i++)
+        if (g_tbv[i].buf == buf && g_tbv[i].off == off && g_tbv[i].range == range && g_tbv[i].f == f) { VkBufferView v = g_tbv[i].v; pthread_mutex_unlock(&g_tbv_mu); return v; }
+    VkBufferView v = VK_NULL_HANDLE;
+    VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = buf, .format = f, .offset = off, .range = range};
+    if (g_ntbv == g_ctbv) { size_t c = g_ctbv ? 2 * g_ctbv : 64; tbv_ent *n = realloc(g_tbv, c * sizeof *n); if (n) { g_tbv = n; g_ctbv = c; } }
+    if (g_ntbv < g_ctbv && vk.vkCreateBufferView(V.dev, &ci, NULL, &v) == VK_SUCCESS) g_tbv[g_ntbv++] = (tbv_ent){buf, off, range, f, v, 0};
+    pthread_mutex_unlock(&g_tbv_mu);
+    return v;
+}
+void vka_tbuf_retire(uint64_t fence) {
+    pthread_mutex_lock(&g_tbv_mu);
+    for (size_t i = g_tbv_open; i < g_ntbv; i++) g_tbv[i].fence = fence;
+    uint64_t done = vka_done(); size_t m = 0;
+    for (size_t i = 0; i < g_ntbv; i++) {
+        if (g_tbv[i].fence <= done) vk.vkDestroyBufferView(V.dev, g_tbv[i].v, NULL);
+        else g_tbv[m++] = g_tbv[i];
+    }
+    g_ntbv = g_tbv_open = m;
+    pthread_mutex_unlock(&g_tbv_mu);
+}
+// Texture ID r->tid as the texel buffer binding r: VK_NULL_HANDLE (unbound, reported once) when it is not a buffer texture Vulkan can view where it lies
+static VkBufferView tbuf_view(const vka_shader *sh, const vka_res *r) {
+    int storage = r->desc == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+    uint64_t addr = 0, bytes = 0; VkBuffer b; VkDeviceSize o;
+    VkFormat f = vka_tex_id_buffer(r->tid, storage, &addr, &bytes);
+    uint64_t run = f != VK_FORMAT_UNDEFINED && bytes ? vka_addr_run(addr, bytes, &b, &o) : 0;   // (bytes: whole texels)
+    const char *why = f == VK_FORMAT_UNDEFINED ? "not a buffer texture in a format the device views" : !run ? "its storage is not in placed guest RAM"
+                    : run < bytes ? "its storage lies across two placed segments (one view holds one buffer)"
+                    : o % V.props.limits.minTexelBufferOffsetAlignment ? "its storage is not at an offset the device views" : NULL;
+    if (why) {
+        static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) { char d[320]; vka_tex_id_desc(r->tid, d, sizeof d);
+            VRED("shader %016llx binding %u: texture ID %d as a texel buffer: %s, it reads as unbound (%s)", (unsigned long long)sh->key, r->binding, r->tid, why, d); }
+        return VK_NULL_HANDLE;
+    }
+    if (storage && (r->flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(addr, run);   // the shader may store into it
+    return tbv_get(b, o, run, f);
+}
 // ---------- Set 0 from the walk ----------
 typedef struct { VkWriteDescriptorSet w[512]; VkDescriptorBufferInfo bi[512]; VkDescriptorImageInfo ii[512]; VkBufferView bv[512]; uint32_t n; } writes_t;
 static writes_t g_w;
@@ -885,9 +930,9 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
             w->pImageInfo = ii; if (g_prof) { g_ps[4] += cntvct() - ti_; g_ps[5]++; }
             break; }
         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
-            if (r[i].what != VKA_R_NULL) VRED_ONCE("texel buffers are not on Vulkan yet (shader %016llx binding %u): bound as null", (unsigned long long)sh->key, r[i].binding);
-            if (!V.null_desc) { VRED_ONCE("a texel buffer binding and no null descriptors: the draw is skipped"); return 0; }
-            g_w.bv[k] = VK_NULL_HANDLE; w->pTexelBufferView = &g_w.bv[k];
+            g_w.bv[k] = r[i].what == VKA_R_TBUF ? tbuf_view(sh, &r[i]) : VK_NULL_HANDLE;   // (Lichii)
+            if (!g_w.bv[k] && !V.null_desc) { VRED_ONCE("an unbound texel buffer and no null descriptors: the draw is skipped"); return 0; }
+            w->pTexelBufferView = &g_w.bv[k];
             break;
         default: VRED_ONCE("descriptor type %u in a binding record", r[i].desc); return 0;
         }
@@ -1633,6 +1678,8 @@ void vka_draw_stats(uint64_t *draws, uint64_t *skipped, uint64_t *dispatches, ui
 // vka_shader.c's blocks, the placeholders with the images)
 void vka_draw_destroy(void) {
     fsc_reset();
+    for (size_t i = 0; i < g_ntbv; i++) vk.vkDestroyBufferView(V.dev, g_tbv[i].v, NULL);
+    free(g_tbv); g_tbv = NULL; g_ntbv = g_ctbv = g_tbv_open = 0;
     for (int s = 0; s < NSLOT; s++) for (int i = 0; i < g_ndp[s]; i++) vk.vkDestroyDescriptorPool(V.dev, g_dp[s][i], NULL);
     for (int s = 0; s < NSLOT; s++) {
         if (g_vrs_att[s].view) vk.vkDestroyImageView(V.dev, g_vrs_att[s].view, NULL);

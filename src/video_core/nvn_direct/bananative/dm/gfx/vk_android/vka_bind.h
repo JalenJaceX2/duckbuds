@@ -70,6 +70,8 @@ typedef int (*vka_read_fn)(void *ctx, uint64_t addr, void *out, size_t n);
 #define VKA_KIND_IMG_UBO 70
 // Lichii: the image pool, set 1 binding NVN_DIRECT_POOL_IMAGE_BINDING, by the texture ID of the handle the shader computes (as TEX_POOL for textures)
 #define VKA_KIND_IMG_POOL 71
+// Lichii: a texel buffer whose handle is in uniform slot reg at byte off (as TEX_UBO for textures)
+#define VKA_KIND_TBUF_UBO 72
 
 #define VKA_WALK_REFUSE (-1)
 // Walks one stage's binding records (e->bind_count of them from b) for NVN stage nvn_stage. Writes at most max results to out and returns their count, or VKA_WALK_REFUSE with

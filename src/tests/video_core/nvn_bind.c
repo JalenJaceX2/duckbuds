@@ -4,7 +4,8 @@
 // The replay's binding walk (vka_bind.c vka_walk) for storage buffers whose address is read from
 // a table in memory (VKA_KIND_SBUF_IND, VKA_KIND_SBUF_UBO_IND: Ocarina of Time's materials;
 // VKA_KIND_UBO_PTR_IND: Duskbloods' compute), images whose handle is in a uniform buffer
-// (VKA_KIND_IMG_UBO) and images read from the image pool (VKA_KIND_IMG_POOL).
+// (VKA_KIND_IMG_UBO), images read from the image pool (VKA_KIND_IMG_POOL) and texel buffers
+// whose handle is in a uniform buffer (VKA_KIND_TBUF_UBO, VKA_KIND_IMG_UBO: Orbitals).
 
 #include <stdint.h>
 #include <stdio.h>
@@ -87,6 +88,18 @@ int main(void) {
     const uint32_t none = 0;
     memcpy(arena + uniforms + 0x20, &none, 4);
     CHECK(walk(&s, 1, img, &r) == 1 && r.what == VKA_R_NULL);
+
+    // Texel buffers whose handle is in a uniform buffer word, uniform and storage: the buffer texture's ID
+    memcpy(arena + uniforms + 0x20, &handle, 4);
+    const dmsh_vk_bind tbuf = {.kind = VKA_KIND_TBUF_UBO, .desc = 4 /* UNIFORM_TEXEL_BUFFER */, .count = 1, .reg = 2, .off = 0x20};
+    CHECK(walk(&s, 1, tbuf, &r) == 1);
+    CHECK(r.what == VKA_R_TBUF && r.tid == 0x1123);
+    dmsh_vk_bind image_buffer = img;
+    image_buffer.desc = 5 /* STORAGE_TEXEL_BUFFER */;
+    CHECK(walk(&s, 1, image_buffer, &r) == 1);
+    CHECK(r.what == VKA_R_TBUF && r.tid == 0x1123);
+    memcpy(arena + uniforms + 0x20, &none, 4);
+    CHECK(walk(&s, 1, tbuf, &r) == 1 && r.what == VKA_R_NULL);
 
     // The image pool: no descriptor in set 0, the shader reads set 1
     const dmsh_vk_bind pool = {.kind = VKA_KIND_IMG_POOL, .desc = 3 /* STORAGE_IMAGE */, .set = DMSH_VK_SET_POOL, .binding = NVN_DIRECT_POOL_IMAGE_BINDING, .reg = -1};

@@ -449,6 +449,7 @@ uint64_t vka_rp_sub_commit(uint64_t reserved) {
     g_slot[(g_slot_i - 1) % NSLOT].fence = fence;
     if (vka_nan_on()) vka_nan_commit(fence);
     vka_scratch_retire(fence);
+    vka_tbuf_retire(fence);   // (Lichii)
     if (r) {
         static _Atomic int nred; if (!vka_stopping() && atomic_fetch_add(&nred, 1) < 8) VRED("submission %llu: %d (its effects run without the GPU)", (unsigned long long)fence, r);
         VkSemaphoreSignalInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = V.tl, .value = fence};
