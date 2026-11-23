@@ -2022,11 +2022,11 @@ static VkSampler sampler_of(const samp_par *p) {
     // NVN_SAMPLER_REDUCTION_AVERAGE 0 / MIN 1 / MAX 2 (nvn.h NVNsamplerReduction) -> VkSamplerReductionMode, spelled out
     VkSamplerReductionModeCreateInfo red = {VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO};
     if (p->reduction == NVN_SAMPLER_REDUCTION_MIN || p->reduction == NVN_SAMPLER_REDUCTION_MAX) {
-        if (V.sampler_minmax) {
+        if (V.sampler_minmax && !ci.compareEnable) {   // (Vulkan: a compare sampler's reduction must be weighted average)
             red.reductionMode = p->reduction == NVN_SAMPLER_REDUCTION_MIN ? VK_SAMPLER_REDUCTION_MODE_MIN : VK_SAMPLER_REDUCTION_MODE_MAX;
             ci.pNext = &red;
             static _Atomic int logged; if (!atomic_exchange(&logged, 1)) VLOG("sampler reduction in use: min / max samplers (first one is mode %d)", p->reduction);
-        } else VRED_ONCE("sampler reduction mode %d not applied (samplerFilterMinmax not enabled on the device)", p->reduction);
+        } else VRED_ONCE("sampler reduction mode %d not applied (samplerFilterMinmax not enabled, or a compare sampler)", p->reduction);
     }
     VkSampler s = VK_NULL_HANDLE;
     if (vk.vkCreateSampler(V.dev, &ci, NULL, &s)) return VK_NULL_HANDLE;
