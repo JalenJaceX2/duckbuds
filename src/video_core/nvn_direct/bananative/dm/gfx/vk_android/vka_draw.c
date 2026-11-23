@@ -10,6 +10,7 @@
 #include "nvn_direct_front.h"
 #include "nvn_direct.h"   // Lichii: the render scale's push constants
 #include "../nvn/nvn_mtl.h"
+#include "../nvn/nvn_dirty.h"
 #include "../../host/plat/plat.h"
 #include <math.h>
 #include <stdio.h>
@@ -674,10 +675,64 @@ static int cpu_read(uint64_t addr, void *out, size_t n) {   // guest bytes as th
 }
 static int rd_cb(void *ctx, uint64_t addr, void *out, size_t n) { (void)ctx; return cpu_read(addr, out, n); }
 // A uniform buffer: bound in place when Vulkan's offset alignment allows, else a copy of what the CPU sees now (a GPU write earlier in this submission is missed: logged)
+// ---------- Device-local copies of guest buffers (experiment, Lichii) ----------
+// Guest RAM is system memory the GPU imports (vka_mem.c: a host-pointer import of type HOST_VISIBLE|HOST_CACHED, not device local), so every vertex fetch and uniform
+// read crosses PCIe. DM_VK_XP_VB_VRAM=1 / DM_VK_XP_UB_VRAM=1 (live): vertex streams / uniform buffers read a device-local copy of their bound range, made in an upload
+// batch (which runs before the part it is recorded beside) the first time a range is bound and again after the CPU wrote its pages (nvn_dirty stamps, as tracked
+// textures). A range copied more than 4 times, or larger than 64 MiB, reads guest RAM as before. GPU writes into a copied range are not seen (wrong picture where the
+// GPU writes vertex or uniform data): an experiment to measure where the GPU time goes, not a fix
+enum { VC_N = 1 << 15 };
+#define VC_ARENA ((VkDeviceSize)768 << 20)
+typedef struct { uint64_t addr, size, stamp; const void *span; VkDeviceSize off; uint32_t copies; uint8_t state; } vc_ent;   // state 0 empty, 1 copied, 2 guest RAM
+static vc_ent *g_vc; static VkBuffer g_vc_buf; static VkDeviceMemory g_vc_mem; static VkDeviceSize g_vc_top; static int g_vc_failed;
+static uint64_t g_vc_bytes, g_vc_ncopy, g_vc_nrecopy, g_vc_hit, g_vc_bypass;
+static int vc_init(void) {
+    if (g_vc_buf || g_vc_failed) return g_vc_buf != VK_NULL_HANDLE;
+    g_vc_failed = 1;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = VC_ARENA, .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    if (vk.vkCreateBuffer(V.dev, &bi, NULL, &g_vc_buf)) { g_vc_buf = VK_NULL_HANDLE; VRED("vertex/uniform copies: no buffer"); return 0; }
+    VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, g_vc_buf, &mr);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
+    if (ai.memoryTypeIndex == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g_vc_mem) || vk.vkBindBufferMemory(V.dev, g_vc_buf, g_vc_mem, 0) || !(g_vc = calloc(VC_N, sizeof *g_vc))) {
+        vk.vkDestroyBuffer(V.dev, g_vc_buf, NULL); g_vc_buf = VK_NULL_HANDLE; VRED("vertex/uniform copies: no device memory"); return 0; }
+    vka_mem_grew(mr.size); g_vc_failed = 0;
+    VLOG("vertex/uniform copies: %llu MiB of device memory (type %u)", (unsigned long long)(VC_ARENA >> 20), ai.memoryTypeIndex);
+    return 1;
+}
+// The copy of [addr, addr + size) for this draw: 1 = *b / *o are it (an upload batch copies it before the part runs), 0 = read guest RAM
+static int vc_get(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
+    if (!size || size > (64u << 20) || !vc_init()) return 0;
+    uint64_t h = (addr ^ size * 0x9E3779B97F4A7C15ull) * 0xff51afd7ed558ccdull; vc_ent *e = NULL;
+    for (uint32_t i = 0; i < 64; i++) { vc_ent *x = &g_vc[(h + i) & (VC_N - 1)]; if (!x->state || (x->addr == addr && x->size == size)) { e = x; break; } }
+    if (!e || e->state == 2) { g_vc_bypass++; return 0; }   // (!e: the table's neighbourhood is full)
+    if (e->state == 1 && !nvn_dirty_since_span(e->span, (const void *)(uintptr_t)addr, size, e->stamp)) { g_vc_hit++; *b = g_vc_buf; *o = e->off; return 1; }
+    if (!e->state) { e->addr = addr; e->size = size; e->span = nvn_dirty_span((const void *)(uintptr_t)addr, size); if (!e->span) { e->state = 2; g_vc_bypass++; return 0; } }
+    if (e->copies >= 4 || g_vc_top + size + 256 > VC_ARENA) { e->state = 2; g_vc_bypass++; return 0; }
+    VkBuffer sb; VkDeviceSize so; uint64_t run = vka_addr_run(addr, size, &sb, &so);
+    if (run < size) { e->state = 2; g_vc_bypass++; return 0; }
+    VkCommandBuffer ub = vka_up_begin();
+    if (!ub || !vka_up_is(ub)) { if (ub) vka_up_end(); g_vc_bypass++; return 0; }
+    e->stamp = nvn_dirty_now(); nvn_dirty_protect((const void *)(uintptr_t)addr, size);   // (the stamp before the GPU reads the bytes: a write after it copies again)
+    const VkDeviceSize off = (g_vc_top + 255) & ~(VkDeviceSize)255; g_vc_top = off + size;   // a new place each time: an earlier copy may still be read by work in flight
+    VkBufferCopy c = {so, off, size}; vk.vkCmdCopyBuffer(ub, sb, g_vc_buf, 1, &c);
+    vka_barrier(ub); vka_up_end();
+    if (e->copies++) g_vc_nrecopy++;
+    g_vc_ncopy++; g_vc_bytes += size;
+    e->state = 1; e->off = off; *b = g_vc_buf; *o = off; return 1;
+}
+void vka_vc_stats(char *b, size_t n, double frames) {
+    static uint64_t c0, r0, h0, y0, by0;
+    if (!g_vc || frames <= 0) { if (n) b[0] = 0; return; }
+    snprintf(b, n, "vertex/uniform copies per frame: %.0f bound from copies, %.0f from guest RAM, %.1f copies (%.1f again after a CPU write), %.2f MiB copied; arena %.0f of %llu MiB",
+             (g_vc_hit - h0) / frames, (g_vc_bypass - by0) / frames, (g_vc_ncopy - c0) / frames, (g_vc_nrecopy - r0) / frames, (g_vc_bytes - y0) / frames / 1048576.0, g_vc_top / 1048576.0,
+             (unsigned long long)(VC_ARENA >> 20));
+    c0 = g_vc_ncopy; r0 = g_vc_nrecopy; h0 = g_vc_hit; y0 = g_vc_bytes; by0 = g_vc_bypass;
+}
 static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
     if (!size || size > V.ub_range) size = size ? V.ub_range : 65536 < V.ub_range ? 65536 : V.ub_range;
     VkBuffer b; VkDeviceSize o;
     uint64_t run = vka_addr_run(addr, size, &b, &o);
+    if (run >= size && !(o % V.ub_align) && !(addr % V.ub_align) && VKA_ENV("DM_VK_XP_UB_VRAM", 0) && vc_get(addr, size, &b, &o)) { *bi = (VkDescriptorBufferInfo){b, o, size}; return 1; }
     if (run && !(o % V.ub_align) && !(addr % V.ub_align)) { *bi = (VkDescriptorBufferInfo){b, o, run}; return 1; }
     vka_span s; if (!vka_scratch(size, V.ub_align, &s)) return 0;
     if (!cpu_read(addr, s.ptr, size)) { memset(s.ptr, 0, size); VRED_ONCE("uniform buffer at %#llx is not readable: it reads zeros", (unsigned long long)addr); }
@@ -1209,7 +1264,8 @@ static void vin_bind(const vka_dstate *d) {
         VkBuffer b = g_zero.buf; VkDeviceSize o = g_zero.off, sz = 65536;
         uint64_t addr = d->vbuf[st].address, size = d->vbuf[st].size;
         if (addr && !VKA_ENV("DM_VK_XP_VB_ZERO", 0)) { VkBuffer cb; VkDeviceSize co; uint64_t run = vka_addr_run(addr, size ? size : 1ull << 30, &cb, &co);
-                    if (run) { b = cb; o = co; sz = run; } else VRED_ONCE("vertex stream at %#llx is not in placed guest RAM: it reads zeros", (unsigned long long)addr); }
+                    if (run && size && run >= size && VKA_ENV("DM_VK_XP_VB_VRAM", 0) && vc_get(addr, size, &cb, &co)) { b = cb; o = co; sz = size; }
+                    else if (run) { b = cb; o = co; sz = run; } else VRED_ONCE("vertex stream at %#llx is not in placed guest RAM: it reads zeros", (unsigned long long)addr); }
         vb_set(st, b, o, sz, &n0, &nn, rb, ro, rs);
     }
     if (VI.zero) vb_set(VI.zb, g_zero.buf, g_zero.off, 65536, &n0, &nn, rb, ro, rs);
@@ -1492,7 +1548,8 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         if (!vka_enc_call(excl_call, &x, sizeof x)) excl_call(&x);
     }
     // Rasterizer and depth / stencil
-    DY_SET1(cull, (uint32_t)(d->poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT : d->poly.cull == NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT : d->poly.cull == NVN_FACE_FRONT_AND_BACK ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_NONE), vk.vkCmdSetCullMode(g_cb, DY.cull));
+    // (DM_VK_XP_CULL_ALL=1: experiment (no picture), every triangle culled after the vertex stage: the vertex work stays, setup and raster go)
+    DY_SET1(cull, (uint32_t)(VKA_ENV("DM_VK_XP_CULL_ALL", 0) ? VK_CULL_MODE_FRONT_AND_BACK : d->poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT : d->poly.cull == NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT : d->poly.cull == NVN_FACE_FRONT_AND_BACK ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_NONE), vk.vkCmdSetCullMode(g_cb, DY.cull));
     DY_SET1(ff, (uint32_t)((d->poly.front == NVN_FRONT_FACE_CCW) != vka_queue_origin_ll() ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE), vk.vkCmdSetFrontFace(g_cb, DY.ff));   // as nvn_mtl.m's winding
     // A mesh pipeline has no input assembly: the topology and primitive restart are not set for it, and set again at the next draw that has them (its pipeline bind may
     // have left them undefined)
