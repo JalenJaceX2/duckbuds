@@ -245,7 +245,7 @@ vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
 }
 
 // A shader by key (the prewarm threads, vka_pso.c): Lichii's recompiled shaders, those translated so far (nvn_recompile.c); NULL = not translated or refused
-vka_shader *vka_shader_by_key(uint64_t key, int gl_depth) { return vka_rc_by_key(key, gl_depth); }
+vka_shader *vka_shader_by_key(uint64_t key, int gl_depth, uint32_t gs_in) { return vka_rc_by_key(key, gl_depth, gs_in); }
 
 // Lichii: the keys program stages asked for that the recompiler could not place, each counted once and logged (the first 256) with how many there are so far
 static pthread_mutex_t g_miss_mu = PTHREAD_MUTEX_INITIALIZER;

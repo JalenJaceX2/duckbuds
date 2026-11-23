@@ -585,6 +585,7 @@ static void rc_make(rc_shader* r, uint64_t key, const nvn_direct_shader* o, cons
     if (g_nlibs < g_libs_cap) g_libs[g_nlibs++] = L;
     pthread_mutex_unlock(&g_mu);
     r->sh = vka_shader_make(L, key);
+    if (r->sh && r->st == 2) r->sh->gs_in = (uint8_t)prim_inputs;   // (Lichii: for the prewarm list, vka_pso.c pw_note)
     if (!r->sh) return;
     r->sh->nvn2_control = nvn2_control(control->bytes) ? control->bytes : NULL; g_made++;
     for (unsigned k = 0; k < o->desc_count; k++) if (o->descs[k].kind == NVN_DIRECT_DESC_TEXTURE) {   // (the descriptors' order is RescalingPass's texture order)
@@ -650,7 +651,7 @@ vka_shader* vka_rc_shader(const prog_t* p, unsigned i, uint64_t key, uint32_t pr
 }
 // Only the key is known here (the prewarm), not its stage: in the near-zero depth mode a depth stage's slot is looked at first, then the key's own, which
 // then counts only for a stage without depth (in GL's, the key's own slot holds both)
-static rc_shader* rc_by_slot(uint64_t key, uint64_t slot, int depth_ok) {
+static rc_shader* rc_by_slot(uint64_t key, uint64_t slot, int depth_ok, uint32_t prim_inputs) {
     rc_shader* r = rc_lookup(slot);
     if (r) return depth_ok || !rc_depth_stage(r->st) ? r : NULL;
     // Lichii: not met in this run yet: made from the translation an earlier run kept (prewarm, pipelines made ahead), and kept for the frame path
@@ -658,7 +659,7 @@ static rc_shader* rc_by_slot(uint64_t key, uint64_t slot, int depth_ok) {
     if (!disk_get(slot, &o, &vin_types, &gl_depth, &prim, &control, &c1, &c1_len) || (!depth_ok && rc_depth_stage((int)control->stage))) return NULL;
     r = calloc(1, sizeof *r); r->st = (int)control->stage; r->prim = prim;
     char why[300] = "";
-    rc_make(r, key, &o, control, c1, c1_len, vin_types, 0, why, sizeof why);
+    rc_make(r, key, &o, control, c1, c1_len, vin_types, prim_inputs, why, sizeof why);
     g_cached++;
     unsigned n = ++g_ahead;
     if (*why || !r->sh) { static _Atomic int k; if (atomic_fetch_add(&k, 1) < 64) VRED("recompiled shader %016llx (NVN stage %d, kept): %s", (unsigned long long)key, r->st, *why ? why : "refused"); }
@@ -666,12 +667,19 @@ static rc_shader* rc_by_slot(uint64_t key, uint64_t slot, int depth_ok) {
     pthread_mutex_lock(&g_mu); rc_put(&g_sh, slot, r); pthread_mutex_unlock(&g_mu);
     return r;
 }
-vka_shader* vka_rc_by_key(uint64_t key, int gl_depth) {
+// Lichii: gs_in, a geometry shader's input primitive (vka_rc_gs_input; a prewarm record keeps it), 0 for the other stages
+vka_shader* vka_rc_by_key(uint64_t key, int gl_depth, uint32_t gs_in) {
+    if (gs_in) {   // a geometry shader has a translation per input primitive only, in each depth mode
+        const uint64_t slot = rc_translation_slot(key, gs_in, 2, gl_depth);
+        rc_shader* r = rc_lookup(slot);
+        if (!r) { pthread_mutex_lock(&g_make_mu); r = rc_by_slot(key, slot, 1, gs_in); pthread_mutex_unlock(&g_make_mu); }
+        return r ? r->sh : NULL;
+    }
     const uint64_t own = rc_key(key), depth = rc_translation_slot(key, 0, 0, gl_depth);
     rc_shader* r = rc_lookup(depth);
     if (!r) {
         pthread_mutex_lock(&g_make_mu);
-        if (!(r = rc_by_slot(key, depth, 1)) && depth != own) r = rc_by_slot(key, own, 0);
+        if (!(r = rc_by_slot(key, depth, 1, 0)) && depth != own) r = rc_by_slot(key, own, 0, 0);
         pthread_mutex_unlock(&g_make_mu);
     }
     return r ? r->sh : NULL;

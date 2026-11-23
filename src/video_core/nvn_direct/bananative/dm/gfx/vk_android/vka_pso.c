@@ -791,7 +791,7 @@ void vka_gpl_line(char *out, size_t n) {
 // frame path. A key names shaders by their library key and the state bytes (vka_gkey), not driver code, so one list serves every driver and survives a shader library
 // change (a shader that is no longer in the library drops its records). Records whose shaders are missing are dropped at the next save; the list keeps at most
 // DM_VK_PREWARM_KEEP records (default 16384), and a run makes at most DM_VK_PREWARM_MAX of them (default 8192): about 1 KB of host memory each, plus the driver's pipeline
-typedef struct { uint8_t kind, bad, pad[2]; uint32_t klen; uint64_t key[5]; } pwrec;   // then klen bytes of vka_gkey, padded to 8; kind 0 graphics, 1 compute (key[0])
+typedef struct { uint8_t kind, bad, gs_in, pad; uint32_t klen; uint64_t key[5]; } pwrec;   // then klen bytes of vka_gkey, padded to 8; kind 0 graphics, 1 compute (key[0]); Lichii: gs_in, the geometry shader's input primitive (vka_shader.gs_in)
 typedef struct { char magic[8]; uint32_t gkey_size, n; } pwhdr;      // NXVKPW1 (read only)
 typedef struct { char magic[8]; uint32_t gkey_size, n, layout, pad; } pwhdr2;   // NXVKPW2: layout = gkey_layout(), the key's field offsets (a size that stays the same hides a reordering)
 static const char PW_MAGIC[8] = "NXVKPW1", PW_MAGIC2[8] = "NXVKPW2";
@@ -807,6 +807,7 @@ static int pw_rec_ok(const pwrec *r, const uint8_t *kb) {
     if (r->kind > 1 || !r->key[0] || r->klen > sizeof(vka_gkey)) return 0;
     if (r->kind == 1) return r->klen == 0;
     if (r->klen < offsetof(vka_gkey, va)) return 0;
+    if (r->key[2] ? !r->gs_in || r->gs_in > 5 : r->gs_in) return 0;   // (Lichii: a geometry shader's record names its input primitive; older ones did not)
     vka_gkey k; memset(&k, 0, sizeof k); memcpy(&k, kb, r->klen);
     if (k.ncolor > 8 || k.fs_variant > VKA_FS_RETYPE || (k.samples != 1 && k.samples != 2 && k.samples != 4 && k.samples != 8)) return 0;
     if (k.topo > VK_PRIMITIVE_TOPOLOGY_PATCH_LIST || k.poly_mode > VK_POLYGON_MODE_POINT || k.alpha_func > 8 || k.logic_op > VK_LOGIC_OP_SET) return 0;
@@ -849,6 +850,7 @@ static void pw_note(int kind, vka_shader *const sh[5], const void *kb, uint32_t 
     if (!g_pw_path[0]) return;
     pwrec r; memset(&r, 0, sizeof r); r.kind = (uint8_t)kind; r.klen = klen;
     for (int i = 0; i < 5; i++) r.key[i] = sh[i] ? sh[i]->key : 0;
+    r.gs_in = sh[2] ? sh[2]->gs_in : 0;
     uint64_t h = fnv(kb, klen, fnv(&r, sizeof r, 1469598103934665603ull));
     pthread_mutex_lock(&g_pw_mu);
     if (pw_set_add(h)) { pw_append(&r, kb); g_pw_dirty = 1; }
@@ -965,8 +967,8 @@ static void *pw_main(void *a) {
         vka_shader *sh[VKA_NSTAGE]; memset(sh, 0, sizeof sh); int bad = !pw_rec_ok(&r, kb);
         vka_gkey k; memset(&k, 0, sizeof k); if (!bad && r.kind != 1) memcpy(&k, kb, r.klen < sizeof k ? r.klen : sizeof k);
         if (bad) {}
-        else if (r.kind == 1) { if (!(sh[5] = vka_shader_by_key(r.key[0], 1))) bad = 1; }
-        else for (int s = 0; s < 5; s++) if (r.key[s] && !(sh[s] = vka_shader_by_key(r.key[s], k.gl_depth))) bad = 1;   // (Lichii: recompiled in the record's depth mode)
+        else if (r.kind == 1) { if (!(sh[5] = vka_shader_by_key(r.key[0], 1, 0))) bad = 1; }
+        else for (int s = 0; s < 5; s++) if (r.key[s] && !(sh[s] = vka_shader_by_key(r.key[s], k.gl_depth, s == 2 ? r.gs_in : 0))) bad = 1;   // (Lichii: recompiled in the record's depth mode)
         vka_layout lay;
         if (!bad && !vka_layout_of(sh, r.kind == 1, &lay)) bad = 1;
         int made = 0;
@@ -1238,7 +1240,7 @@ static void lib_ahead_make(vka_shader *s, int part, const vka_gkey *k, int scrat
 }
 static void lib_ahead_one(const ahead_item *it) {
     vka_gkey k; memset(&k, 0, sizeof k); lib_default_key(&k);
-    lib_ahead_make(vka_shader_by_key(it->key, k.gl_depth), it->part, &k, 0);
+    lib_ahead_make(vka_shader_by_key(it->key, k.gl_depth, 0), it->part, &k, 0);
 }
 // A speculative translation's stage library in the most common state, for the caches only (nvn_recompile.c spec_main): part 1 a vertex shader, 2 a pixel shader;
 // s is a vka_shader_scratch one

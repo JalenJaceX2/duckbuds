@@ -406,6 +406,7 @@ typedef struct vka_shader {
     vka_span loop_guard;                // Lichii: a recompiled shader's loop guard word (static memory; none when it has no loops)
     uint16_t scale_tex_binding;         // Lichii: a recompiled shader's first texture binding and that texture's bit in the render scale's push constants
     uint8_t scale_tex_bit, scale_tex_bits;   // (nvn_direct.h nvn_direct_scale_texture_bit; scale_tex_bits 0: no textures)
+    uint8_t gs_in;                      // Lichii: a recompiled geometry shader's input primitive (nvn_recompile.c vka_rc_gs_input), 0 for the other stages
 } vka_shader;
 // by NVN stage; bad: stages whose shader is refused (bit = NVN stage) or VKA_BAD_MISSING (their draws are skipped). Lichii: depth, recompiled shaders' depth mode
 // (1 + gl_depth: the pre-rasterization stages are translated for one, vka_rc_shader; 0: any)
@@ -416,7 +417,7 @@ int vka_progsh_current(const vka_progsh *ps);   // 1 = ps's shaders fit the dept
 int vka_prog_shaders(const prog_t *p, vka_progsh *out);      // 1 = resolved (stages the program lacks are NULL); 0 = no program
 void vka_prog_put(uint64_t serial, const vka_progsh *ps);   // a program made by the host itself (the selftest), by serial
 vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key);
-vka_shader *vka_shader_by_key(uint64_t key, int gl_depth);   // the recompiled shader of key in depth mode gl_depth (vka_rc_by_key); NULL = not translated or refused
+vka_shader *vka_shader_by_key(uint64_t key, int gl_depth, uint32_t gs_in);   // the recompiled shader of key in depth mode gl_depth (vka_rc_by_key); NULL = not translated or refused
 VkShaderModule vka_shader_module(vka_shader *s, int variant);
 VkShaderModule vka_shader_gs_module(vka_shader *s);   // a geometry shader's module with its memory writes made once per primitive (vka_spv_gs_claim)
 #define VKA_SET_FS 2   // Lichii: a graphics pipeline's pixel shader resources: their own set (vka_pso.c layout_slow; its module remapped, vka_shader.c)
@@ -435,7 +436,7 @@ uint32_t vka_rc_gs_input(void);                     // Lichii: 1 + the Shader::I
 vka_shader *vka_rc_shader(const prog_t *p, unsigned i, uint64_t key, uint32_t prim_inputs, int gl_depth, int *st);
 int vka_rc_stage(uint64_t key);         // NVN stage of a kept control section, -1 none
 uint32_t vka_rc_prim(uint64_t key);     // a recompiled mesh shader's generic outputs per primitive
-vka_shader *vka_rc_by_key(uint64_t key, int gl_depth);
+vka_shader *vka_rc_by_key(uint64_t key, int gl_depth, uint32_t gs_in);
 unsigned vka_rc_stage_keys(int st, uint64_t **out);   // the kept translations' shader keys of NVN stage st (malloc'd)
 void vka_rc_counts(unsigned *made, unsigned *kept);    // shaders made this run, of them kept from earlier runs
 size_t vka_rc_spec_pending(void);       // speculative translations whose libraries are not in a saved pipeline cache yet (vka_pso.c save_now)
