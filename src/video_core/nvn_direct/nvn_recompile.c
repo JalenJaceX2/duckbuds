@@ -507,6 +507,31 @@ static void disk_spec_done(uint64_t key) {
     if (g_disk_f) { fwrite(&r, sizeof r, 1, g_disk_f); fflush(g_disk_f); }
     pthread_mutex_unlock(&g_mu);
 }
+// Lichii: a speculative translation that made a stage library is marked in the file only once a pipeline cache save holds that library
+// (vka_pso.c save_now: vka_rc_spec_pending before the copy, vka_rc_spec_commit after the file is written). The library is all it leaves, and it lives in the
+// in-memory cache until a save (at start, every DM_VK_PCACHE_SAVE_S and at the end). Marked at once, as before, a run that ended without its last save
+// (killed, or a hang the bench gave up on) kept the marks and lost the libraries: the next run skipped those shaders, and the ones it met first at a
+// scene change (Ocarina of Time's Deku Tree cutscene: 183 translated and compiled on the frame path, 2.1 s with the GPU's queues waiting) cost the
+// whole compile there. A run whose translations were all made over (a new recompile stamp) reads such a file as "5496 translated speculatively in earlier
+// runs" with only ~320 translations kept
+static uint64_t* g_spec_pend; static size_t g_spec_pend_n, g_spec_pend_cap;   // keys made this run, not marked in the file yet (under g_mu)
+static void spec_made(uint64_t key) {
+    pthread_mutex_lock(&g_mu); rc_put(&g_spec_done, rc_key(key), (void*)1);   // (this run does not make it again)
+    if (g_spec_pend_n == g_spec_pend_cap) { size_t nc = g_spec_pend_cap ? 2 * g_spec_pend_cap : 1024; uint64_t* n = realloc(g_spec_pend, nc * sizeof *n); if (n) { g_spec_pend = n; g_spec_pend_cap = nc; } }
+    if (g_spec_pend_n < g_spec_pend_cap) g_spec_pend[g_spec_pend_n++] = key;   // (no room: not marked, a later run makes it again)
+    pthread_mutex_unlock(&g_mu);
+}
+size_t vka_rc_spec_pending(void) { pthread_mutex_lock(&g_mu); size_t n = g_spec_pend_n; pthread_mutex_unlock(&g_mu); return n; }
+void vka_rc_spec_commit(size_t n) {   // the first n pending keys' libraries are in the saved pipeline cache: marked in the file
+    pthread_mutex_lock(&g_mu); disk_open();
+    if (n > g_spec_pend_n) n = g_spec_pend_n;
+    if (g_disk_f && n) {
+        for (size_t i = 0; i < n; i++) { rc_rec r; memset(&r, 0, sizeof r); r.magic = RC_SPEC_MAGIC; r.size = sizeof r; r.key = g_spec_pend[i]; fwrite(&r, sizeof r, 1, g_disk_f); }
+        fflush(g_disk_f);
+    }
+    memmove(g_spec_pend, g_spec_pend + n, (g_spec_pend_n - n) * sizeof *g_spec_pend); g_spec_pend_n -= n;
+    pthread_mutex_unlock(&g_mu);
+}
 // The kept translations' shader keys of NVN stage st (not the pixel shaders' per-primitive variants, valid only in mesh pipelines), malloc'd into *out: how many
 // (vka_pso.c lib_ahead_start: their stage libraries are made ahead, so a pair the frame path has not met only needs the fast link)
 unsigned vka_rc_stage_keys(int st, uint64_t** out) {
@@ -640,7 +665,8 @@ vka_shader* vka_rc_by_key(uint64_t key, int gl_depth) {
 // modules are the same (2 in 3 of those made in time in mkw-race: about 2 in 3 vertex and 2 in 5 pixel shaders) that library is a cache hit instead of a compile on
 // the frame path. Newest first: Mario Kart World sets ~4,000 programs and draws ~900, those it set last soonest. First-met content (cold, the NVIDIA disk cache off):
 // libraries compiled on the frame path 0.54 -> 0.41-0.43 per shader made (615 / 596 -> 448-515 a race), frame-path creation 54-56 -> 47-50 s; warm runs unchanged.
-// Each shader done is marked in vk_recompiled.bin (disk_spec_done), so a warm run does not translate again the ones the game sets and never draws.
+// Each shader done is marked in vk_recompiled.bin (disk_spec_done; one with a library once a pipeline cache save holds it: spec_made), so a warm run does not
+// translate again the ones the game sets and never draws.
 // Threads: an eighth of the host's, 1 to 4 (nice 10).
 typedef struct { uint64_t key, data; const rc_control* control; } spec_item;
 static spec_item* g_spec; static size_t g_spec_n, g_spec_cap; static int g_spec_up;
@@ -674,8 +700,8 @@ static void spec_one(spec_item it) {
     if (s) vka_lib_ahead_shader(s, st == 0 ? 1 : 2);
     vka_shader_scratch_free(s);
     if (L) { free((void*)L->base); free(L); }
-    disk_spec_done(it.key);
-    if (!s) { g_spec_failed++; return; }
+    if (!s) { g_spec_failed++; disk_spec_done(it.key); return; }
+    spec_made(it.key);
     unsigned n = ++g_spec_made;
     if (n == 1 || !(n & (n - 1))) VLOG("recompiler: %u shaders translated speculatively and their libraries made (%u kept or drawn already, %u not translated without a draw, %u too large)", n, (unsigned)g_spec_skipped, (unsigned)g_spec_failed, (unsigned)g_spec_huge);
 }
@@ -725,7 +751,7 @@ void vka_rc_destroy(void) {
     for (size_t i = 0; i < g_nlibs; i++) { free((void*)g_libs[i]->base); free(g_libs[i]); }
     free(g_libs);
     rc_map_free(&g_sh, 1); rc_map_free(&g_ctl, 1); rc_map_free(&g_disk, 1); rc_map_free(&g_spec_done, 0);
-    free(g_guards); free(g_spec);
+    free(g_guards); free(g_spec); free(g_spec_pend);
     if (g_disk_f) fclose(g_disk_f);
 }
 

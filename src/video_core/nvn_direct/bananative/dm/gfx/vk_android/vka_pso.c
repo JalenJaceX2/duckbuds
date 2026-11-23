@@ -227,8 +227,9 @@ void vka_pso_start(void) { vka_bindless_init(); pc_open(); }   // (Lichii, from 
 static void save_now(void) {
     uint64_t t = now_ns();
     uint64_t made = __atomic_load_n(&g_made, __ATOMIC_RELAXED);
+    const size_t spec = vka_rc_spec_pending();   // (before the copy: their libraries are in it)
     size_t n = 0; void *d = NULL;
-    if (g_pc && g_pc_path[0] && made != g_saved_at) {
+    if (g_pc && g_pc_path[0] && (made != g_saved_at || spec)) {
         // The cache grows between the size query and the copy while prewarm and optimizer threads add pipelines: the copy then answers VK_INCOMPLETE with a partial
         // blob. Tried up to 3 times with a quarter more room; only a complete copy (VK_SUCCESS) is written
         VkResult gr = VK_INCOMPLETE;
@@ -242,7 +243,7 @@ static void save_now(void) {
             char tmp[1100]; snprintf(tmp, sizeof tmp, "%s.tmp", g_pc_path);
             FILE *f = fopen(tmp, "wb");
             int ok = f && fwrite(d, 1, n, f) == n; if (f && fclose(f)) ok = 0;   // (closed once, whatever failed)
-            if (ok && !rename(tmp, g_pc_path)) g_saved_at = made;
+            if (ok && !rename(tmp, g_pc_path)) { g_saved_at = made; vka_rc_spec_commit(spec); }
             else { unlink(tmp); static _Atomic int k; if (atomic_fetch_add(&k, 1) < 2) VRED("pipeline cache not written to %s", g_pc_path); free(d); d = NULL; n = 0; }
         }
     }
