@@ -421,6 +421,7 @@ static inline void chunk_check(void) {
     if (cp > 0 && in >= (uint64_t)cp && vka_rp_open_for(&S.rt, S.has_rt)) { vka_rp_end(); chunk(); }
 }
 static uint64_t g_cur_fence;   // the fence of the submission being replayed, reserved before it (vka_worker.c); 0 = reserved at its commit
+uint64_t vka_rp_fence(void) { return g_cur_fence ? g_cur_fence : vka_fence_last() + 1; }   // Lichii: the fence this submission commits with (vka_draw.c vc_bind: a copy's last reader)
 uint64_t vka_rp_sub_commit(uint64_t reserved) {
     uint64_t fence = reserved ? reserved : vka_fence_next(); g_cur_fence = 0;
     if (g_qn >= 0) g_qt[g_qn].last = fence;   // (queue_move)

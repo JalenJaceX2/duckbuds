@@ -674,75 +674,282 @@ static int cpu_read(uint64_t addr, void *out, size_t n) {   // guest bytes as th
     return !plat_mem_read(addr, out, n);
 }
 static int rd_cb(void *ctx, uint64_t addr, void *out, size_t n) { (void)ctx; return cpu_read(addr, out, n); }
-// A uniform buffer: bound in place when Vulkan's offset alignment allows, else a copy of what the CPU sees now (a GPU write earlier in this submission is missed: logged)
-// ---------- Device-local copies of guest buffers (experiment, Lichii) ----------
-// Guest RAM is system memory the GPU imports (vka_mem.c: a host-pointer import of type HOST_VISIBLE|HOST_CACHED, not device local), so every vertex fetch and uniform
-// read crosses PCIe. DM_VK_XP_VB_VRAM=1 / DM_VK_XP_UB_VRAM=1 (live): vertex streams / uniform buffers read a device-local copy of their bound range, made in an upload
-// batch (which runs before the part it is recorded beside) the first time a range is bound and again after the CPU wrote its pages (nvn_dirty stamps, as tracked
-// textures). A range copied more than 4 times, or larger than 64 MiB, reads guest RAM as before. GPU writes into a copied range are not seen (wrong picture where the
-// GPU writes vertex or uniform data): an experiment to measure where the GPU time goes, not a fix
-enum { VC_N = 1 << 15 };
-#define VC_ARENA ((VkDeviceSize)768 << 20)
-typedef struct { uint64_t addr, size, stamp; const void *span; const uint8_t *phys; VkDeviceSize off; uint32_t copies; uint8_t state; } vc_ent;   // state 0 empty, 1 copied, 2 guest RAM; phys: where the CPU writes the bytes
-static vc_ent *g_vc; static VkBuffer g_vc_buf; static VkDeviceMemory g_vc_mem; static VkDeviceSize g_vc_top; static int g_vc_failed;
-static uint64_t g_vc_bytes, g_vc_ncopy, g_vc_nrecopy, g_vc_hit, g_vc_bypass, g_vc_why[6], g_vc_untracked, g_vc_trk_direct, g_vc_trk_vpool;   // why: size, table, copied too often or arena full, not one segment, no upload batch, kept in guest RAM
+// ---------- VRAM vertex cache (Lichii) ----------
+// Guest RAM is system memory the GPU imports (vka_mem.c: a host-pointer import, not device local), so every vertex fetch from it crosses PCIe: in Duskbloods' lobby the
+// vertex streams alone were ~20 ms of a ~33 ms GPU frame (runs ab1-ab3). A bound vertex range is read from a device-local copy instead, made in an upload batch (which goes
+// to the queue before the part it is recorded beside, vka_dev.c "Upload batches"). A copy is never written again once a draw may read it: a refresh goes to a new place
+// (the clean bytes copied from the old one on the GPU, the CPU-written pages from guest RAM), and the old place is reused once the last submission that read it is done.
+//   - CPU writes: the dirty tracker's pages of the memory the CPU writes (for a virtual pool, the physical pool behind it: nvn_vpool_phys), stamped and protected before
+//     the copy; a range is checked once a submission (and again after a GPU write or an invalidation);
+//   - GPU writes (copies, fills, inline updates, stores into storage buffers, texture → buffer copies; vka_tex.c gw_add, and pages raw global memory stores wrote once
+//     their submission is done): marked per 64 KiB of the buffer the GPU addresses (vka_addr_run: a virtual pool's range and its physical pool are the same bytes there)
+//     with the writer's fence. A range under a write not yet done reads guest RAM (the upload batch could run before the write); once it is done, the range is copied again;
+//   - a range refreshed or under GPU writes again and again (4 times, each within 3 frames of the last) reads guest RAM for 300 frames, unprotected;
+//   - budget: one device-local arena (DM_VK_VB_CACHE_MB, default 1024, at most a quarter of the free device budget), first fit; when it is full, the copies bound least
+//     recently are dropped (their places reused once their submissions are done);
+//   - ranges of more than 64 MiB, not in one placed segment, or in a virtual pool not backed by one run of physical pages read guest RAM.
+// Not cached: index buffers (bound without a size), uniform buffers (the DM_VK_XP_UB_VRAM experiment, run ab3: no gain, and its copies went stale), transform feedback (not on Vulkan).
+// DM_VK_VB_CACHE=0 (live): every stream reads guest RAM. Replay thread only (the GPU-write hooks run on it too)
+enum { VC_N = 1 << 16, VC_PROBE = 64, VC_GWR = 1 << 16, VC_GWR_SHIFT = 16, VC_LATE = 4096 };
+#define VC_NONE (~(VkDeviceSize)0)
+#define VC_MAXR ((uint64_t)64 << 20)
+enum { VW_OFF, VW_SIZE, VW_TABLE, VW_UNTRACKED, VW_SPLIT, VW_SEGMENT, VW_GPU, VW_CHURN, VW_FULL, VW_BATCH, VW_N };   // why a range reads guest RAM
+typedef struct {
+    uint64_t addr, size;                   // the bound range (the key)
+    const uint8_t *phys; const void *span; // where the CPU writes its bytes and the dirty tracker's range there
+    VkBuffer sb; VkDeviceSize so;          // the bytes as the GPU addresses them (vka_addr_run): copied from there, GPU writes matched there
+    uint64_t vgen, mgen;                   // nvn_sparse_gen / vka_mem_gen at the resolve
+    uint64_t stamp, gwchk, ep, fence;      // dirty generation at the copy, GPU-write generation it includes, cache epoch, last submission that read it
+    uint64_t msub, mgw, mep;               // validated in this submission at this GPU-write generation and epoch (memo)
+    VkDeviceSize off;                      // the copy in the arena (VC_NONE: none)
+    uint32_t last, rframe, cool;           // frame last bound, frame of the last refresh, end of a cooldown
+    uint8_t live, kind, why, churn, mok;   // kind: 1 tracked directly, 2 through a virtual pool, 0 untracked (why); mok, why: the memo's answer
+} vc_ent;
+static vc_ent *g_vc; static VkBuffer g_vc_buf; static VkDeviceMemory g_vc_mem; static VkDeviceSize g_vc_size, g_vc_used; static int g_vc_failed;
+static uint64_t g_vc_ep = 1, g_vc_gwgen = 1;
+static uint64_t g_vc_hit, g_vc_miss, g_vc_why[VW_N], g_vc_new, g_vc_rcpu, g_vc_rgpu, g_vc_rep, g_vc_bytes_g, g_vc_bytes_v, g_vc_evict, g_vc_trk[3];
+// The arena's free places (sorted, merged) and the places waiting for their last reader's fence
+typedef struct { VkDeviceSize off, len; } vc_ext;
+static vc_ext *g_vfree; static int g_nvfree, g_cvfree;
+static struct { VkDeviceSize off, len; uint64_t fence; } g_vlate[VC_LATE]; static int g_nvlate;
+// GPU writes: per 64 KiB of a buffer (hashed: a collision costs a copy or a guest-RAM bind, never a stale one), the newest write's generation and fence (UINT64_MAX: in
+// the submission being recorded, given its fence at the commit); writes over more than 64 MiB go to g_vgw_all
+static struct { uint64_t gen, fence; } g_vgw[VC_GWR], g_vgw_all;
+static uint32_t *g_vgw_cur; static int g_nvgw_cur, g_cvgw_cur; static int g_vgw_all_cur;
+static struct { uint64_t a, n, fence; } g_vgw_done[1024]; static int g_nvgw_done, g_vgw_done_lost;   // done writes reported under the image table's lock (gml_poll), marked at the next bind
+uint64_t nvn_sparse_gen(void); int nvn_vpool_phys(uint64_t a, uint64_t n, const uint8_t **phys);   // hle_nvn.c
+uint64_t vka_rp_fence(void); uint64_t vka_frame(void); uint64_t vka_mem_gen(void);   // vka_exec.c: the fence of the submission being recorded, the frame; vka_mem.c
+static uint64_t g_vc_sub = 1;   // submissions committed (vka_vc_gpu_commit): the validation memo's clock
+
 static int vc_init(void) {
     if (g_vc_buf || g_vc_failed) return g_vc_buf != VK_NULL_HANDLE;
     g_vc_failed = 1;
-    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = VC_ARENA, .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    if (vk.vkCreateBuffer(V.dev, &bi, NULL, &g_vc_buf)) { g_vc_buf = VK_NULL_HANDLE; VRED("vertex/uniform copies: no buffer"); return 0; }
+    VkDeviceSize want = (VkDeviceSize)VKA_ENV("DM_VK_VB_CACHE_MB", 1024) << 20; uint64_t use, bud;
+    if (vka_mem_budget(&use, &bud) && bud > use && want > (bud - use) / 4) want = (bud - use) / 4 & ~(VkDeviceSize)0xFFFFF;
+    if (want < (16u << 20)) { VRED("VRAM vertex cache: %llu MiB is too small: vertex streams read guest RAM", (unsigned long long)(want >> 20)); return 0; }
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = want, .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    if (vk.vkCreateBuffer(V.dev, &bi, NULL, &g_vc_buf)) { g_vc_buf = VK_NULL_HANDLE; VRED("VRAM vertex cache: no buffer: vertex streams read guest RAM"); return 0; }
     VkMemoryRequirements mr; vk.vkGetBufferMemoryRequirements(V.dev, g_vc_buf, &mr);
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = vka_mem_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)};
-    if (ai.memoryTypeIndex == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g_vc_mem) || vk.vkBindBufferMemory(V.dev, g_vc_buf, g_vc_mem, 0) || !(g_vc = calloc(VC_N, sizeof *g_vc))) {
-        vk.vkDestroyBuffer(V.dev, g_vc_buf, NULL); g_vc_buf = VK_NULL_HANDLE; VRED("vertex/uniform copies: no device memory"); return 0; }
+    if (ai.memoryTypeIndex == UINT32_MAX || vk.vkAllocateMemory(V.dev, &ai, NULL, &g_vc_mem) || vk.vkBindBufferMemory(V.dev, g_vc_buf, g_vc_mem, 0) || !(g_vc = calloc(VC_N, sizeof *g_vc))
+        || !(g_vfree = malloc(64 * sizeof *g_vfree))) {
+        if (g_vc_mem) vk.vkFreeMemory(V.dev, g_vc_mem, NULL);
+        vk.vkDestroyBuffer(V.dev, g_vc_buf, NULL); g_vc_buf = VK_NULL_HANDLE; free(g_vc); g_vc = NULL; VRED("VRAM vertex cache: no device memory: vertex streams read guest RAM"); return 0; }
+    g_cvfree = 64; g_nvfree = 1; g_vfree[0] = (vc_ext){0, want}; g_vc_size = want;
     vka_mem_grew(mr.size); g_vc_failed = 0;
-    VLOG("vertex/uniform copies: %llu MiB of device memory (type %u)", (unsigned long long)(VC_ARENA >> 20), ai.memoryTypeIndex);
+    VLOG("VRAM vertex cache: %llu MiB of device memory (type %u)", (unsigned long long)(want >> 20), ai.memoryTypeIndex);
     return 1;
 }
-// The copy of [addr, addr + size) for this draw: 1 = *b / *o are it (an upload batch copies it before the part runs), 0 = read guest RAM
-static int vc_get(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
-    #define VC_NO(w) do { g_vc_bypass++; g_vc_why[w]++; return 0; } while (0)
-    if (!vc_init()) return 0;
-    if (!size || size > (64u << 20)) VC_NO(0);
-    uint64_t h = (addr ^ size * 0x9E3779B97F4A7C15ull) * 0xff51afd7ed558ccdull; vc_ent *e = NULL;
-    for (uint32_t i = 0; i < 64; i++) { vc_ent *x = &g_vc[(h + i) & (VC_N - 1)]; if (!x->state || (x->addr == addr && x->size == size)) { e = x; break; } }
-    if (!e) VC_NO(1);   // (the table's neighbourhood is full)
-    if (e->state == 2) VC_NO(5);
-    // (an untracked range, a pool the CPU cannot write such as a virtual pool's pages or a CPU_NO_ACCESS pool: copied once)
-    if (e->state == 1 && (!e->span || !nvn_dirty_since_span(e->span, e->phys, size, e->stamp))) { g_vc_hit++; *b = g_vc_buf; *o = e->off; return 1; }
-    // A virtual pool has no span of its own: its CPU writes land in the physical pool behind it (nvn_vpool_phys), whose span sees them
-    if (!e->state) { int nvn_vpool_phys(uint64_t a, uint64_t n, const uint8_t **phys);
-                     e->addr = addr; e->size = size; e->phys = (const uint8_t *)(uintptr_t)addr; e->span = nvn_dirty_span(e->phys, size);
-                     if (e->span) g_vc_trk_direct++; else if (nvn_vpool_phys(addr, size, &e->phys) > 0 && (e->span = nvn_dirty_span(e->phys, size))) g_vc_trk_vpool++; else g_vc_untracked++; }
-    if (e->copies >= 4 || g_vc_top + size + 256 > VC_ARENA) { e->state = 2; VC_NO(2); }
-    VkBuffer sb; VkDeviceSize so; uint64_t run = vka_addr_run(addr, size, &sb, &so);
-    if (run < size) { e->state = 2; VC_NO(3); }
+
+// ---- The arena: first fit over the free places; a place a draw may still read waits for its fence
+static void vc_free_now(VkDeviceSize off, VkDeviceSize len) {
+    int i = 0; while (i < g_nvfree && g_vfree[i].off < off) i++;
+    int prev = i > 0 && g_vfree[i - 1].off + g_vfree[i - 1].len == off, next = i < g_nvfree && off + len == g_vfree[i].off;
+    if (prev && next) { g_vfree[i - 1].len += len + g_vfree[i].len; memmove(&g_vfree[i], &g_vfree[i + 1], (size_t)(g_nvfree - i - 1) * sizeof *g_vfree); g_nvfree--; }
+    else if (prev) g_vfree[i - 1].len += len;
+    else if (next) { g_vfree[i].off = off; g_vfree[i].len += len; }
+    else {
+        if (g_nvfree == g_cvfree) { vc_ext *n = realloc(g_vfree, 2 * (size_t)g_cvfree * sizeof *g_vfree); if (!n) { VRED_ONCE("VRAM vertex cache: out of memory for its free list: places are lost"); return; } g_vfree = n; g_cvfree *= 2; }
+        memmove(&g_vfree[i + 1], &g_vfree[i], (size_t)(g_nvfree - i) * sizeof *g_vfree); g_vfree[i] = (vc_ext){off, len}; g_nvfree++;
+    }
+    g_vc_used -= len;
+}
+static void vc_reclaim(void) {
+    uint64_t done = vka_done(); int k = 0;
+    for (int i = 0; i < g_nvlate; i++) { if (g_vlate[i].fence <= done) vc_free_now(g_vlate[i].off, g_vlate[i].len); else g_vlate[k++] = g_vlate[i]; }
+    g_nvlate = k;
+}
+static void vc_free_later(VkDeviceSize off, VkDeviceSize len, uint64_t fence) {
+    if (g_nvlate == VC_LATE) vc_reclaim();
+    if (g_nvlate == VC_LATE) { vka_wait_done(g_vlate[0].fence, vka_hang_ns()); vc_reclaim(); }   // (4096 places waiting: the oldest is a frame or two away)
+    if (g_nvlate == VC_LATE) { VRED_ONCE("VRAM vertex cache: a place is lost (its reader's fence did not come)"); return; }
+    g_vlate[g_nvlate].off = off; g_vlate[g_nvlate].len = len; g_vlate[g_nvlate].fence = fence; g_nvlate++;
+}
+static VkDeviceSize vc_len(uint64_t size) { return (size + 255) & ~(VkDeviceSize)255; }
+static void vc_drop(vc_ent *e) { if (e->off != VC_NONE) { vc_free_later(e->off, vc_len(e->size), e->fence); e->off = VC_NONE; } }
+static VkDeviceSize vc_take(VkDeviceSize len) {
+    for (int i = 0; i < g_nvfree; i++) if (g_vfree[i].len >= len) {
+        VkDeviceSize off = g_vfree[i].off; g_vfree[i].off += len; g_vfree[i].len -= len;
+        if (!g_vfree[i].len) { memmove(&g_vfree[i], &g_vfree[i + 1], (size_t)(g_nvfree - i - 1) * sizeof *g_vfree); g_nvfree--; }
+        g_vc_used += len; return off;
+    }
+    return VC_NONE;
+}
+// A place of len bytes: the waiting places reclaimed, then the copies bound least recently dropped (older than 600, 120, 30, 8, then 2 frames) until one fits
+static VkDeviceSize vc_alloc(VkDeviceSize len, uint32_t f) {
+    VkDeviceSize off = vc_take(len); if (off != VC_NONE) return off;
+    vc_reclaim(); if ((off = vc_take(len)) != VC_NONE) return off;
+    static const uint32_t ages[] = {600, 120, 30, 8, 2};
+    for (size_t a = 0; a < sizeof ages / sizeof *ages; a++) {
+        for (uint32_t i = 0; i < VC_N; i++) { vc_ent *e = &g_vc[i]; if (e->live && e->off != VC_NONE && f - e->last > ages[a]) { vc_drop(e); g_vc_evict++; } }
+        vc_reclaim(); if ((off = vc_take(len)) != VC_NONE) return off;
+    }
+    return VC_NONE;
+}
+
+// ---- GPU writes
+static uint32_t vgw_slot(VkBuffer b, VkDeviceSize r) { return (uint32_t)((((uint64_t)(uintptr_t)b ^ r * 0x9E3779B97F4A7C15ull) * 0xff51afd7ed558ccdull) >> 32) & (VC_GWR - 1); }
+static int g_vgw_changed;   // a slot took a write in this vgw_range call
+static void vgw_set(uint64_t *gen, uint64_t *fence, uint64_t f) {   // a slot (or g_vgw_all) takes a write of fence f (UINT64_MAX: this submission's)
+    if (*fence == UINT64_MAX && f == UINT64_MAX) return;   // (pending in this submission already: a range under it reads guest RAM until the write is done)
+    *gen = g_vc_gwgen + 1; g_vgw_changed = 1;
+    if (*fence != UINT64_MAX && (f == UINT64_MAX || f > *fence)) *fence = f;
+}
+static void vgw_all(uint64_t f) { if (f == UINT64_MAX && g_vgw_all.fence != UINT64_MAX) g_vgw_all_cur = 1; vgw_set(&g_vgw_all.gen, &g_vgw_all.fence, f); }
+static void vgw_mark(VkBuffer b, VkDeviceSize off, uint64_t n, uint64_t f) {
+    uint64_t r0 = off >> VC_GWR_SHIFT, r1 = (off + n - 1) >> VC_GWR_SHIFT;
+    if (r1 - r0 >= VC_GWR) { vgw_all(f); return; }   // (4 GiB and more: every range)
+    for (uint64_t r = r0; r <= r1; r++) {
+        uint32_t s = vgw_slot(b, r);
+        if (f == UINT64_MAX && g_vgw[s].fence != UINT64_MAX) {   // its fence comes at the commit
+            if (g_nvgw_cur == g_cvgw_cur) { uint32_t *p = realloc(g_vgw_cur, (size_t)(g_cvgw_cur ? 2 * g_cvgw_cur : 1024) * sizeof *p); if (!p) { vgw_all(f); return; } g_vgw_cur = p; g_cvgw_cur = g_cvgw_cur ? 2 * g_cvgw_cur : 1024; }
+            g_vgw_cur[g_nvgw_cur++] = s;
+        }
+        vgw_set(&g_vgw[s].gen, &g_vgw[s].fence, f);
+    }
+}
+static void vgw_range(uint64_t addr, uint64_t n, uint64_t f) {   // [addr, addr + n) written by the GPU at fence f, in buffer terms
+    if (!n) return;   // (followed from the start, cache made or not: a range copied later may lie under a write still in flight)
+    static uint64_t la, ln, lsub;   // the same pending write again in this submission (a storage buffer bound draw after draw): nothing new
+    if (f == UINT64_MAX && addr == la && n == ln && lsub == g_vc_sub) return;
+    if (f == UINT64_MAX) { la = addr; ln = n; lsub = g_vc_sub; }
+    g_vgw_changed = 0;
+    while (n) {
+        VkBuffer b; VkDeviceSize o; uint64_t k = vka_addr_run(addr, n, &b, &o);
+        if (!k) { vgw_all(f); break; }   // (not placed: every range, to be safe)
+        vgw_mark(b, o, k, f); addr += k; n -= k;
+    }
+    if (g_vgw_changed) g_vc_gwgen++;
+}
+void vka_vc_gpu_write(uint64_t addr, uint64_t n) { vgw_range(addr, n, UINT64_MAX); }   // vka_tex.c gw_add: a GPU write recorded in this submission
+void vka_vc_gpu_commit(uint64_t fence) {   // vka_tex.c vka_tex_gw_commit: this submission's writes get its fence
+    for (int i = 0; i < g_nvgw_cur; i++) if (g_vgw[g_vgw_cur[i]].fence == UINT64_MAX) g_vgw[g_vgw_cur[i]].fence = fence;
+    g_nvgw_cur = 0;
+    if (g_vgw_all_cur && g_vgw_all.fence == UINT64_MAX) g_vgw_all.fence = fence;
+    g_vgw_all_cur = 0;
+    g_vc_sub++;   // (also ends vgw_range's repeat filter: the next submission's writes are new)
+}
+void vka_vc_gpu_done(uint64_t addr, uint64_t n, uint64_t fence) {   // vka_tex.c gml_poll (under its lock): a done write found by a raw global memory log
+    if (g_nvgw_done == (int)(sizeof g_vgw_done / sizeof *g_vgw_done)) { g_vgw_done_lost = 1; return; }
+    g_vgw_done[g_nvgw_done].a = addr; g_vgw_done[g_nvgw_done].n = n; g_vgw_done[g_nvgw_done].fence = fence; g_nvgw_done++;
+}
+void vka_vc_invalidate(void) { g_vc_ep++; }   // GPU writes the host could not follow (a raw global memory log full or missing): every copy is made again
+static void vgw_done_flush(void) {
+    if (g_vgw_done_lost) { g_vgw_done_lost = 0; g_vc_ep++; }
+    for (int i = 0; i < g_nvgw_done; i++) vgw_range(g_vgw_done[i].a, g_vgw_done[i].n, g_vgw_done[i].fence);
+    g_nvgw_done = 0;
+}
+// GPU writes over e since its copy: 0 none, 1 done (copy it again), 2 one not done (read guest RAM)
+static int vgw_state(const vc_ent *e) {
+    uint64_t gen = 0, f = 0;
+    if (g_vgw_all.gen > e->gwchk) { gen = g_vgw_all.gen; f = g_vgw_all.fence; }
+    for (uint64_t r = e->so >> VC_GWR_SHIFT, r1 = (e->so + e->size - 1) >> VC_GWR_SHIFT; r <= r1; r++) {
+        uint32_t s = vgw_slot(e->sb, r);
+        if (g_vgw[s].gen > e->gwchk) { gen = 1; if (g_vgw[s].fence > f) f = g_vgw[s].fence; }
+    }
+    if (!gen) return 0;
+    return f == UINT64_MAX || f > vka_done() ? 2 : 1;
+}
+
+// ---- Ranges
+static void vc_resolve(vc_ent *e) {   // where the CPU writes e's bytes and where the GPU addresses them
+    e->vgen = nvn_sparse_gen(); e->mgen = vka_mem_gen(); e->kind = 0;
+    if (vka_addr_run(e->addr, e->size, &e->sb, &e->so) < e->size) { e->why = VW_SEGMENT; return; }
+    e->phys = (const uint8_t *)(uintptr_t)e->addr;
+    if ((e->span = nvn_dirty_span(e->phys, e->size))) { e->kind = 1; return; }
+    int r = nvn_vpool_phys(e->addr, e->size, &e->phys);
+    if (r > 0 && (e->span = nvn_dirty_span(e->phys, e->size))) { e->kind = 2; return; }
+    e->why = r < 0 ? VW_SPLIT : VW_UNTRACKED;
+}
+// A refresh or a GPU write not done, at frame f: 1 = the range has been at it 4 times, each within 3 frames of the last: guest RAM for 300 frames
+static int vc_churn(vc_ent *e, uint32_t f) {
+    e->churn = f - e->rframe <= 3 ? (uint8_t)(e->churn + 1) : 1; e->rframe = f;
+    if (e->churn < 4) return 0;
+    e->churn = 0; e->cool = f + 300; vc_drop(e); return 1;
+}
+// e copied into a new place in an upload batch: all of it (full), or [lo, hi) from guest RAM and the rest from its old copy. 0 = not copied, why in *why
+static int vc_copy(vc_ent *e, int full, size_t lo, size_t hi, uint32_t f, int *why) {
+    if (e->off == VC_NONE) full = 1;
+    VkDeviceSize len = vc_len(e->size), off = vc_alloc(len, f);
+    if (off == VC_NONE) { *why = VW_FULL; return 0; }
     VkCommandBuffer ub = vka_up_begin();
-    if (!ub || !vka_up_is(ub)) { if (ub) vka_up_end(); VC_NO(4); }
-    #undef VC_NO
-    if (e->span) { e->stamp = nvn_dirty_now(); nvn_dirty_protect(e->phys, size); }   // (the stamp before the GPU reads the bytes: a write after it copies again)
-    const VkDeviceSize off = (g_vc_top + 255) & ~(VkDeviceSize)255; g_vc_top = off + size;   // a new place each time: an earlier copy may still be read by work in flight
-    VkBufferCopy c = {so, off, size}; vk.vkCmdCopyBuffer(ub, sb, g_vc_buf, 1, &c);
+    if (!ub || !vka_up_is(ub)) { if (ub) vka_up_end(); vc_free_now(off, len); *why = VW_BATCH; return 0; }
+    e->stamp = nvn_dirty_now(); nvn_dirty_protect(e->phys, e->size);   // (the stamp before the GPU reads the bytes: a write after it is seen at the next check)
+    if (full) { lo = 0; hi = e->size; }
+    VkBufferCopy c = {e->so + lo, off + lo, hi - lo}; vk.vkCmdCopyBuffer(ub, e->sb, g_vc_buf, 1, &c);
+    VkBufferCopy keep[2]; uint32_t nk = 0;
+    if (!full && lo) keep[nk++] = (VkBufferCopy){e->off, off, lo};
+    if (!full && hi < e->size) keep[nk++] = (VkBufferCopy){e->off + hi, off + hi, e->size - hi};
+    if (nk) vk.vkCmdCopyBuffer(ub, g_vc_buf, g_vc_buf, nk, keep);   // (the old place was written by an earlier batch, which ended with a full barrier)
     vka_barrier(ub); vka_up_end();
-    if (e->copies++) g_vc_nrecopy++;
-    g_vc_ncopy++; g_vc_bytes += size;
-    e->state = 1; e->off = off; *b = g_vc_buf; *o = off; return 1;
+    g_vc_bytes_g += hi - lo; g_vc_bytes_v += e->size - (hi - lo);
+    vc_drop(e); e->off = off; e->ep = g_vc_ep;
+    return 1;
+}
+// The copy of [addr, addr + size) for this draw: 1 = *b / *o are it, 0 = read guest RAM
+static int vc_bind(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
+    #define VC_NO(w) do { g_vc_miss++; g_vc_why[w]++; return 0; } while (0)
+    static int was_on;
+    const int on = VKA_ENV("DM_VK_VB_CACHE", 1) != 0;
+    if (on != was_on) { was_on = on; if (on) g_vc_ep++; }   // (switched on again: every copy is made again)
+    if (!on) VC_NO(VW_OFF);
+    if (size > VC_MAXR) VC_NO(VW_SIZE);
+    if (!vc_init()) return 0;
+    if (g_nvgw_done || g_vgw_done_lost) vgw_done_flush();
+    const uint32_t f = (uint32_t)vka_frame();
+    uint64_t h = (addr ^ size * 0x9E3779B97F4A7C15ull) * 0xff51afd7ed558ccdull; vc_ent *e = NULL, *old = NULL;
+    for (uint32_t i = 0; i < VC_PROBE; i++) {
+        vc_ent *x = &g_vc[(h + i) & (VC_N - 1)];
+        if (!x->live) { old = x; break; }   // (slots are never emptied: the chain ends here)
+        if (x->addr == addr && x->size == size) { e = x; break; }
+        if (f - x->last > 2 && (!old || (int32_t)(x->last - old->last) < 0)) old = x;   // the least recently bound, if not bound in the last 2 frames
+    }
+    if (!e) {   // a new range, in an empty slot or in place of the least recently bound one of the neighbourhood
+        if (!old) VC_NO(VW_TABLE);
+        if (old->live) { vc_drop(old); g_vc_evict++; }
+        e = old; memset(e, 0, sizeof *e); e->live = 1; e->addr = addr; e->size = size; e->off = VC_NONE; e->rframe = f - 100; e->cool = f;
+        vc_resolve(e); g_vc_trk[e->kind]++;
+    }
+    e->last = f;
+    if (e->msub == g_vc_sub && e->mgw == g_vc_gwgen && e->mep == g_vc_ep) {   // validated in this submission, nothing changed since
+        if (!e->mok) VC_NO(e->why);
+        g_vc_hit++; e->fence = vka_rp_fence(); *b = g_vc_buf; *o = e->off; return 1;
+    }
+    e->msub = g_vc_sub; e->mgw = g_vc_gwgen; e->mep = g_vc_ep; e->mok = 0;
+    if ((int32_t)(e->cool - f) > 0) { e->why = VW_CHURN; VC_NO(VW_CHURN); }
+    // A mapping or a segment changed, or the pool went (a new pool over the same memory has a span of its own, and its bytes were not tracked before it): resolved
+    // again, copied again if its memory moved
+    if (e->vgen != nvn_sparse_gen() || e->mgen != vka_mem_gen() || (e->kind && nvn_dirty_span(e->phys, e->size) != e->span)) {
+        const uint8_t *p = e->phys; const void *sp = e->span; VkBuffer sb = e->sb; VkDeviceSize so = e->so; int k = e->kind;
+        vc_resolve(e); if (e->kind != k || e->phys != p || e->span != sp || e->sb != sb || e->so != so) vc_drop(e);
+    }
+    if (!e->kind) VC_NO(e->why);
+    const int gw = vgw_state(e);
+    if (gw == 2) { vc_churn(e, f); e->why = VW_GPU; VC_NO(VW_GPU); }
+    int full = e->off == VC_NONE || e->ep != g_vc_ep || gw == 1; size_t lo = 0, hi = e->size;
+    if (full || nvn_dirty_bounds_since(e->span, e->phys, e->size, e->stamp, &lo, &hi)) {
+        const int fresh = e->off == VC_NONE;
+        if (!fresh && vc_churn(e, f)) { e->why = VW_CHURN; VC_NO(VW_CHURN); }
+        int why; if (!vc_copy(e, full, lo, hi, f, &why)) { e->msub = 0; e->why = (uint8_t)why; VC_NO(why); }   // (not memoized: the next bind tries again)
+        if (fresh) g_vc_new++; else if (gw == 1) g_vc_rgpu++; else if (full) g_vc_rep++; else g_vc_rcpu++;
+    }
+    #undef VC_NO
+    e->gwchk = g_vc_gwgen; e->mok = 1;
+    g_vc_hit++; e->fence = vka_rp_fence(); *b = g_vc_buf; *o = e->off; return 1;
 }
 void vka_vc_stats(char *b, size_t n, double frames) {
-    static uint64_t c0, r0, h0, y0, by0;
+    static uint64_t h0, m0, c0, y0;
     if (!g_vc || frames <= 0) { if (n) b[0] = 0; return; }
-    snprintf(b, n, "vertex/uniform copies per frame: %.0f bound from copies, %.0f from guest RAM, %.1f copies (%.1f again after a CPU write), %.2f MiB copied; arena %.0f of %llu MiB; "
-             "guest RAM since the start by reason: size %llu, table %llu, copied too often / arena full %llu, not in one segment %llu, no upload batch %llu, kept there %llu; ranges tracked %llu directly, %llu through a virtual pool's physical pages, %llu untracked (copied once)",
-             (g_vc_hit - h0) / frames, (g_vc_bypass - by0) / frames, (g_vc_ncopy - c0) / frames, (g_vc_nrecopy - r0) / frames, (g_vc_bytes - y0) / frames / 1048576.0, g_vc_top / 1048576.0,
-             (unsigned long long)(VC_ARENA >> 20), (unsigned long long)g_vc_why[0], (unsigned long long)g_vc_why[1], (unsigned long long)g_vc_why[2], (unsigned long long)g_vc_why[3],
-             (unsigned long long)g_vc_why[4], (unsigned long long)g_vc_why[5], (unsigned long long)g_vc_trk_direct, (unsigned long long)g_vc_trk_vpool, (unsigned long long)g_vc_untracked);
-    c0 = g_vc_ncopy; r0 = g_vc_nrecopy; h0 = g_vc_hit; y0 = g_vc_bytes; by0 = g_vc_bypass;
+    snprintf(b, n, "VRAM vertex cache per frame: %.0f streams bound from VRAM, %.0f from guest RAM, %.1f copies, %.2f MiB copied; %.0f of %.0f MiB used",
+             (g_vc_hit - h0) / frames, (g_vc_miss - m0) / frames, (g_vc_new + g_vc_rcpu + g_vc_rgpu + g_vc_rep - c0) / frames, (g_vc_bytes_g + g_vc_bytes_v - y0) / frames / 1048576.0,
+             g_vc_used / 1048576.0, g_vc_size / 1048576.0);
+    h0 = g_vc_hit; m0 = g_vc_miss; c0 = g_vc_new + g_vc_rcpu + g_vc_rgpu + g_vc_rep; y0 = g_vc_bytes_g + g_vc_bytes_v;
 }
+// A uniform buffer: bound in place when Vulkan's offset alignment allows, else a copy of what the CPU sees now (a GPU write earlier in this submission is missed: logged)
 static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
     if (!size || size > V.ub_range) size = size ? V.ub_range : 65536 < V.ub_range ? 65536 : V.ub_range;
     VkBuffer b; VkDeviceSize o;
     uint64_t run = vka_addr_run(addr, size, &b, &o);
-    if (run >= size && !(o % V.ub_align) && !(addr % V.ub_align) && VKA_ENV("DM_VK_XP_UB_VRAM", 0) && vc_get(addr, size, &b, &o)) { *bi = (VkDescriptorBufferInfo){b, o, size}; return 1; }
     if (run && !(o % V.ub_align) && !(addr % V.ub_align)) { *bi = (VkDescriptorBufferInfo){b, o, run}; return 1; }
     vka_span s; if (!vka_scratch(size, V.ub_align, &s)) return 0;
     if (!cpu_read(addr, s.ptr, size)) { memset(s.ptr, 0, size); VRED_ONCE("uniform buffer at %#llx is not readable: it reads zeros", (unsigned long long)addr); }
@@ -1274,7 +1481,7 @@ static void vin_bind(const vka_dstate *d) {
         VkBuffer b = g_zero.buf; VkDeviceSize o = g_zero.off, sz = 65536;
         uint64_t addr = d->vbuf[st].address, size = d->vbuf[st].size;
         if (addr && !VKA_ENV("DM_VK_XP_VB_ZERO", 0)) { VkBuffer cb; VkDeviceSize co; uint64_t run = vka_addr_run(addr, size ? size : 1ull << 30, &cb, &co);
-                    if (run && size && run >= size && VKA_ENV("DM_VK_XP_VB_VRAM", 0) && vc_get(addr, size, &cb, &co)) { b = cb; o = co; sz = size; }
+                    if (run && size && run >= size && vc_bind(addr, size, &cb, &co)) { b = cb; o = co; sz = size; }   // (the VRAM vertex cache)
                     else if (run) { b = cb; o = co; sz = run; } else VRED_ONCE("vertex stream at %#llx is not in placed guest RAM: it reads zeros", (unsigned long long)addr); }
         vb_set(st, b, o, sz, &n0, &nn, rb, ro, rs);
     }

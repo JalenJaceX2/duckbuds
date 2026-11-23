@@ -737,8 +737,10 @@ static uint64_t mem_hash(const uint8_t *p, uint64_t n) { uint64_t h = 1469598103
 enum { GW_COPY, GW_FILL, GW_UPDATE, GW_OPAQUE };
 typedef struct { uint64_t lo, hi, src, seq, fence; uint32_t kind, value; uint8_t *data; } gw_t;
 static gw_t *g_gw; static int g_ngw, g_gwcap; static uint64_t g_gwseq = 1, g_gw_redo, g_gw_over, g_gw_late;
+void vka_vc_gpu_write(uint64_t addr, uint64_t n); void vka_vc_gpu_done(uint64_t addr, uint64_t n, uint64_t fence); void vka_vc_gpu_commit(uint64_t fence); void vka_vc_invalidate(void);   // vka_draw.c: the VRAM vertex cache
 static void gw_add(int kind, uint64_t dst, uint64_t n, uint64_t src, uint32_t value, const void *data) {
     if (!n) return;
+    vka_vc_gpu_write(dst, n);
     pthread_mutex_lock(&g_tmu);
     if (g_ngw == g_gwcap) { g_gwcap = g_gwcap ? 2 * g_gwcap : 256; g_gw = realloc(g_gw, (size_t)g_gwcap * sizeof *g_gw); }
     if (kind == GW_OPAQUE)   // the same range again in this submission (a storage buffer bound by draw after draw): one entry, at the newest place
@@ -762,7 +764,7 @@ int vka_tex_gml_take(VkDescriptorBufferInfo *bi) {   // 0 = no log free (the cal
     for (int i = 0; i < GML_N; i++) if (!g_gml[i].used && g_gml[i].s.ptr) {
         g_gml[i].used = 1; g_gml[i].fence = 0; memset(g_gml[i].s.ptr, 0, GML_BYTES);
         *bi = (VkDescriptorBufferInfo){g_gml[i].s.buf, g_gml[i].s.off, GML_BYTES}; pthread_mutex_unlock(&g_tmu); return 1; }
-    g_gml_none++; pthread_mutex_unlock(&g_tmu);
+    g_gml_none++; pthread_mutex_unlock(&g_tmu); vka_vc_invalidate();   // (stores nobody follows: the vertex cache copies everything again)
     VRED_ONCE("more than %d raw global memory write logs in flight: stores of later draws are not followed into textures", GML_N);
     return 0;
 }
@@ -770,11 +772,11 @@ static void gml_poll(void) {   // caller holds g_tmu
     uint64_t done = vka_done();
     for (int i = 0; i < GML_N; i++) {
         if (!g_gml[i].used || !g_gml[i].fence || g_gml[i].fence > done) continue;
-        const uint32_t *w = (const uint32_t *)g_gml[i].s.ptr; g_gml_full += w[0] != 0;
+        const uint32_t *w = (const uint32_t *)g_gml[i].s.ptr; g_gml_full += w[0] != 0; if (w[0]) vka_vc_invalidate();
         if (w[0]) VRED_ONCE("a raw global memory write log ran out of slots: some stores are not followed into textures");
         for (int k = 1; k <= 1 << DMSH_GMEM_LOG_LOG2; k++) if (w[k]) {
             if (g_ngw == g_gwcap) { g_gwcap = g_gwcap ? 2 * g_gwcap : 256; g_gw = realloc(g_gw, (size_t)g_gwcap * sizeof *g_gw); }
-            uint64_t a = nvn_direct_host_of((uint64_t)w[k] << 12); g_gw[g_ngw++] = (gw_t){a, a + 4096, 0, g_gwseq++, g_gml[i].fence, GW_OPAQUE, 0, NULL}; g_gml_pages++;
+            uint64_t a = nvn_direct_host_of((uint64_t)w[k] << 12); g_gw[g_ngw++] = (gw_t){a, a + 4096, 0, g_gwseq++, g_gml[i].fence, GW_OPAQUE, 0, NULL}; g_gml_pages++; vka_vc_gpu_done(a, 4096, g_gml[i].fence);
         }
         g_gml[i].used = 0;
     }
@@ -876,6 +878,7 @@ void vka_tex_gw_commit(uint64_t fence) {   // the writes recorded since the last
     for (int i = g_ngw - 1; i >= 0 && !g_gw[i].fence; i--) g_gw[i].fence = fence;
     for (int i = 0; i < GML_N; i++) if (g_gml[i].used && !g_gml[i].fence) g_gml[i].fence = fence;
     pthread_mutex_unlock(&g_tmu);
+    vka_vc_gpu_commit(fence);
 }
 // The storage [mem, mem + n) as the GPU sees it after the writes recorded so far: NULL = memory as it is (no pending write over it), else a malloc'd copy with the pending writes
 // applied in order. *seen = the newest write the content includes with every older one (the writes not done and not applied, opaque ones, cap it). Caller holds g_tmu
