@@ -1880,7 +1880,7 @@ static void read_texels_storage(const tex_t *t, unsigned level, unsigned layer0,
     }
     free(lin); free(part);
 }
-// Lichii: DM_VK_RTDUMP=<present>:<dir> (diagnostic): at that present, once the GPU has done everything submitted, level 0 / layer 0 of every colour image the GPU has
+// Lichii: DM_VK_RTDUMP=<present>:<dir> (diagnostic): at that present's fill, once the GPU has done everything submitted before it, level 0 / layer 0 of every colour image the GPU has
 // written is read back into <dir>/rt-<serial>-<w>x<h>-nvn<format>-vk<VkFormat>.raw (rows packed, as tools/nx2 can convert), for finding the first wrong render target of a frame
 void vka_tex_rt_dump(const char *dir) {
     pthread_mutex_lock(&g_tmu);
@@ -1888,7 +1888,15 @@ void vka_tex_rt_dump(const char *dir) {
     for (int i = 0; l && i < g_nlive; i++) { vka_img *im = g_live[i];
         if (im->gpu_owned && im->f.kind < 3 && im->samples == 1 && !im->scaled && im->f.bw == 1 && (im->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT))) { im->refs++; l[n++] = im; } }
     pthread_mutex_unlock(&g_tmu);
-    mtl_wait(mtl_last_fence(), 5000000000ull);
+    // Every submission handed to the GPU so far done on every queue (vka_wait_done: completion in fence order, not the last fence's own queue alone), or nothing is read.
+    // Called by the present's fill (nvn_present.c), in replay order: the fences the game reserved for submissions the worker has not reached are not waited for
+    const uint64_t last = vka_fence_queued();
+    if (vka_hung() || !vka_wait_done(last, 5000000000ull)) {
+        for (int i = 0; i < n; i++) vka_tex_drop(l[i]);
+        free(l);
+        VRED("DM_VK_RTDUMP: the submissions up to fence %llu were not done within 5 s: nothing read back", (unsigned long long)last);
+        return;
+    }
     int ok = 0;
     for (int i = 0; i < n; i++) { vka_img *im = l[i];
         const int nz = im->d.target == NVN_TEXTURE_TARGET_3D ? (int)im->depth : 1;   // (a 3D image whole: its slices one after the other)

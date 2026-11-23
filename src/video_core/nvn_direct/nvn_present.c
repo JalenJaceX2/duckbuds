@@ -94,6 +94,12 @@ static void frame_path_creation(uint64_t tk) {
 }
 uint64_t vka_present_filled(void) { return g_filled; }   // (the replay thread, which fills them)
 void vka_present_fill(uint64_t tk, const tex_t* t, double period_s, const int crop[4]) {
+    {   // DM_VK_RTDUMP=<present>:<dir> (vka_tex.c vka_tex_rt_dump): on the replay worker, where the present stands in replay order, nothing more submitted meanwhile
+        static const char* dump = (const char*)1;
+        if (dump == (const char*)1) dump = getenv("DM_VK_RTDUMP");
+        char* colon;
+        if (dump && strtoull(dump, &colon, 10) == tk && *colon == ':') { void vka_tex_rt_dump(const char*); vka_tex_rt_dump(colon + 1); }
+    }
     vka_perf_frame(period_s);
     frame_path_creation(tk);
     // The presenting queue's last submission (handed to the queue: the worker fills presents in
@@ -194,12 +200,6 @@ int nvn_direct_present_take(nvn_direct_frame* out) {
         static _Atomic int n;
         if (atomic_fetch_add(&n, 1) < 8) VRED("present %llu: fence %llu has no GPU signal: dropped", (unsigned long long)tk, (unsigned long long)p.fence);
         return 0;
-    }
-    {   // DM_VK_RTDUMP=<present>:<dir> (vka_tex.c vka_tex_rt_dump)
-        static const char* dump = (const char*)1;
-        if (dump == (const char*)1) dump = getenv("DM_VK_RTDUMP");
-        char* colon;
-        if (dump && strtoull(dump, &colon, 10) == tk && *colon == ':') { void vka_tex_rt_dump(const char*); vka_tex_rt_dump(colon + 1); }
     }
     vka_img* im = vka_tex_acquire(p.serial);
     if (!im) return 0;   // the replay never drew or uploaded it (a boot frame): nothing to show
