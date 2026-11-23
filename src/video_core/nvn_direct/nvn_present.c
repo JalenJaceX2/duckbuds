@@ -179,6 +179,9 @@ static VkImageView frame_view(const vka_img* im, VkFormat format) {
 // turns: Duskbloods' lobby ~11 + ~15 ms, run readtexels2). One frame more latency. The window's acquire still waits for Lichii's composite of an image before the game
 // draws into it again (nvn_direct_present_composite_pending). Switching it drops the present held, or shows nothing for one present
 static _Thread_local uint64_t t_lagged;
+// Lichii: tickets the take skipped (a present's frame never handed over: its ticket jumped past last_tk+1), for DM_VK_PRESENT_STATS (core/nvn_hook.cpp)
+static _Atomic uint64_t g_take_gaps;
+uint64_t nvn_direct_present_gaps(void) { return atomic_load(&g_take_gaps); }
 int nvn_direct_present_take(nvn_direct_frame* out) {
     memset(out, 0, sizeof *out);
     out->interval = t_interval ? t_interval : 1;
@@ -188,6 +191,7 @@ int nvn_direct_present_take(nvn_direct_frame* out) {
     uint64_t tk = now_tk;
     if (VKA_ENV("DM_VK_PRESENT_LAG", 1)) { tk = t_lagged; t_lagged = now_tk; if (!tk) return 0; }
     else t_lagged = 0;
+    { static _Thread_local uint64_t last_tk; if (last_tk && tk > last_tk + 1) atomic_fetch_add(&g_take_gaps, tk - last_tk - 1); last_tk = tk; }
     pthread_mutex_lock(&g_mu);
     while (g_filled < tk && !vka_stopping()) pthread_cond_wait(&g_cv, &g_mu);
     const pres_t p = g_pres[tk % NPRES];

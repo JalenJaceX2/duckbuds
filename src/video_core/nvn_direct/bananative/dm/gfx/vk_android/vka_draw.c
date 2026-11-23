@@ -191,18 +191,23 @@ static int statics(void) {
 }
 
 // ---------- Descriptor sets that do not fit a push (per submission slot) ----------
-enum { NSLOT = 8, MAXPOOLS = 64 };
+enum { NSLOT = 64, MAXPOOLS = 64 };   // Lichii: NSLOT must equal vka_exec.c NSLOT (a slot's pools are reset when that slot is taken again)
 static VkDescriptorPool g_dp[NSLOT][MAXPOOLS]; static int g_ndp[NSLOT], g_cur_dp[NSLOT];
 void vka_dyn_invalidate(void);
 static void drv_memo_reset(void);
 static void fsc_reset(void);
+static struct { VkDescriptorSetLayout l; VkDescriptorSet s[16]; int n, next; } g_sb[16];   // Lichii: set_alloc's batches (DM_VK_REC_SETBATCH)
 void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot) {
     g_cb = cb; g_slot = slot % NSLOT; vka_dyn_invalidate();
     { void vka_mem_rec_thread(void); vka_mem_rec_thread(); }   // the address lookups' cache outside TLS for the recording thread (vka_mem.c)
     drv_memo_reset();   // the last submission's scratch spans go with its fence
     g_prof = VKA_ENV("DM_VK_PROF", 0) != 0; g_dyn_filter = VKA_ENV("DM_VK_DYN_FILTER", 1); g_pass_keep = VKA_ENV("DM_VK_PASS_KEEP", 1); g_vb_filter = VKA_ENV("DM_VK_VB_FILTER", 1);   // live: from this submission
     for (int i = 0; i < g_ndp[g_slot]; i++) vk.vkResetDescriptorPool(V.dev, g_dp[g_slot][i], 0);   // the slot's last submission is done (mtl_sub_begin waited for it)
-    g_cur_dp[g_slot] = 0;
+    {   // Lichii: DM_VK_DPOOL_KEEP (live, default 4; 0 = keep all): pools beyond it are destroyed (the slot's sets are all dead, its fence was waited for; not after a hang, the GPU may still read them), so 64 slots do not each keep the pools of their biggest submission. A later big submission makes them again (set_alloc)
+        int keep = VKA_ENV("DM_VK_DPOOL_KEEP", 4);
+        if (keep > 0 && g_ndp[g_slot] > keep && !vka_hung()) { for (int i = keep; i < g_ndp[g_slot]; i++) { vk.vkDestroyDescriptorPool(V.dev, g_dp[g_slot][i], NULL); g_dp[g_slot][i] = VK_NULL_HANDLE; } g_ndp[g_slot] = keep; }
+    }
+    g_cur_dp[g_slot] = 0; memset(g_sb, 0, sizeof g_sb);   // (Lichii: the batches' sets went with the pools' reset)
     fsc_reset();   // (Lichii: its sets were the slot's)
     vka_pso_save(0);
     static int ph; VkImageView placeholder(uint8_t dim, int storage);
@@ -212,7 +217,21 @@ void vka_draw_sub_begin(VkCommandBuffer cb, unsigned slot) {
     }
 }
 int vka_dpool_count(void) { int n = 0; for (int i = 0; i < NSLOT; i++) n += g_ndp[i]; return n; }   // (Lichii: the VRAM line)
+// Lichii: DM_VK_REC_SETBATCH=1 (live, default 0): sets of one layout are taken from the pool in batches (1, 2, 4 .. 16 a call, growing as the layout keeps being asked for) and handed out one by one: a
+// vkAllocateDescriptorSets call (driver, pool lock, on the replay thread) a set was the cost of every pixel shader set the cache (fs_set_of) missed. The leftovers of a batch stay in their pool (reset
+// with it at the submission's start: g_sb is emptied there) and count against its 1024 sets; a layout that takes the entry of another starts again at 1 so a thrashing pair wastes none
 static VkDescriptorSet set_alloc(VkDescriptorSetLayout l) {
+    if (VKA_ENV("DM_VK_REC_SETBATCH", 0)) {
+        typeof(g_sb[0]) *e = &g_sb[((uintptr_t)l >> 4) & 15];
+        if (e->l != l) { e->l = l; e->n = 0; e->next = 1; }
+        if (e->n) return e->s[--e->n];
+        int sz = e->next, i = g_cur_dp[g_slot]; e->next = sz < 16 ? sz * 2 : 16;
+        if (sz > 1 && i < g_ndp[g_slot]) {   // (an exhausted or missing pool: the loop below moves on or makes one)
+            VkDescriptorSetLayout ls[16]; for (int j = 0; j < sz; j++) ls[j] = l;
+            VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_dp[g_slot][i], .descriptorSetCount = (uint32_t)sz, .pSetLayouts = ls};
+            if (!vk.vkAllocateDescriptorSets(V.dev, &ai, e->s)) { e->n = sz; return e->s[--e->n]; }
+        }
+    }
     for (;;) {
         int i = g_cur_dp[g_slot];
         if (i == g_ndp[g_slot]) {
@@ -274,13 +293,17 @@ static int rt_same(const p_set_rt *a, int ha, const p_set_rt *b, int hb) {
 }
 // Game barriers (OP_BARRIER) that came with a pass open: taken inside it (DM_VK_BAR_KEEP), ended it at once, ended it later at a draw that needed it (bar_hazard)
 static uint64_t g_bar_in, g_bar_kept, g_bar_late;
+extern int vka_xprof; uint64_t now_ns(void); uint64_t vka_t_rpend, vka_t_rp_begin;   // Lichii: DM_VK_PROF (vka_exec.c xp_stats): ns in a pass end (its barrier too) and in rp_begin when it opens a pass
 void vka_rp_end(void) {
     if (PC.n) pc_flush();
     if (!R.on) return;
+    const uint64_t xe_ = vka_xprof ? now_ns() : 0;
+    { extern void vka_occl_pass_end(void); vka_occl_pass_end(); }   // Lichii: DM_VK_OCCL: an occlusion query ends inside its pass (vka_exec.c)
     vk.vkCmdEndRendering(g_cb);
-    vka_barrier(g_cb);   // the pass's writes before whatever reads them next (copies, the present, the next pass's samples)
+    vka_barrier_pe(g_cb);   // the pass's writes before whatever reads them next (copies, the present, the next pass's samples)
     R.on = 0; vka_tex_feedback(NULL, NULL, 0);
     if (vka_nan_on()) vka_nan_pass(g_cb, R.cim, R.clv, R.cl0, R.nci);
+    if (vka_xprof) vka_t_rpend += now_ns() - xe_;
 }
 static void rt_range(const vka_img *im, const view_t *v, int has_v, uint32_t *lv, uint32_t *l0, uint32_t *nl) {
     *lv = has_v && v->set_levels ? v->base_level : 0;
@@ -502,7 +525,8 @@ static int rp_begin(const p_set_rt *rt, int has_rt, const vka_dstate *d) {
     }
     rts_note(w, h, d, dp || sp);
     vk.vkCmdBeginRendering(g_cb, &ri);
-    R.on = 1; vka_n_rp++; if (g_dyn_filter == 2) vka_dyn_invalidate();   // DM_VK_DYN_FILTER=2: the dynamic state set again at each pass (bisect)
+    R.on = 1; vka_n_rp++; { extern void vka_occl_pass_begin(void); vka_occl_pass_begin(); }   // Lichii: DM_VK_OCCL: a pending occlusion query begins in the pass (vka_exec.c)
+    if (g_dyn_filter == 2) vka_dyn_invalidate();   // DM_VK_DYN_FILTER=2: the dynamic state set again at each pass (bisect)
     for (int k = 0; k < nlate; k++) { VkClearAttachment c = {late[k]->asp, late[k]->ci >= 0 ? (uint32_t)late[k]->ci : 0, late[k]->in}; VkClearRect cr = {late[k]->rc, 0, layers}; vk.vkCmdClearAttachments(g_cb, 1, &c, 1, &cr); }
     PC.n = 0;
     return 1;
@@ -687,7 +711,8 @@ static int rd_cb(void *ctx, uint64_t addr, void *out, size_t n) { (void)ctx; ret
 //   - a range refreshed or under GPU writes again and again (4 times, each within 3 frames of the last) reads guest RAM for 300 frames, unprotected;
 //   - budget: one device-local arena (DM_VK_VB_CACHE_MB, default 1024, at most a quarter of the free device budget), first fit; when it is full, the copies bound least
 //     recently are dropped (their places reused once their submissions are done);
-//   - ranges of more than 64 MiB, not in one placed segment, or in a virtual pool not backed by one run of physical pages read guest RAM.
+//   - ranges of more than 64 MiB (VC_MAXR: a bound size is the whole pool behind the mesh, not what the draw reads; DM_VK_VB_BIG=1, vc_prefix, caches only the first bytes the draw
+//     reads: the key is that prefix, so everything below is the ordinary range above), not in one placed segment, or in a virtual pool not backed by one run of physical pages read guest RAM.
 // Not cached: index buffers (bound without a size), uniform buffers (the DM_VK_XP_UB_VRAM experiment, run ab3: no gain, and its copies went stale), transform feedback (not on Vulkan).
 // DM_VK_VB_CACHE=0 (live): every stream reads guest RAM. Replay thread only (the GPU-write hooks run on it too)
 enum { VC_N = 1 << 16, VC_PROBE = 64, VC_GWR = 1 << 16, VC_GWR_SHIFT = 16, VC_LATE = 4096 };
@@ -908,6 +933,17 @@ static int vc_copy(vc_ent *e, int full, size_t lo, size_t hi, uint32_t f, int *w
     vc_drop(e); e->off = off; e->ep = g_vc_ep;
     return 1;
 }
+// Lichii: DM_VK_VB_DYN=1 (live, default 0): a small range the CPU rewrites every frame ("written again and again") is refreshed in VRAM each time instead of reading guest RAM for 300
+// frames: the same copy path as any CPU write (stamped and protected before the copy, only the dirty part copied), so it cannot be stale; it only skips the churn cooldown.
+// Bounded per range (DM_VK_VB_DYN_KB, default 256 KiB) and per frame (DM_VK_VB_DYN_MB bytes copied, default 8): past either, the old cooldown rule applies. GPU writes still cool down.
+static uint64_t g_vc_imemo, g_vc_dyn, g_vc_dyn_bytes, g_vc_big;   // refreshes the cooldown would have refused, their bytes; streams of ranges over 64 MiB served from VRAM (DM_VK_VB_BIG)
+static int vc_dyn_ok(uint32_t f, uint64_t bytes) {
+    static uint32_t df; static uint64_t used;
+    if (!VKA_ENV("DM_VK_VB_DYN", 0) || bytes > ((uint64_t)VKA_ENV("DM_VK_VB_DYN_KB", 256) << 10)) return 0;
+    if (df != f) { df = f; used = 0; }
+    if (used + bytes > ((uint64_t)VKA_ENV("DM_VK_VB_DYN_MB", 8) << 20)) return 0;
+    used += bytes; g_vc_dyn++; g_vc_dyn_bytes += bytes; return 1;
+}
 // The copy of [addr, addr + size) for this draw: 1 = *b / *o are it, 0 = read guest RAM
 static int vc_bind(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
     #define VC_NO(w) do { g_vc_miss++; g_vc_why[w]++; return 0; } while (0)
@@ -951,7 +987,7 @@ static int vc_bind(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
     int full = e->off == VC_NONE || e->ep != g_vc_ep || gw == 1; size_t lo = 0, hi = e->size;
     if (full || nvn_dirty_bounds_since(e->span, e->phys, e->size, e->stamp, &lo, &hi)) {
         const int fresh = e->off == VC_NONE;
-        if (!fresh && vc_churn(e, f)) { e->why = VW_CHURN; VC_NO(VW_CHURN); }
+        if (!fresh && !vc_dyn_ok(f, full ? e->size : hi - lo) && vc_churn(e, f)) { e->why = VW_CHURN; VC_NO(VW_CHURN); }
         int why; if (!vc_copy(e, full, lo, hi, f, &why)) { e->msub = 0; e->why = (uint8_t)why; VC_NO(why); }   // (not memoized: the next bind tries again)
         if (fresh) g_vc_new++; else if (gw == 1) g_vc_rgpu++; else if (full) g_vc_rep++; else g_vc_rcpu++;
     }
@@ -974,6 +1010,8 @@ void vka_vc_stats(char *b, size_t n, double frames) {
                                      (g_vc_bytes_v - y0[1]) / frames / 1048576.0, (g_vc_evict - ev0) / frames, (faults - fl0) / frames, g_vc_used / 1048576.0, g_vc_size / 1048576.0, g_nvlate,
                                      (unsigned long long)g_vc_trk[1], (unsigned long long)g_vc_trk[2], (unsigned long long)g_vc_trk[0], (unsigned long long)g_vc_wn,
                                      (unsigned long long)g_vc_wseen, (unsigned long long)g_vc_wbad);
+    { static uint64_t d0, db0, g0, im0; if (k < n) snprintf(b + k, n - k, "; DM_VK_VB_DYN %.2f refreshes a frame (%.3f MiB), DM_VK_VB_BIG %.1f streams of ranges over 64 MiB from VRAM (%.1f index scans saved by the memo)", (g_vc_dyn - d0) / frames, (g_vc_dyn_bytes - db0) / frames / 1048576.0, (g_vc_big - g0) / frames, (g_vc_imemo - im0) / frames);
+      d0 = g_vc_dyn; db0 = g_vc_dyn_bytes; g0 = g_vc_big; im0 = g_vc_imemo; }
     h0 = g_vc_hit; m0 = g_vc_miss; memcpy(w0, g_vc_why, sizeof w0); memcpy(c0, c, sizeof c0); y0[0] = g_vc_bytes_g; y0[1] = g_vc_bytes_v; ev0 = g_vc_evict; fl0 = faults;
 }
 // A uniform buffer: bound in place when Vulkan's offset alignment allows, else a copy of what the CPU sees now (a GPU write earlier in this submission is missed: logged)
@@ -1229,11 +1267,39 @@ static int stage_writes(const vka_dstate *d, int st, const vka_shader *sh, const
 // Each stage's bindings, walked once a draw or dispatch (walk_all): the images first used are made from them (make_images), then set 0 is written from them (bind_sets)
 static struct { int n[VKA_NSTAGE], pool[VKA_NSTAGE]; char why[VKA_NSTAGE][200]; vka_res r[VKA_NSTAGE][512]; } g_wk;
 uint64_t vka_frame(void);
+// Lichii: DM_VK_REC_WALK=1 (live, default 0): a stage's walk is not made again when its inputs are the last walk's: the same shader, the stage's slice of the bindings (uniform and storage buffer
+// ranges, texture / sampler / image handles, the pools' bases) byte for byte, and every guest word the walk read still holding the value it read (those words are logged as host pointers on the
+// walk that made the memo and compared in place), with no memory segment placed or released since (vka_mem_gen: the pointers stay valid). g_wk.r[st] is then still that walk's result: only walk_all
+// writes it, and it drops the memo of a stage that has no shader or whose walk it cannot keep (a refused walk, a read off placed memory, more than 48 words)
+typedef struct { int valid, nlog, tex_base, samp_base; const vka_shader *sh; uint64_t key, gen; vka_range ubo[16], ssbo[16]; uint64_t tex[VKA_NTEX], samp[128], img[32]; struct { const void *hp; uint8_t n, v[8]; } log[48]; } wmemo;
+static wmemo g_wm[VKA_NSTAGE];
+static int wl_rd(void *ctx, uint64_t addr, void *out, size_t n) {   // cpu_read, logging the words it finds in placed memory
+    wmemo *m = ctx;
+    if (n <= 8 && m->nlog >= 0 && m->nlog < 48 && vka_addr(addr, n, NULL, NULL, NULL)) {
+        const void *hp = (const void *)(uintptr_t)nvn_direct_host_of(addr); memcpy(out, hp, n);
+        m->log[m->nlog].hp = hp; m->log[m->nlog].n = (uint8_t)n; memcpy(m->log[m->nlog].v, out, n); m->nlog++; return 1; }
+    m->nlog = -1; return cpu_read(addr, out, n);
+}
+static int wm_same(const wmemo *m, const vka_bstate *b, int st, const vka_shader *s, uint64_t gen) {
+    if (!m->valid || m->sh != s || m->key != s->key || m->gen != gen || m->tex_base != b->tex_base || m->samp_base != b->samp_base) return 0;
+    if (memcmp(m->ubo, b->ubo[st], sizeof m->ubo) || memcmp(m->ssbo, b->ssbo[st], sizeof m->ssbo) || memcmp(m->tex, b->tex[st], sizeof m->tex) || memcmp(m->samp, b->samp[st], sizeof m->samp) || memcmp(m->img, b->img[st], sizeof m->img)) return 0;
+    for (int i = 0; i < m->nlog; i++) if (memcmp(m->log[i].hp, m->log[i].v, m->log[i].n)) return 0;
+    return 1;
+}
 static void walk_all(const vka_dstate *d, vka_shader *const sh[VKA_NSTAGE]) {
     uint64_t t0_ = g_prof ? cntvct() : 0;
+    const int memo = VKA_ENV("DM_VK_REC_WALK", 0); const uint64_t gen = memo ? vka_mem_gen() : 0;
     for (int st = 0; st < VKA_NSTAGE; st++) {
-        vka_shader *s = sh[st]; g_wk.n[st] = 0; g_wk.pool[st] = 0; if (!s) continue;
-        g_wk.n[st] = vka_walk(&d->b, st, s->e, s->b, s->lib->h->ssbo_align, V.sb_align, rd_cb, NULL, g_wk.r[st], 512, &g_wk.pool[st], g_wk.why[st], sizeof g_wk.why[st]);
+        vka_shader *s = sh[st];
+        if (memo && s && wm_same(&g_wm[st], &d->b, st, s, gen)) continue;   // (g_wk.n / pool / why / r[st] are the memo's walk's: nothing wrote them since)
+        g_wm[st].valid = 0; g_wk.n[st] = 0; g_wk.pool[st] = 0; if (!s) continue;
+        wmemo *m = &g_wm[st]; m->nlog = 0;
+        g_wk.n[st] = vka_walk(&d->b, st, s->e, s->b, s->lib->h->ssbo_align, V.sb_align, memo ? wl_rd : rd_cb, memo ? (void *)m : NULL, g_wk.r[st], 512, &g_wk.pool[st], g_wk.why[st], sizeof g_wk.why[st]);
+        if (memo && g_wk.n[st] >= 0 && m->nlog >= 0) {
+            m->sh = s; m->key = s->key; m->gen = gen; m->tex_base = d->b.tex_base; m->samp_base = d->b.samp_base;
+            memcpy(m->ubo, d->b.ubo[st], sizeof m->ubo); memcpy(m->ssbo, d->b.ssbo[st], sizeof m->ssbo); memcpy(m->tex, d->b.tex[st], sizeof m->tex); memcpy(m->samp, d->b.samp[st], sizeof m->samp); memcpy(m->img, d->b.img[st], sizeof m->img);
+            m->valid = 1;
+        }
     }
     if (g_prof) g_ps[0] += cntvct() - t0_;
 }
@@ -1452,7 +1518,14 @@ static int resolve(const prog_t *p, int st, vka_shader **out, unsigned *bad) {
 // Vertex input: an attribute per input location the vertex shader reads (Location = NVN attribute index), each from its stream; an input no attribute feeds reads a zero buffer.
 // With VK_EXT_vertex_input_dynamic_state the descriptions are set per draw, else they go into the pipeline key
 static struct { VkVertexInputBindingDescription2EXT b[33]; VkVertexInputAttributeDescription2EXT a[32]; uint32_t nb, na, used, zb; int zero; } VI;
+// Lichii: DM_VK_REC_VIN=1 (live, default 0): the last draw's vertex input kept with the inputs that made it (the shader's input mask and types, the attribute and stream state): a draw with the
+// same inputs keeps VI as it is (only vin_build writes it) and takes the class bits from the memo; the vin_bind compare of VI against what the command buffer holds becomes a generation compare.
+// =2: also no vkCmdSetVertexInputEXT again after each pipeline bind (Vulkan keeps dynamic vertex input across vkCmdBindPipeline; the hardening in vin_bind is skipped: A/B on the device)
+static struct { int valid; uint32_t mask, nattr, vin_u, vin_s; uint64_t types; va_st attr[16]; vs_st stream[16]; } VM; static uint64_t g_vi_gen;
 static void vin_build(const vka_dstate *d, const vka_shader *vs, vka_gkey *k) {
+    const int memo = V.vin_dyn && VKA_ENV("DM_VK_REC_VIN", 0) > 0;
+    if (memo && VM.valid && VM.mask == vs->e->vin_mask && VM.types == vs->e->vin_types && VM.nattr == (uint32_t)d->nattr && !memcmp(VM.attr, d->attr, sizeof VM.attr) && !memcmp(VM.stream, d->stream, sizeof VM.stream)) { k->vin_u |= VM.vin_u; k->vin_s |= VM.vin_s; return; }
+    VM.valid = 0; g_vi_gen++;   // (VI is rebuilt: the memo is gone until the end of this build, and what vin_bind copied is another generation)
     VI.nb = VI.na = VI.used = 0; VI.zero = 0;
     VI.zb = V.max_vin_bindings > 32 ? 31 : V.max_vin_bindings > 16 ? V.max_vin_bindings - 1 : 15;   // the zero buffer's binding: past the 16 streams when the device has room
     for (uint32_t loc = 0; loc < 32; loc++) {
@@ -1485,11 +1558,12 @@ static void vin_build(const vka_dstate *d, const vka_shader *vs, vka_gkey *k) {
         for (uint32_t i = 0; i < VI.na; i++) { uint32_t l = VI.a[i].location; k->va[l].fmt = VI.a[i].format; k->va[l].offset = VI.a[i].offset; k->va[l].binding = (uint8_t)VI.a[i].binding; k->va[l].used = 1; }
         for (uint32_t i = 0; i < VI.nb; i++) { uint32_t b = VI.b[i].binding; k->vb[b].stride = VI.b[i].stride; k->vb[b].divisor = VI.b[i].inputRate ? VI.b[i].divisor : 0; k->vb[b].used = 1; }
     }
+    if (memo) { VM.mask = vs->e->vin_mask; VM.types = vs->e->vin_types; VM.nattr = (uint32_t)d->nattr; memcpy(VM.attr, d->attr, sizeof VM.attr); memcpy(VM.stream, d->stream, sizeof VM.stream); VM.vin_u = k->vin_u; VM.vin_s = k->vin_s; VM.valid = 1; }
 }
 // The vertex buffers the command buffer holds (slot: buffer, offset, size): a draw binds only the slots that changed, consecutive ones in one call. Vulkan keeps vertex
 // buffer bindings across pipeline binds and passes for the life of the command buffer; forgotten with the dynamic state (vka_dyn_invalidate: a new command buffer or
 // part). Profile p2: vin_bind was 13 % of the replay thread, one vkCmdBindVertexBuffers2 a stream a draw. DM_VK_VB_FILTER=0 (live): every slot every draw
-static struct { int valid, vin_stale; VkBuffer b[33]; VkDeviceSize o[33], sz[33]; uint32_t vnb, vna; VkVertexInputBindingDescription2EXT vb[33]; VkVertexInputAttributeDescription2EXT va[32]; } VB;
+static struct { int valid, vin_stale; uint64_t vgen; VkBuffer b[33]; VkDeviceSize o[33], sz[33]; uint32_t vnb, vna; VkVertexInputBindingDescription2EXT vb[33]; VkVertexInputAttributeDescription2EXT va[32]; } VB;
 static void vb_set(uint32_t slot, VkBuffer b, VkDeviceSize o, VkDeviceSize sz, uint32_t *n0, uint32_t *nn, VkBuffer *rb, VkDeviceSize *ro, VkDeviceSize *rs) {
     if (slot >= 33) return;
     if (VB.valid && g_vb_filter && VB.b[slot] == b && VB.o[slot] == o && VB.sz[slot] == sz) return;
@@ -1498,21 +1572,72 @@ static void vb_set(uint32_t slot, VkBuffer b, VkDeviceSize o, VkDeviceSize sz, u
     if (!*nn) *n0 = slot;
     rb[*nn] = b; ro[*nn] = o; rs[*nn] = sz; (*nn)++;
 }
+// Lichii: DM_VK_VB_BIG=1 (live, default 0): a vertex stream bound with more than 64 MiB (the whole pool) is cached as the prefix [addr, addr + plen) the draw reads: first..first + count
+// vertices (draw arrays), base vertex + the largest index (indexed: indices scanned on the CPU, so a draw whose indices cannot be read, hold the type's all-ones value, or is
+// indirect reads guest RAM as before), or the instances at the stream's divisor. plen is rounded up (8 steps a power of two) so a changing count does not make a new range every
+// time, and is cached by vc_bind like any range (own key, CPU-write tracking, GPU-write marks, sampled check): bytes the draw does not read are never trusted.
+static const p_draw *g_vc_dw; static const p_draw_idx *g_vc_di; static int g_vc_have, g_vc_ok; static int64_t g_vc_mx;   // (have: the indices of this draw scanned)
+// the draw being bound (set in vka_draw before vin_bind)
+static uint32_t *read_indices(uint64_t addr, int itype, uint32_t count);
+// Lichii: the largest index of an indexed draw, memoized per (address, type, count) in a direct-mapped table while the index bytes cannot have changed: the same stamp and
+// protect as a vertex range (CPU writes: the dirty tracker; GPU writes: vgw_state over a vc_ent made for the range), the mappings (sparse / memory generation) and the span
+// unchanged. Index bytes the tracker cannot follow are scanned every draw. 1 = *mx is the largest index; 0 = unknown (unreadable, too many, or the type's all-ones value)
+
+static int vc_maxidx(const p_draw_idx *di, int64_t *mx) {
+    static struct { uint64_t ibuf; int itype, count; vc_ent e; int64_t mx; int ok, valid; } T[256];
+    if (di->count <= 0 || di->count > (1 << 22)) return 0;
+    const size_t isz = di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4, n = isz * (size_t)di->count;
+    uint32_t h = (uint32_t)(((di->ibuf >> 2) ^ (uint64_t)di->count * 0x9E3779B1u ^ (uint64_t)di->itype) * 0x9E3779B97F4A7C15ull >> 56); __typeof__(T[0]) *t = &T[h];
+    if (t->valid && t->ibuf == di->ibuf && t->itype == di->itype && t->count == di->count) {
+        vc_ent *e = &t->e;
+        if (e->vgen == nvn_sparse_gen() && e->mgen == vka_mem_gen() && nvn_dirty_span(e->phys, e->size) == e->span && !nvn_dirty_since_span(e->span, e->phys, e->size, e->stamp) && !vgw_state(e)) {
+            g_vc_imemo++; *mx = t->mx; return t->ok; }
+    }
+    t->valid = 0;
+    vc_ent e; memset(&e, 0, sizeof e); e.addr = di->ibuf; e.size = n; e.vgen = nvn_sparse_gen(); e.mgen = vka_mem_gen();
+    int tracked = vka_addr_run(e.addr, e.size, &e.sb, &e.so) >= e.size && (e.phys = (const uint8_t *)(uintptr_t)e.addr, (e.span = nvn_dirty_span(e.phys, e.size)) != NULL);
+    if (!tracked && vka_addr_run(e.addr, e.size, &e.sb, &e.so) >= e.size) { int r = nvn_vpool_phys(e.addr, e.size, &e.phys); tracked = r > 0 && (e.span = nvn_dirty_span(e.phys, e.size)) != NULL; }
+    if (tracked) { e.gwchk = g_vc_gwgen; e.stamp = nvn_dirty_now(); nvn_dirty_protect(e.phys, e.size); }   // (stamped and protected before the scan: a later write is seen)
+    uint32_t *ix = read_indices(di->ibuf, di->itype, (uint32_t)di->count); if (!ix) return 0;
+    uint32_t m = 0; for (int i = 0; i < di->count; i++) if (ix[i] > m) m = ix[i];
+    free(ix); int ok = m != (di->itype == 0 ? 0xFFu : di->itype == 1 ? 0xFFFFu : 0xFFFFFFFFu); *mx = m;
+    if (tracked) { t->ibuf = di->ibuf; t->itype = di->itype; t->count = di->count; t->e = e; t->mx = m; t->ok = ok; t->valid = 1; }
+    return ok;
+}
+static uint64_t vc_prefix(const vka_dstate *d, uint32_t st, uint64_t size) {
+    const p_draw *dw = g_vc_dw; const p_draw_idx *di = g_vc_di; uint32_t stride = d->stream[st].stride, div = d->stream[st].divisor;
+    if (!stride || (dw ? dw->ind || dw->mdi_cnt : !di || di->ind || di->mdi_cnt)) return 0;
+    int64_t inst = (dw ? dw->instances : di->instances) > 0 ? (dw ? dw->instances : di->instances) : 1, bi = dw ? dw->base_instance : di->base_instance, vmax;
+    if (div) vmax = bi + (inst - 1) / div;
+    else if (dw) vmax = (int64_t)dw->first + dw->count - 1;
+    else {
+        if (!g_vc_have) { g_vc_have = 1; g_vc_ok = vc_maxidx(di, &g_vc_mx); }   // the largest index once a draw
+        if (!g_vc_ok) return 0;
+        vmax = (int64_t)di->base_vertex + g_vc_mx;
+    }
+    if (vmax < 0) return 0;
+    uint64_t need = ((uint64_t)vmax + 1) * stride + 256, plen = 262144; while (plen < need) plen <<= 1;   // (next power of two: one copy serves the counts between)
+    return plen < size ? plen : size;
+}
 static void vin_bind(const vka_dstate *d) {
     if (!VB.valid) memset(&VB, 0, sizeof VB);
     // The vertex input state too only when it changed (it was set every draw: up to 65 descriptions copied into the encoder's ring and the driver), and again after
     // every pipeline bind: Vulkan keeps dynamic vertex input across vkCmdBindPipeline, but drivers have lost it there before (hardening; the buffers stay filtered)
     if (V.vin_dyn) {
-        int same = VB.valid && !VB.vin_stale && g_vb_filter && VB.vnb == VI.nb && VB.vna == VI.na && !memcmp(VB.vb, VI.b, VI.nb * sizeof *VI.b) && !memcmp(VB.va, VI.a, VI.na * sizeof *VI.a);
-        if (!same) { vk.vkCmdSetVertexInputEXT(g_cb, VI.nb, VI.b, VI.na, VI.a); VB.vnb = VI.nb; VB.vna = VI.na; memcpy(VB.vb, VI.b, VI.nb * sizeof *VI.b); memcpy(VB.va, VI.a, VI.na * sizeof *VI.a); }
+        const int rec = VKA_ENV("DM_VK_REC_VIN", 0);   // Lichii: see VM (vin_build): =1 generation compare, =2 also no re-set after a pipeline bind
+        int same = VB.valid && (!VB.vin_stale || rec >= 2) && g_vb_filter && VB.vnb == VI.nb && VB.vna == VI.na
+                   && ((rec > 0 && VB.vgen == g_vi_gen) || (!memcmp(VB.vb, VI.b, VI.nb * sizeof *VI.b) && !memcmp(VB.va, VI.a, VI.na * sizeof *VI.a)));
+        if (!same) { vk.vkCmdSetVertexInputEXT(g_cb, VI.nb, VI.b, VI.na, VI.a); VB.vnb = VI.nb; VB.vna = VI.na; VB.vgen = g_vi_gen; memcpy(VB.vb, VI.b, VI.nb * sizeof *VI.b); memcpy(VB.va, VI.a, VI.na * sizeof *VI.a); }
         VB.vin_stale = 0;
     }
     VkBuffer rb[33]; VkDeviceSize ro[33], rs[33]; uint32_t n0 = 0, nn = 0;
     for (uint32_t st = 0; st < 16; st++) if (VI.used >> st & 1) {   // each stream at its address, as far as it is bound and placed
         VkBuffer b = g_zero.buf; VkDeviceSize o = g_zero.off, sz = 65536;
         uint64_t addr = d->vbuf[st].address, size = d->vbuf[st].size;
-        if (addr && !VKA_ENV("DM_VK_XP_VB_ZERO", 0)) { VkBuffer cb; VkDeviceSize co; uint64_t run = vka_addr_run(addr, size ? size : 1ull << 30, &cb, &co);
-                    if (run && size && run >= size && vc_bind(addr, size, &cb, &co)) { b = cb; o = co; sz = size; }   // (the VRAM vertex cache)
+        if (addr && !VKA_ENV("DM_VK_XP_VB_ZERO", 0)) { VkBuffer cb; VkDeviceSize co; uint64_t run = vka_addr_run(addr, size ? size : 1ull << 30, &cb, &co), plen = 0;
+                    if (run && size > (64ull << 20) && VKA_ENV("DM_VK_VB_BIG", 0) && (plen = vc_prefix(d, st, size)) && plen < size && run >= plen) {   // (a big binding: its prefix)
+                        if (vc_bind(addr, plen, &cb, &co)) { b = cb; o = co; sz = plen; g_vc_big++; } else if (run) { run = vka_addr_run(addr, size, &cb, &co); b = cb; o = co; sz = run; } }
+                    else if (run && size && run >= size && vc_bind(addr, size, &cb, &co)) { b = cb; o = co; sz = size; }   // (the VRAM vertex cache)
                     else if (run) { b = cb; o = co; sz = run; } else VRED_ONCE("vertex stream at %#llx is not in placed guest RAM: it reads zeros", (unsigned long long)addr); }
         vb_set(st, b, o, sz, &n0, &nn, rb, ro, rs);
     }
@@ -1678,7 +1803,8 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     vka_span mrec = {0};
     if (mesh && ind && dw->prim == NVN_PRIM_MESH && !mesh_records(dw, &mrec))
         SKIP("indirect mesh draw: records at %#llx (%d, stride %d) not in one placed segment: skipped", (unsigned long long)ind, dw->mdi_max, dw->mdi_stride);
-    if (!rp_begin(rt, has_rt, d)) { g_skipped++, vka_skip_line[__LINE__ & 2047]++; return; }
+    { const uint64_t xr_ = vka_xprof ? now_ns() : 0; const int rok_ = rp_begin(rt, has_rt, d); if (vka_xprof) vka_t_rp_begin += now_ns() - xr_;   // (DM_VK_PROF: includes the pass end of another pass it replaces)
+      if (!rok_) { g_skipped++, vka_skip_line[__LINE__ & 2047]++; return; } }
     if (!R.swrite && draw_writes(sh, d)) R.swrite = 1;   // (a game barrier in this pass from now on ends it: vka_rp_game_barrier)
     d->b.samples = R.samples;
     vka_gkey k; memset(&k, 0, V.vin_dyn ? offsetof(vka_gkey, va) : sizeof k);   // (va, vb: only without vertex input dynamic state, vin_build; the pipeline lookup reads no further then)
@@ -1764,7 +1890,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     PT(5);
     if (!bind_sets(d, sh, &lay, VK_PIPELINE_BIND_POINT_GRAPHICS, NULL)) { g_skipped++, vka_skip_line[__LINE__ & 2047]++; return; }
     PT(6);
-    if (!mesh) vin_bind(d);
+    if (!mesh) { g_vc_dw = dw; g_vc_di = di; g_vc_have = 0; vin_bind(d); }   // (the draw's range for DM_VK_VB_BIG)
 
     // Viewport and scissor. The translator writes clip space for Metal (y up, origin upper left): Metal's viewport, flipped for a lower-left window origin as on Metal, then given
     // a negative height, maps it as Metal does (android/SHADERS.md "Depth and Y")

@@ -138,12 +138,55 @@ static void rgb32_widen(const vka_fmt *f, uint8_t *p, size_t pitch, size_t rows,
     for (size_t r = 0; r < rows; r++) for (size_t x = texels; x-- > 0;) { uint8_t *q = p + r * pitch; memmove(q + 16 * x, q + 12 * x, 12); memcpy(q + 16 * x + 12, &one, 4); }
 }
 
-uint64_t vka_n_bar;   // full barriers recorded (vka_exec.c replay statistics)
+uint64_t vka_n_bar, vka_t_bar;   // full barriers recorded, and DM_VK_PROF's ns in them (vka_exec.c replay statistics)
+extern int vka_xprof; uint64_t now_ns(void);
+// Lichii: barrier statistics (vka_bar_stats, logged from vka_exec.c mtl_set_frame): the recording sites by count (file:line, to see where the ~900 a frame come from), pass-end barriers (narrowed or not),
+// and the barriers skipped as redundant (DM_VK_BAR_DEDUP: vka_exec.c walk; DM_VK_BAR_RUN: a run of buffer updates / copies / fills)
+uint64_t vka_n_bar_pe, vka_n_bar_narrow, vka_n_bar_dup, vka_n_bar_run;
+enum { NBSITE = 96 };
+static struct { uint64_t key; const char *f; int l; _Atomic uint64_t n; } g_bsite[NBSITE];
+static void bsite(const char *f, int l) {
+    const uint64_t key = (uint64_t)(uintptr_t)f * 31u + (uint64_t)l + 1;
+    for (int i = 0; i < NBSITE; i++) {
+        uint64_t k = __atomic_load_n(&g_bsite[i].key, __ATOMIC_ACQUIRE);
+        if (!k && __atomic_compare_exchange_n(&g_bsite[i].key, &k, key, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { g_bsite[i].f = f; g_bsite[i].l = l; }
+        if (k == 0 || k == key) { atomic_fetch_add_explicit(&g_bsite[i].n, 1, memory_order_relaxed); return; }
+    }
+}
+void vka_bar_stats(char *b, size_t n, double frames) {
+    static uint64_t pe0, nr0, du0, ru0, s0[NBSITE];
+    b[0] = 0; if (frames <= 0 || n < 64) return;
+    uint64_t d[NBSITE]; int idx[NBSITE], m = 0;
+    for (int i = 0; i < NBSITE; i++) { uint64_t c = atomic_load_explicit(&g_bsite[i].n, memory_order_relaxed); d[i] = c - s0[i]; s0[i] = c; if (d[i] && g_bsite[i].f) idx[m++] = i; }
+    for (int i = 1; i < m; i++) { int t = idx[i], j = i; while (j > 0 && d[idx[j - 1]] < d[t]) { idx[j] = idx[j - 1]; j--; } idx[j] = t; }
+    int o = snprintf(b, n, "full barriers per frame: %.1f at pass ends (%.1f of them narrowed, DM_VK_BAR_PASSEND), %.1f game barriers skipped as redundant (DM_VK_BAR_DEDUP), %.1f buffer-run barriers skipped (DM_VK_BAR_RUN); top sites:",
+                     (vka_n_bar_pe - pe0) / frames, (vka_n_bar_narrow - nr0) / frames, (vka_n_bar_dup - du0) / frames, (vka_n_bar_run - ru0) / frames);
+    pe0 = vka_n_bar_pe; nr0 = vka_n_bar_narrow; du0 = vka_n_bar_dup; ru0 = vka_n_bar_run;
+    for (int k = 0; k < m && k < 10 && o > 0 && (size_t)o < n; k++) o += snprintf(b + o, n - o, " %s:%d=%.1f", g_bsite[idx[k]].f, g_bsite[idx[k]].l, d[idx[k]] / frames);
+}
+// Lichii: a pass end's barrier narrowed (DM_VK_BAR_PASSEND=1, live, default off). What follows a pass end can be anything (a sample in the next pass, a compute read, a copy, the present), so the
+// destination stays every stage that reads or writes memory; the source is the pass's own stages (all graphics: the execution scope also makes a later write wait for the pass's reads of what it
+// writes) plus compute and transfer, with the write accesses a pass or the work around it makes. Host access is left out (the submit makes host writes visible, the readbacks have their own barriers)
+void vka_barrier_pe_at(VkCommandBuffer cb, const char *file, int line) {
+    vka_n_bar_pe++;
+    if (!VKA_ENV("DM_VK_BAR_PASSEND", 0)) { vka_barrier_at(cb, file, line); return; }
+    vka_n_bar++; vka_n_bar_narrow++; bsite(file, line); const uint64_t xt_ = vka_xprof ? now_ns() : 0;
+    const VkPipelineStageFlags st = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT |
+                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+    vk.vkCmdPipelineBarrier(cb, st, st, 0, 1, &mb, 0, NULL, 0, NULL);
+    if (vka_gp_active) vka_gp_mark(cb, file, line);
+    if (vka_xprof) vka_t_bar += now_ns() - xt_;
+}
 void vka_barrier_at(VkCommandBuffer cb, const char *file, int line) {
-    vka_n_bar++;
+    vka_n_bar++; bsite(file, line); const uint64_t xt_ = vka_xprof ? now_ns() : 0;
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
     vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     if (vka_gp_active) vka_gp_mark(cb, file, line);
+    if (vka_xprof) vka_t_bar += now_ns() - xt_;
 }
 void vka_img_barrier(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to) {
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,

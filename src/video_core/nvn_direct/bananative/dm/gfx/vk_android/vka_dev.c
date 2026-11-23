@@ -642,11 +642,29 @@ int vka_scratch(VkDeviceSize n, VkDeviceSize align, vka_span *out) {
 }
 static void retire(int c, uint64_t value) {
     pthread_mutex_lock(&g_smu);
+    // Lichii: DM_VK_SCRATCH_SHARE (live, default 1): the submission's newest block, if under half used, stays open for the next submission (class 0 only) with its fence raised
+    // to this one, so it is reusable only once the LATEST submission that wrote into it is done. Only the head takes allocations: older open blocks go busy as before.
+    // Upload staging (class 1) is unchanged. Before, every submission took a 16 MiB block of its own: 64 slots in flight = ~1 GiB
+    if (!c && g_open[0] && g_open[0]->used * 2 < g_open[0]->size && VKA_ENV("DM_VK_SCRATCH_SHARE", 1)) {
+        sblk *h = g_open[0], *rest = h->next; h->fence = value; h->next = NULL;
+        while (rest) { sblk *b = rest; rest = b->next; b->fence = value; b->next = g_busy; g_busy = b; }
+        g_open[0] = h; pthread_mutex_unlock(&g_smu); return;
+    }
     while (g_open[c]) { sblk *b = g_open[c]; g_open[c] = b->next; b->fence = value; b->next = g_busy; g_busy = b; }
     if (c) { g_ubytes = 0; sblk_trim(vka_done(), up_done()); }   // (the submission's blocks are trimmed at a miss only: a game that takes more than 16 MiB a frame would make and free them every frame)
     pthread_mutex_unlock(&g_smu);
 }
 void vka_scratch_retire(uint64_t fence) { retire(0, fence); }
+// Lichii: scratch blocks not yet reusable (open, or their fence not done) and their bytes, for mtl_set_frame's stats line
+uint32_t vka_scratch_flight(uint64_t *bytes) {
+    uint64_t done = vka_done(), udone = up_done(), by = 0; uint32_t n = 0;
+    pthread_mutex_lock(&g_smu);
+    for (int c = 0; c < 2; c++) for (sblk *b = g_open[c]; b; b = b->next) { n++; by += b->size; }
+    for (sblk *b = g_busy; b; b = b->next) if (!sblk_idle(b, done, udone)) { n++; by += b->size; }
+    pthread_mutex_unlock(&g_smu);
+    if (bytes) *bytes = by;
+    return n;
+}
 
 // ---------- Upload batches ----------
 // The first content of an image the replay makes (its upload from guest memory, or its clear) is recorded into a command buffer of its own, an upload batch, instead of

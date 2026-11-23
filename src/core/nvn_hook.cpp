@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -748,7 +749,30 @@ bool OnBlockEntry(u64 pc, Dynarmic::A64::Jit& jit, Core::Memory::Memory& memory,
 }
 
 #ifdef LICHII_NVN_DIRECT
+extern "C" uint64_t nvn_direct_present_gaps(void);
 namespace {
+/// Lichii: DM_VK_PRESENT_STATS (or DM_NVN_GAMEWAIT): every 300 presents, the spread of the intervals between the frames handed to Lichii (min/max/stddev ms), the presents that
+/// showed nothing new (the previous frame stays: shown twice) and the frames the take skipped (a ticket jumped).
+struct ShowStats {
+    std::chrono::steady_clock::time_point last{};
+    double n{}, sum{}, sq{}, mn{1e9}, mx{};
+    u64 repeats{}, base_gaps{};
+    void Shown() {
+        const auto now = std::chrono::steady_clock::now();
+        if (last.time_since_epoch().count()) {
+            const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+            n += 1; sum += ms; sq += ms * ms; mn = (std::min)(mn, ms); mx = (std::max)(mx, ms);
+        }
+        last = now;
+    }
+    void Log(u64 own) {
+        if (own % 300 != 0) return;
+        const double mean = n > 0 ? sum / n : 0, sd = n > 0 ? std::sqrt((std::max)(0.0, sq / n - mean * mean)) : 0;
+        const u64 gaps = nvn_direct_present_gaps();
+        LOG_INFO(Core, "NVN direct: shown-frame interval over {} presents: min {:.2f} max {:.2f} mean {:.2f} sd {:.2f} ms, repeated {}, skipped {}", static_cast<u64>(n), n > 0 ? mn : 0.0, mx, mean, sd, repeats, gaps - base_gaps);
+        n = sum = sq = mx = 0; mn = 1e9; repeats = 0; base_gaps = gaps;
+    }
+};
 /// Every 600 presents: the halted calls and the stub census (names called without an
 /// implementation).
 void LogStubCensus(State& state, u64 present) {
@@ -782,6 +806,13 @@ void PresentDirect(Core::System& system, State& state) {
     nvn_direct_frame frame{};
     u64 t = g_game_wait.on ? GameWait::Now() : 0;
     const bool shown = nvn_direct_present_take(&frame) != 0;
+    // Lichii: DM_NVN_PRESENT_PACE_FIRST=1 (default off): with DM_VK_PRESENT_LAG the frame shown is the one before, and its composite was requested here at the call of present N,
+    // when the game's CPU time of frame N (variable) decides which vblank shows it, so the shown cadence follows that jitter although the pacer's deadlines are even. 1 requests
+    // it after PaceToVblank (the deadline, even by construction), so a frame is shown at the vblank after its present's pacing slot.
+    static const bool pace_first = [] { const char* e = std::getenv("DM_NVN_PRESENT_PACE_FIRST"); return e && *e == '1'; }();
+    static const bool stats_on = [] { const char* e = std::getenv("DM_VK_PRESENT_STATS"); return (e && *e == '1') || std::getenv("DM_NVN_GAMEWAIT"); }();
+    static ShowStats stats;
+    std::vector<Tegra::FramebufferConfig> layers;
     auto lap = [&t](u64& into) {
         if (g_game_wait.on) {
             const u64 now = GameWait::Now();
@@ -813,7 +844,7 @@ void PresentDirect(Core::System& system, State& state) {
             : frame.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
                 ? Service::Nx2NativeImageFormat::Rgb10A2
                 : Service::Nx2NativeImageFormat::Rgba8;
-        std::vector<Tegra::FramebufferConfig> layers{Tegra::FramebufferConfig{
+        layers = {Tegra::FramebufferConfig{
             .address = NVN_DIRECT_FRAME_TAG | frame.id,
             .width = frame.width,
             .height = frame.height,
@@ -831,12 +862,22 @@ void PresentDirect(Core::System& system, State& state) {
             .color_space = Service::Nx2NativeImageColorSpace(image_format,
                                                              Service::g_nx2_told_hdr.load()),
         }};
-        system.GPU().RequestComposite(std::move(layers), {});
+        if (!pace_first) {
+            if (stats_on) stats.Shown();
+            system.GPU().RequestComposite(std::move(layers), {});
+        }
+    } else if (stats_on) {
+        ++stats.repeats;
     }
     present.Finish(own);
     lap(g_game_wait.take_ns); // (Finish and the composite request: counted with the fill wait)
     present.PaceToVblank((frame.interval << 16) | 60, system.ApplicationProcess(), own, nullptr);
     lap(g_game_wait.pace_ns);
+    if (pace_first && shown) {
+        if (stats_on) stats.Shown();
+        system.GPU().RequestComposite(std::move(layers), {});
+    }
+    if (stats_on) stats.Log(own);
     if (g_game_wait.on) {
         g_game_wait.Log(own);
     }
