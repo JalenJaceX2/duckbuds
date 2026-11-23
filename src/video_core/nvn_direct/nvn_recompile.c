@@ -406,7 +406,7 @@ static int rc_translate(const prog_t* p, unsigned i, const rc_control* control, 
                                     .input_topology = st == 2 && prim_inputs ? prim_inputs - 1 : 0, .context = x,
                                     .read_cbuf = rc_cbuf, .read_memory = rc_read, .texture_info = rc_texture};
     if (st == 0 && d)   // vertex inputs typed as the draw's attributes (the integer formats' classes): vka_draw.c then binds them retyping none
-        for (int loc = 0; loc < 16 && loc < d->nattr; loc++) {
+        for (int loc = 0; loc < 32 && loc < d->nattr; loc++) {
             vka_fmt vf; if (!d->attr[loc].fmt || !vka_fmt_of(d->attr[loc].fmt, &vf)) continue;
             src.vertex_input_types[loc] = vf.kind == 1 ? 2 : vf.kind == 2 ? 1 : 0;
             *vin_types |= (uint64_t)(vf.kind == 1 ? DMSH_VK_TYPE_UINT : vf.kind == 2 ? DMSH_VK_TYPE_SINT : DMSH_VK_TYPE_FLOAT) << (2 * loc);

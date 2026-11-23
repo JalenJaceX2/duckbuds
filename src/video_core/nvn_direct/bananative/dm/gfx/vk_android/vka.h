@@ -478,7 +478,7 @@ typedef struct vka_dstate {   // (named: nvn_recompile.c declares it ahead)
     vka_bstate b;
     const prog_t *bst[VKA_NSTAGE], *cprog;   // the program bound per graphics stage (NVN stage bits; [5] unused, [6] / [7] NVN2's task and mesh bits), the compute program
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
-    va_st attr[16]; int nattr; vs_st stream[16]; int nstream; NVNbufferRange vbuf[16];
+    va_st attr[32]; int nattr; vs_st stream[16]; int nstream; NVNbufferRange vbuf[16];
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][4]; float dr[2]; int has_vp, depth_clamp; uint8_t vp_sw[16][4]; p_depth_bounds dbounds;
     float blend_color[4], alpha_ref;
