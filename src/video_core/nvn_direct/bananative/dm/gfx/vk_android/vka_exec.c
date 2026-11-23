@@ -902,10 +902,13 @@ static void rc_note(const p_render_cond *rc, int skip) {
 // (returns 1). Written at completion, it landed at a time set by the GPU's progress: Mario Kart World reports a timestamp onto a word its CPU sets to 1 and draws only while
 // the word differs from the next (SetRenderEnableConditional, render if not equal), so whether the completion of an earlier frame's report had overwritten the CPU's newer 1
 // when the replay reached the condition decided whether those draws ran: background objects came and went from frame to frame
+// Samples passed grows by 2^16 at each report (reset to 0 by ResetCounter), as the GPU's counter only grows: Duskbloods reports it before and after each occlusion box
+// and takes the difference; a constant 1 made that 0 samples, and its characters, weapons and props were culled as hidden
+static uint64_t g_samples;
 static int rc_counter(uint64_t a, uint32_t t) {
     const int ts = t == NVN_COUNTER_TYPE_TIMESTAMP || t == NVN_COUNTER_TYPE_TIMESTAMP_TOP;
     if (ts && !DM_GAME_RENDER_COND) return 0;   // (a timestamp's counter is the time otherwise: known at completion only)
-    uint64_t v = t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1 : 0;
+    uint64_t v = t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? (g_samples += 1u << 16) : 0;
     memcpy(nvn_direct_writable(a), &v, 8);
     return 1;
 }
@@ -1155,7 +1158,7 @@ static void walk(walk_t *w) {
             if (rc->mode >= 2) S.rc_skip = rc->mode == 3;
             else { uint64_t x = 0, y = 0; int known = rc_known(rc->addr, &x) && rc_known(rc->addr + 16, &y); S.rc_skip = known && (rc->mode ? x == y : x != y); rc_note(rc, S.rc_skip); }
             break; }
-        case OP_RESET_COUNTER: break;
+        case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) g_samples = 0; break; }
         case OP_ENABLE_COND: { const p_enable_cond *ec = a; int skip = ec->mode == 3;   // (Lichii: as OP_RENDER_COND, for dispatches or copies)
             if (ec->mode < 2) { uint64_t x = 0, y = 0; skip = rc_known(ec->addr, &x) && rc_known(ec->addr + 16, &y) && (ec->mode ? x == y : x != y); }
             if (ec->target) S.copy_skip = skip; else S.compute_skip = skip;
