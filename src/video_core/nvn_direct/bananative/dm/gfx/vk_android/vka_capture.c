@@ -612,8 +612,37 @@ static void cap_submit(int n, const uint64_t *h) {
 
 void nvn_cap_submit(int n, const uint64_t *h) { pthread_mutex_lock(&g_cap_mu); cap_submit(n, h); pthread_mutex_unlock(&g_cap_mu); }
 
+// Lichii diagnostics: DM_VK_TEXSTAT=<seconds>: once, at the first present that many seconds after the first, level 0 / layer 0 of every live image is read back and
+// counted as all zero bytes or not, by kind (ASTC re-compressed to BC1, ASTC to BC3, other uploaded from storage, GPU-written); an all-zero image whose guest storage
+// is not all zero is logged (the first 48): an upload or decode that left the image empty
+static int mem_nonzero(const uint8_t *p, uint64_t n) { for (uint64_t i = 0; i < n; i++) if (p[i]) return 1; return 0; }
+static void texstat(void) {
+    static double at = -1; static uint64_t t0;
+    if (at < 0) { const char *e = getenv("DM_VK_TEXSTAT"); at = e ? atof(e) : 0; t0 = now_ns(); if (at > 0) VLOG("DM_VK_TEXSTAT: every image read back %.0f s after the first present", at); }
+    if (at <= 0 || (now_ns() - t0) / 1e9 < at) return;
+    at = 0;
+    enum { MAXI = 16384 }; vka_img **ims = malloc(MAXI * sizeof *ims); if (!ims) return;
+    int n = vka_tex_live_refs(ims, MAXI), logged = 0; unsigned cnt[4][3] = {{0}};   // [kind][all zero, not, unread]
+    static const char *const kname[4] = {"ASTC as BC1", "ASTC as BC3", "from storage", "GPU-written"};
+    for (int i = 0; i < n; i++) {
+        vka_img *im = ims[i];
+        int k = im->gpu_owned ? 3 : im->f.astc_bw ? (im->f.bpb == 8 ? 0 : 1) : 2;
+        size_t nb = 0; uint8_t *px = im->samples > 1 ? NULL : vcap_img_level0(im, &nb);
+        if (!px) { cnt[k][2]++; vka_tex_drop(im); continue; }
+        int nz = mem_nonzero(px, nb); free(px); cnt[k][nz]++;
+        int src = !im->mem || !im->L.size || im->vpool || !nvn_host_readable((uint64_t)(uintptr_t)im->mem, im->L.size) ? -1 : mem_nonzero(im->mem, im->L.size);
+        if (!nz && src > 0 && logged++ < 48)
+            VLOG("DM_VK_TEXSTAT: serial %llu NVN format %#x VkFormat %d %ux%u levels %u layers %u (%s, track %d, mode %u): image all zero, its storage is not", (unsigned long long)im->serial,
+                 im->d.format, im->f.vk, im->w, im->h, im->levels, im->layers, kname[k], im->track, im->mode);
+        vka_tex_drop(im);
+    }
+    for (int k = 0; k < 4; k++) VLOG("DM_VK_TEXSTAT: %s: %u images all zero, %u not, %u not read", kname[k], cnt[k][0], cnt[k][1], cnt[k][2]);
+    free(ims);
+}
+
 // Hook: nvnQueuePresentTexture, before the present is queued
 static void cap_present(const tex_t *t, const int crop[4]) {
+    texstat();
     if (!nvn_cap_enabled()) return;
     g_cap_presents++;
     if (!g_cap_frame) {   // @seconds: the next frame is the one
