@@ -1068,7 +1068,11 @@ static uint8_t *hostseg_take(const cmd_t *o, size_t n) {
     unsigned t = ++total; int ns = g_nhostseg; uint64_t bytes = g_hostseg_bytes;
     pthread_mutex_unlock(&g_hostseg_mu);
     if (!m) die("NVN command memory: the game's pool is empty and host-lent segments reached %u MB without being reclaimed by the game's blocks", HOSTSEG_CAP >> 20);
-    if (t == 1 || t % 1024 == 0) LOG("[nvn] the game's command memory ran short, the host lends a segment of %zu KB (%u times so far, frame %llu, segment pool %d segments, %llu KB)", n >> 10, t, (unsigned long long)f, ns, (unsigned long long)(bytes >> 10));
+    // Lichii: logged when the pool grows to twice the segments of the last line, not every 1024 lends: a game whose recordings each start in a lent segment (the callback adds
+    // their memory after the call that needed it: Orbitals) lends hundreds a second from a pool that stays the same
+    static _Atomic int logged_ns; int lns = atomic_load(&logged_ns);
+    if (ns >= 2 * lns && atomic_compare_exchange_strong(&logged_ns, &lns, ns))   // (the first lend too: 0 logged)
+        LOG("[nvn] the game's command memory ran short, the host lends a segment of %zu KB (%u times so far, frame %llu, segment pool %d segments, %llu KB)", n >> 10, t, (unsigned long long)f, ns, (unsigned long long)(bytes >> 10));
     return m;
 }
 // The game gives out [lo, hi): segments whose recording's guest bytes overlap it are dead, reclaim them
