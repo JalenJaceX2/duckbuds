@@ -741,6 +741,7 @@ static void copy_bt(const p_copy_b2t *c, int to_tex) {
                                                                               c->has_view && c->view.set_levels ? c->view.base_level : 0, c->r.width, c->r.height, (unsigned long long)g_cp_astc_raw); }
     if (im->samples > 1) { VRED_ONCE("buffer copy of a multisampled texture"); return; }
     const vka_fmt *f = &im->f;
+    if (f->rgb32) { VRED_ONCE("%s of RGB32 texture serial %llu (format %#x): its image is RGBA32 and the buffer's texels are 12 bytes; not copied", to_tex ? "buffer → texture copy" : "texture → buffer copy", (unsigned long long)im->serial, im->d.format); return; }
     unsigned lv = c->has_view && c->view.set_levels ? c->view.base_level : 0, l0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
     { unsigned lvt = lv; int ok = vka_img_lv(im, &lv); if (to_tex) cp_note(im, lvt, !ok); if (!ok) return; }
     if (c->r.width <= 0 || c->r.height <= 0) return;

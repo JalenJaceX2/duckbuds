@@ -111,6 +111,15 @@ static int fmt_of_slow(int nf, vka_fmt *o) {
         *o = (vka_fmt){VK_FORMAT_BC3_UNORM_BLOCK, e.srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK, 0, e.srgb, 16, 4, 4, (uint8_t)bw, (uint8_t)bh};
         return 1;
     }
+    // RGB32 (NVIDIA and AMD give it no optimal-tiling image): the RGBA32 image of the same type, alpha 1; uploads widen the texels (rgb32_widen), reads narrow them
+    if ((e.vk == VK_FORMAT_R32G32B32_SFLOAT || e.vk == VK_FORMAT_R32G32B32_UINT || e.vk == VK_FORMAT_R32G32B32_SINT) && bpb == 12 && !(feats(e.vk) & (VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))) {
+        VkFormat a = e.vk == VK_FORMAT_R32G32B32_SFLOAT ? VK_FORMAT_R32G32B32A32_SFLOAT : e.vk == VK_FORMAT_R32G32B32_UINT ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32B32A32_SINT;
+        if (feats(a) & (VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+            static _Atomic int once; if (!atomic_exchange(&once, 1)) VLOG("RGB32 textures: no RGB32 images on this device, RGBA32 images with alpha 1 in their place");
+            *o = (vka_fmt){a, a, e.kind, 0, 16, 1, 1, 0, 0, e.vk == VK_FORMAT_R32G32B32_SFLOAT ? 1 : 2};
+            return 1;
+        }
+    }
     if (e.vk == VK_FORMAT_UNDEFINED || !bpb || !(feats(e.vk) & (VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))) {
         static uint64_t logged[4]; unsigned b = (unsigned)nf & 255;
         if (!(__atomic_fetch_or(&logged[b >> 6], 1ull << (b & 63), __ATOMIC_RELAXED) >> (b & 63) & 1)) VRED("NVN format %#x has no Vulkan format on this device (VkFormat %d)", nf, e.vk);
@@ -121,6 +130,13 @@ static int fmt_of_slow(int nf, vka_fmt *o) {
 }
 static VkImageAspectFlags aspect_of(int kind) { return kind == 3 ? VK_IMAGE_ASPECT_DEPTH_BIT : kind == 4 ? VK_IMAGE_ASPECT_STENCIL_BIT : kind == 5 ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT; }
 static int compressed(const vka_fmt *f) { return f->bw > 1 || f->bh > 1; }
+// An RGB32 texture's image is RGBA32 (fmt_of_slow): rows deswizzled or copied from storage hold 12-byte texels at the start of each pitch (texels * 16) bytes, widened in place to 16
+// (from the last texel down: a texel's new place overlaps only its own old one) with alpha 1.0f or 1
+static void rgb32_widen(const vka_fmt *f, uint8_t *p, size_t pitch, size_t rows, size_t texels) {
+    if (!f->rgb32) return;
+    const uint32_t one = f->rgb32 == 1 ? 0x3F800000u : 1u;
+    for (size_t r = 0; r < rows; r++) for (size_t x = texels; x-- > 0;) { uint8_t *q = p + r * pitch; memmove(q + 16 * x, q + 12 * x, 12); memcpy(q + 16 * x + 12, &one, 4); }
+}
 
 uint64_t vka_n_bar;   // full barriers recorded (vka_exec.c replay statistics)
 void vka_barrier_at(VkCommandBuffer cb, const char *file, int line) {
@@ -912,7 +928,7 @@ static void upload_fill(vka_img *im, const tex_t *t, VkCommandBuffer cb) {   // 
 // 1024x8192 R8: the whole 8 MB was deswizzled and copied each time a glyph was rasterized into it). 0 = not such a texture (the caller uploads all of it)
 static int upload_rows_tracked(vka_img *im, const tex_t *t, VkCommandBuffer cb, size_t lo, size_t hi) {
     const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f;
-    if (!(d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || im->levels > 1 || im->layers > 1 || im->depth > 1 || f->kind >= 3) return 0;
+    if (!(d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || im->levels > 1 || im->layers > 1 || im->depth > 1 || f->kind >= 3 || f->rgb32) return 0;   // (RGB32 widened: the whole texture)
     uint32_t bx = (im->w + f->bw - 1) / f->bw, by = (im->h + f->bh - 1) / f->bh; size_t pitch = (size_t)bx * f->bpb, st = d->stride ? d->stride : pitch;
     if (st < pitch) return 0;
     uint32_t r0 = (uint32_t)(lo / st), r1 = (uint32_t)((hi + st - 1) / st); if (r1 > by) r1 = by;
@@ -1148,6 +1164,7 @@ static void upload_sparse_parts(vka_img *im, VkCommandBuffer cb, uint64_t gen, u
                     // the deswizzler reads level lv of layer ly at its offset in the whole storage, and writes row y at y * pitch: part holds just this run's bytes
                     if (nvn_deswizzle_rows(d, lv, ly, (const uint8_t *)((uintptr_t)part - (uintptr_t)so), s.ptr - (size_t)y0 * pitch, pitch, y0, y1)) {
                         VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)im->serial, d->format, d->target); goto out; }
+                    rgb32_widen(f, s.ptr, pitch, sz / pitch, bx);
                     up += sz;
                 }
                 uint32_t py0 = y0 * f->bh, py1 = y1 * f->bh > h ? h : y1 * f->bh;
@@ -1585,7 +1602,7 @@ static int up_parallel(up_part *p, uint32_t n, int *fail) {
 static int upload_mt(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *nbytes) {
     const nvn_texdesc *d = &t->d; const vka_fmt *f = &im->f;
     int is3d = d->target == NVN_TEXTURE_TARGET_3D;
-    if (vka_nan_on() || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || f->kind >= 3 || f->astc_bw) return 0;   // (ASTC decoded on the CPU: the serial path)
+    if (vka_nan_on() || (d->flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) || f->kind >= 3 || f->astc_bw || f->rgb32) return 0;   // (ASTC decoded on the CPU, RGB32 widened: the serial path)
     uint64_t total = 0; uint32_t npieces = im->levels * im->layers;
     for (uint32_t lv = 0; lv < im->levels; lv++) {
         uint32_t w = im->w >> lv ? im->w >> lv : 1, h = im->h >> lv ? im->h >> lv : 1, z = is3d ? (im->depth >> lv ? im->depth >> lv : 1) : 1;
@@ -1663,7 +1680,7 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
                 free(blk);
                 if (bad) { VRED_ONCE("texture serial %llu format %#x target %d: ASTC not transcoded on the CPU", (unsigned long long)t->serial, d->format, d->target); free(part); return; }
             }
-            else if (linear) { size_t st = d->stride ? d->stride : pitch; for (uint32_t y = 0; y < by; y++) memcpy(s.ptr + y * pitch, src + y * st, pitch); }
+            else if (linear) { size_t gp = f->rgb32 ? (size_t)bx * 12 : pitch, st = d->stride ? d->stride : gp; for (uint32_t y = 0; y < by; y++) memcpy(s.ptr + y * pitch, src + y * st, gp); }
             else if (nvn_deswizzle(d, lv, ly, src, s.ptr, pitch)) { VRED_ONCE("texture serial %llu format %#x target %d: no CPU deswizzle", (unsigned long long)t->serial, d->format, d->target); free(part); return; }
             if (d->format >= 0x79 && d->format <= 0x94 && vka_nan_on()) {   // DM_VK_NANSCAN: all-zero blocks of ASTC textures (an all-zero ASTC block is an error block)
                 uint64_t zb = 0, nb = piece / 16; for (uint64_t k = 0; k < nb; k++) if (!mem_any(s.ptr + 16 * k, 16)) zb++;
@@ -1674,6 +1691,7 @@ static void upload_(vka_img *im, const tex_t *t, VkCommandBuffer cb, uint64_t *n
                 }
                 static _Atomic int nz; if (zb && atomic_fetch_add(&nz, 1) < 64) VLOG("NaN scan: upload of serial %llu format %#x level %u layer %u: %llu of %llu blocks all zero (storage %p)", (unsigned long long)t->serial, d->format, lv, ly, (unsigned long long)zb, (unsigned long long)nb, (const void *)t->mem);
             }
+            rgb32_widen(f, s.ptr, pitch, (size_t)by * z, bx);
             if (vka_upload_hook) vka_upload_hook(t, lv, ly, s.ptr, pitch, piece);
             VkBufferImageCopy c = {s.off, bx * f->bw, by * f->bh, {im->aspect, lv, ly, 1}, {0, 0, 0}, {w, h, z}};
             vk.vkCmdCopyBufferToImage(cb, s.buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
@@ -1803,7 +1821,7 @@ void vka_img_written_at(vka_img *im, const char *file, int line) {
         VLOG("large image serial %llu %ux%u layers %u format %#x (%.1f MiB): first GPU write at frame %llu (%s:%d), sampled by %u draws before, %u other textures over its storage", (unsigned long long)im->serial,
              im->w, im->h, im->layers, im->d.format, im->m.size / 1048576.0, (unsigned long long)vka_frame(), file, line, im->nsamp, im->novl); }
     im->gpu_owned = 1;
-    if ((im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && im->mem && !im->wb_pending && im->samples == 1 && im->f.kind < 3 && im->f.bw == 1) {
+    if ((im->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) && im->mem && !im->wb_pending && im->samples == 1 && im->f.kind < 3 && im->f.bw == 1 && !im->f.rgb32) {   // (RGB32: no copy back, the image's texels are 16 bytes)
         if (g_nwb == g_wbcap) { g_wbcap = g_wbcap ? 2 * g_wbcap : 32; g_wb = realloc(g_wb, (size_t)g_wbcap * sizeof *g_wb); }
         im->wb_pending = 1; im->refs++; g_wb[g_nwb++] = im;
     }
@@ -1832,12 +1850,12 @@ void vka_tex_writeback(VkCommandBuffer cb) {
 // undoing its layout, on the calling thread (after nxnative's mtl_read_texels, MIT)
 static int read_texels_gpu(vka_img *im, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img, int bw, int bh, int bpb) {
     uint32_t lv = level;
-    if (im->samples > 1 || im->scaled || im->f.astc_bw || im->f.bpb != bpb || im->f.bw != bw || im->f.bh != bh || !vka_img_lv(im, &lv)) return 0;
+    if (im->samples > 1 || im->scaled || im->f.astc_bw || im->f.bpb != (im->f.rgb32 ? 16 : bpb) || (im->f.rgb32 && bpb != 12) || im->f.bw != bw || im->f.bh != bh || !vka_img_lv(im, &lv)) return 0;
     VkImageAspectFlags asp = im->f.kind < 3 ? VK_IMAGE_ASPECT_COLOR_BIT : im->f.vk == VK_FORMAT_D16_UNORM || im->f.vk == VK_FORMAT_D32_SFLOAT ? VK_IMAGE_ASPECT_DEPTH_BIT
                            : im->f.vk == VK_FORMAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : 0;   // (a packed depth-stencil one: its buffer layout interleaves what Vulkan copies by aspect)
     const int is3d = im->d.target == NVN_TEXTURE_TARGET_3D, nz = r->depth > 0 ? r->depth : 1;
     if (!asp || (!is3d && layer0 + (uint32_t)r->zoffset + (uint32_t)nz > im->layers)) return 0;
-    const size_t wb = (size_t)((r->width + bw - 1) / bw) * (size_t)bpb, hb = (size_t)((r->height + bh - 1) / bh);
+    const size_t ib = im->f.rgb32 ? 16 : (size_t)bpb, wb = (size_t)((r->width + bw - 1) / bw) * ib, hb = (size_t)((r->height + bh - 1) / bh);   // (ib: the image's texel; RGB32's RGBA32 narrowed to the guest's 12 bytes)
     vcap_hbuf h; if (!vcap_hbuf_make(&h, wb * hb * (size_t)nz)) return 0;
     VkCommandBuffer cb = vcap_cb_begin(); int ok = 0;
     if (cb) {
@@ -1845,7 +1863,10 @@ static int read_texels_gpu(vka_img *im, unsigned level, unsigned layer0, const N
                                {(uint32_t)r->width, (uint32_t)r->height, is3d ? (uint32_t)nz : 1}};
         vk.vkCmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, h.b, 1, &c);
         if ((ok = vcap_cb_run(cb, &h, im)))   // (a 30 s timeout keeps h and im until the GPU is done: the free below then frees nothing)
-            for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(dst + (size_t)z * img + y * row, h.p + ((size_t)z * hb + y) * wb, wb);
+            for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) {
+                if (!im->f.rgb32) memcpy(dst + (size_t)z * img + y * row, h.p + ((size_t)z * hb + y) * wb, wb);
+                else for (size_t x = 0; x < wb / 16; x++) memcpy(dst + (size_t)z * img + y * row + 12 * x, h.p + ((size_t)z * hb + y) * wb + 16 * x, 12);
+            }
     }
     vcap_hbuf_free(&h);
     return ok;

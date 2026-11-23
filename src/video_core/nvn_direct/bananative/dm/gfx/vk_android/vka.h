@@ -252,6 +252,7 @@ typedef struct {
     uint8_t srgb;          // stored as UNORM, cleared with an sRGB-encoded colour
     uint8_t bpb, bw, bh;
     uint8_t astc_bw, astc_bh;   // an ASTC texture on a device without ASTC: the storage's block size; the image is BC3 (Lichii: BC1 when opaque and never in a texture copy, vka_tex.c astc_bc1) filled on the GPU or by vka_astc_transcode (0: not such a texture)
+    uint8_t rgb32;   // an RGB32 texture on a device without it (Lichii): the image is RGBA32 (bpb 16) and the guest's texels are 12 bytes; 1 float, 2 integer (alpha 1): vka_tex.c rgb32_widen
 } vka_fmt;
 int vka_fmt_of(int nvn_format, vka_fmt *f);         // 0 = no Vulkan format (logged once per format)
 // ASTC blocks (w x h x depth texels, bw x bh blocks, rows of blocks packed) transcoded to BC3 (rows of 4x4 blocks packed, 16 bytes each) on the CPU, for a device without
