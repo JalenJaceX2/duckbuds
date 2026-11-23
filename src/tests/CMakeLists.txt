@@ -217,6 +217,7 @@ add_executable(tests
     video_core/spirv_builtin_capabilities.cpp
     video_core/spirv_frag_depth_d24.cpp
     video_core/spirv_min_max_denorms.cpp
+    video_core/spirv_float_atomic_add.cpp
     video_core/spirv_nan_safe_min_max.cpp
     video_core/spirv_scalar_constants.cpp
     video_core/ssa_fixed_variables.cpp

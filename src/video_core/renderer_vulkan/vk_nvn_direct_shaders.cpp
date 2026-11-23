@@ -439,6 +439,7 @@ NvnDirectShaders::NvnDirectShaders(const Device& device, const Shader::Profile& 
     : profile{profile_}, host_info{host_info_} {
     // The replay sets no VK_EXT_depth_clip_control: the GL depth mode is converted in the shader.
     profile.support_native_ndc = false;
+    profile.support_float32_atomic_add = device.IsNvnDirectFloat32AtomicAddEnabled();
     // A texture or image handle no constant buffer word gives is read from the replay's pool tables
     // by the value the shader computes (NVN_DIRECT_POOL_SET), as on the console, not by a handle
     // program evaluated for each draw, which the replay has no means to run.

@@ -1031,6 +1031,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     VkPhysicalDeviceExclusiveScissorFeaturesNV direct_exclusive_scissor{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXCLUSIVE_SCISSOR_FEATURES_NV,
     };
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT direct_atomic_float{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+    };
     std::array<float, NvnDirectMaxQueues> direct_queue_priorities{};
     if (nvn_direct) {
         const bool pipeline_library =
@@ -1090,6 +1093,25 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                 loaded_extensions.insert(VK_NV_SCISSOR_EXCLUSIVE_EXTENSION_NAME);
             }
         }
+        // Native 32-bit float atomic adds on storage buffers in the translated shaders
+        // (vk_nvn_direct_shaders.cpp) instead of a compare-exchange loop
+        if (supported_extensions.contains(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME)) {
+            VkPhysicalDeviceFeatures2 atomic_float_query{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                .pNext = &direct_atomic_float};
+            physical.GetFeatures2(atomic_float_query);
+            nvn_direct_float32_atomic_add =
+                direct_atomic_float.shaderBufferFloat32AtomicAdd == VK_TRUE;
+            if (nvn_direct_float32_atomic_add) {
+                direct_atomic_float = {
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+                    .pNext = const_cast<void*>(first_next),
+                    .shaderBufferFloat32AtomicAdd = VK_TRUE,
+                };
+                first_next = &direct_atomic_float;
+                loaded_extensions.insert(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+            }
+        }
         const auto ci = std::ranges::find(queue_cis, graphics_family,
                                           &VkDeviceQueueCreateInfo::queueFamilyIndex);
         const u32 available = physical.GetQueueFamilyProperties()[graphics_family].queueCount;
@@ -1099,11 +1121,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         ci->pQueuePriorities = direct_queue_priorities.data();
         LOG_INFO(Render_Vulkan,
                  "NVN2 direct mode: dynamic rendering {}, graphics pipeline libraries {}, host "
-                 "memory import {}, {} of the graphics family's {} queues",
+                 "memory import {}, float atomic adds {}, {} of the graphics family's {} queues",
                  direct_dynamic_rendering.dynamicRendering == VK_TRUE,
                  direct_pipeline_library.graphicsPipelineLibrary == VK_TRUE,
                  loaded_extensions.contains(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME),
-                 nvn_direct_queue_count, available);
+                 nvn_direct_float32_atomic_add, nvn_direct_queue_count, available);
     }
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
 

@@ -354,6 +354,11 @@ public:
         return {nvn_direct_queues.data(), nvn_direct_queue_count};
     }
 
+    /// NVN2 direct mode: shaderBufferFloat32AtomicAdd is enabled for the replay's shaders.
+    bool IsNvnDirectFloat32AtomicAddEnabled() const {
+        return nvn_direct_float32_atomic_add;
+    }
+
     /// Returns the extensions the device was created with.
     const std::set<std::string, std::less<>>& GetLoadedExtensions() const {
         return loaded_extensions;
@@ -1455,6 +1460,7 @@ private:
     bool nvn_direct{};                                        ///< NVN2 direct mode
     std::array<VkQueue, NvnDirectMaxQueues> nvn_direct_queues{}; ///< NVN2 direct mode
     u32 nvn_direct_queue_count{};                             ///< NVN2 direct mode
+    bool nvn_direct_float32_atomic_add{};                     ///< NVN2 direct mode
     vk::Queue present_queue;     ///< Main present queue.
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
