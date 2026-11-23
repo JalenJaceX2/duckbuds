@@ -62,7 +62,7 @@ void mtl_set_frame(uint64_t f) {
           vka_enc_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb);
           vka_floor_stats(pb, sizeof pb); if (pb[0]) VLOG("%s", pb);
           vka_rp_bar_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb);
-          { void vka_vc_stats(char *b, size_t n, double frames); vka_vc_stats(pb, sizeof pb, n); if (pb[0]) VLOG("%s", pb); }
+          { void vka_vc_stats(char *b, size_t n, double frames); char vb[1200]; vka_vc_stats(vb, sizeof vb, n); if (vb[0]) VLOG("%s", vb); }
           { void vka_drv_memo_stats(char *b, size_t n); vka_drv_memo_stats(pb, sizeof pb); if (pb[0]) VLOG("%s", pb); } }
         f0 = f; d0 = g_stat_draws; rp0 = vka_n_rp; b0 = vka_n_bar; ub0 = g_n_ub; s0 = g_n_sub; r0 = g_rec_ns; o0 = g_stat_ops; pc0 = g_n_pclear; ch0 = g_n_chunks;
     }

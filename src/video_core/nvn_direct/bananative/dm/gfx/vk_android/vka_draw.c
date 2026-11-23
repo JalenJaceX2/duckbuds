@@ -694,6 +694,8 @@ enum { VC_N = 1 << 16, VC_PROBE = 64, VC_GWR = 1 << 16, VC_GWR_SHIFT = 16, VC_LA
 #define VC_NONE (~(VkDeviceSize)0)
 #define VC_MAXR ((uint64_t)64 << 20)
 enum { VW_OFF, VW_SIZE, VW_TABLE, VW_UNTRACKED, VW_SPLIT, VW_SEGMENT, VW_GPU, VW_CHURN, VW_FULL, VW_BATCH, VW_N };   // why a range reads guest RAM
+static const char *const g_vw_name[VW_N] = {"switched off", "over 64 MiB", "table full", "untracked", "virtual pages not one run", "not one segment",
+                                            "GPU write not done", "written again and again", "arena full", "no upload batch"};
 typedef struct {
     uint64_t addr, size;                   // the bound range (the key)
     const uint8_t *phys; const void *span; // where the CPU writes its bytes and the dirty tracker's range there
@@ -704,9 +706,11 @@ typedef struct {
     VkDeviceSize off;                      // the copy in the arena (VC_NONE: none)
     uint32_t last, rframe, cool;           // frame last bound, frame of the last refresh, end of a cooldown
     uint8_t live, kind, why, churn, mok;   // kind: 1 tracked directly, 2 through a virtual pool, 0 untracked (why); mok, why: the memo's answer
+    uint64_t hash;                         // of the first 256 bytes as the CPU saw them at the copy (vc_watch)
 } vc_ent;
 static vc_ent *g_vc; static VkBuffer g_vc_buf; static VkDeviceMemory g_vc_mem; static VkDeviceSize g_vc_size, g_vc_used; static int g_vc_failed;
 static uint64_t g_vc_ep = 1, g_vc_gwgen = 1;
+static uint64_t g_vc_wn, g_vc_wseen, g_vc_wbad;   // vc_watch: checks, changes the tracker had seen, changes it had not
 static uint64_t g_vc_hit, g_vc_miss, g_vc_why[VW_N], g_vc_new, g_vc_rcpu, g_vc_rgpu, g_vc_rep, g_vc_bytes_g, g_vc_bytes_v, g_vc_evict, g_vc_trk[3];
 // The arena's free places (sorted, merged) and the places waiting for their last reader's fence
 typedef struct { VkDeviceSize off, len; } vc_ext;
@@ -867,6 +871,23 @@ static int vc_churn(vc_ent *e, uint32_t f) {
     if (e->churn < 4) return 0;
     e->churn = 0; e->cool = f + 300; vc_drop(e); return 1;
 }
+// Sampled check (every 1024th bind from VRAM): the first 256 bytes of the range as the CPU sees them against their hash at the copy. A change the dirty tracker and the
+// GPU-write marks did not see is a copy shown stale: counted and logged ([RED], the first 8)
+uint64_t dm_guest_read_mapped(void *dst, uintptr_t a, size_t n);   // hle_svc.c
+static uint64_t vc_hash(const vc_ent *e) {
+    uint8_t b[256]; size_t n = e->size < sizeof b ? (size_t)e->size : sizeof b; uint64_t h = 1469598103934665603ull;
+    dm_guest_read_mapped(b, (uintptr_t)e->phys, n);
+    for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+static int vgw_state(const vc_ent *e);
+static void vc_watch(const vc_ent *e) {
+    g_vc_wn++;
+    if (vc_hash(e) == e->hash) return;
+    if (nvn_dirty_since_span(e->span, e->phys, e->size < 256 ? e->size : 256, e->stamp) || vgw_state(e)) { g_vc_wseen++; return; }   // (copied again at its next check)
+    if (++g_vc_wbad <= 8) VRED("VRAM vertex cache: the range %#llx+%#llx (%s) changed with no CPU write or GPU write seen since its copy: draws read stale vertices", (unsigned long long)e->addr,
+                               (unsigned long long)e->size, e->kind == 2 ? "through a virtual pool" : "tracked directly");
+}
 // e copied into a new place in an upload batch: all of it (full), or [lo, hi) from guest RAM and the rest from its old copy. 0 = not copied, why in *why
 static int vc_copy(vc_ent *e, int full, size_t lo, size_t hi, uint32_t f, int *why) {
     if (e->off == VC_NONE) full = 1;
@@ -875,6 +896,7 @@ static int vc_copy(vc_ent *e, int full, size_t lo, size_t hi, uint32_t f, int *w
     VkCommandBuffer ub = vka_up_begin();
     if (!ub || !vka_up_is(ub)) { if (ub) vka_up_end(); vc_free_now(off, len); *why = VW_BATCH; return 0; }
     e->stamp = nvn_dirty_now(); nvn_dirty_protect(e->phys, e->size);   // (the stamp before the GPU reads the bytes: a write after it is seen at the next check)
+    e->hash = vc_hash(e);
     if (full) { lo = 0; hi = e->size; }
     VkBufferCopy c = {e->so + lo, off + lo, hi - lo}; vk.vkCmdCopyBuffer(ub, e->sb, g_vc_buf, 1, &c);
     VkBufferCopy keep[2]; uint32_t nk = 0;
@@ -913,7 +935,7 @@ static int vc_bind(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
     e->last = f;
     if (e->msub == g_vc_sub && e->mgw == g_vc_gwgen && e->mep == g_vc_ep) {   // validated in this submission, nothing changed since
         if (!e->mok) VC_NO(e->why);
-        g_vc_hit++; e->fence = vka_rp_fence(); *b = g_vc_buf; *o = e->off; return 1;
+        if (!(++g_vc_hit & 1023)) vc_watch(e); e->fence = vka_rp_fence(); *b = g_vc_buf; *o = e->off; return 1;
     }
     e->msub = g_vc_sub; e->mgw = g_vc_gwgen; e->mep = g_vc_ep; e->mok = 0;
     if ((int32_t)(e->cool - f) > 0) { e->why = VW_CHURN; VC_NO(VW_CHURN); }
@@ -935,15 +957,24 @@ static int vc_bind(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
     }
     #undef VC_NO
     e->gwchk = g_vc_gwgen; e->mok = 1;
-    g_vc_hit++; e->fence = vka_rp_fence(); *b = g_vc_buf; *o = e->off; return 1;
+    if (!(++g_vc_hit & 1023)) vc_watch(e); e->fence = vka_rp_fence(); *b = g_vc_buf; *o = e->off; return 1;
 }
+// The replay statistics' line (vka_exec.c, every 300 frames): per frame, then the totals
 void vka_vc_stats(char *b, size_t n, double frames) {
-    static uint64_t h0, m0, c0, y0;
+    static uint64_t h0, m0, w0[VW_N], c0[4], y0[2], ev0, fl0;
     if (!g_vc || frames <= 0) { if (n) b[0] = 0; return; }
-    snprintf(b, n, "VRAM vertex cache per frame: %.0f streams bound from VRAM, %.0f from guest RAM, %.1f copies, %.2f MiB copied; %.0f of %.0f MiB used",
-             (g_vc_hit - h0) / frames, (g_vc_miss - m0) / frames, (g_vc_new + g_vc_rcpu + g_vc_rgpu + g_vc_rep - c0) / frames, (g_vc_bytes_g + g_vc_bytes_v - y0) / frames / 1048576.0,
-             g_vc_used / 1048576.0, g_vc_size / 1048576.0);
-    h0 = g_vc_hit; m0 = g_vc_miss; c0 = g_vc_new + g_vc_rcpu + g_vc_rgpu + g_vc_rep; y0 = g_vc_bytes_g + g_vc_bytes_v;
+    uint64_t faults, preps; nvn_dirty_stats(&faults, &preps);
+    const uint64_t c[4] = {g_vc_new, g_vc_rcpu, g_vc_rgpu, g_vc_rep};
+    size_t k = (size_t)snprintf(b, n, "VRAM vertex cache per frame: %.0f streams from VRAM, %.0f from guest RAM (", (g_vc_hit - h0) / frames, (g_vc_miss - m0) / frames);
+    for (int i = 0, any = 0; i < VW_N && k < n; i++) if (g_vc_why[i] > w0[i]) { k += (size_t)snprintf(b + k, n - k, "%s%s %.1f", any ? ", " : "", g_vw_name[i], (g_vc_why[i] - w0[i]) / frames); any = 1; }
+    if (k < n) k += (size_t)snprintf(b + k, n - k, "); copies %.2f new, %.2f after a CPU write, %.2f after a GPU write, %.2f after an invalidation; %.3f MiB from guest RAM, %.3f MiB kept from "
+                                     "the old copy; %.1f dropped for room; tracked pool memory: %.0f CPU writes seen; arena %.0f of %.0f MiB (%d places waiting for their fence); since the start: "
+                                     "ranges tracked %llu directly, %llu through a virtual pool, %llu untracked; sampled checks %llu, changes seen %llu, unseen %llu",
+                                     (c[0] - c0[0]) / frames, (c[1] - c0[1]) / frames, (c[2] - c0[2]) / frames, (c[3] - c0[3]) / frames, (g_vc_bytes_g - y0[0]) / frames / 1048576.0,
+                                     (g_vc_bytes_v - y0[1]) / frames / 1048576.0, (g_vc_evict - ev0) / frames, (faults - fl0) / frames, g_vc_used / 1048576.0, g_vc_size / 1048576.0, g_nvlate,
+                                     (unsigned long long)g_vc_trk[1], (unsigned long long)g_vc_trk[2], (unsigned long long)g_vc_trk[0], (unsigned long long)g_vc_wn,
+                                     (unsigned long long)g_vc_wseen, (unsigned long long)g_vc_wbad);
+    h0 = g_vc_hit; m0 = g_vc_miss; memcpy(w0, g_vc_why, sizeof w0); memcpy(c0, c, sizeof c0); y0[0] = g_vc_bytes_g; y0[1] = g_vc_bytes_v; ev0 = g_vc_evict; fl0 = faults;
 }
 // A uniform buffer: bound in place when Vulkan's offset alignment allows, else a copy of what the CPU sees now (a GPU write earlier in this submission is missed: logged)
 static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
