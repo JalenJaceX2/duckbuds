@@ -2019,7 +2019,15 @@ static VkSampler sampler_of(const samp_par *p) {
         .compareOp = p->cmp_func >= 1 && p->cmp_func <= 8 ? (VkCompareOp)(p->cmp_func - 1) : VK_COMPARE_OP_NEVER,
         .minLod = p->lod_min, .maxLod = mip ? p->lod_max : (p->lod_min < 0.25f ? 0.25f : p->lod_min),
         .borderColor = white ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : opaque ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK};
-    if (p->reduction) VRED_ONCE("sampler reduction mode %d not applied", p->reduction);
+    // NVN_SAMPLER_REDUCTION_AVERAGE 0 / MIN 1 / MAX 2 (nvn.h NVNsamplerReduction) -> VkSamplerReductionMode, spelled out
+    VkSamplerReductionModeCreateInfo red = {VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO};
+    if (p->reduction == NVN_SAMPLER_REDUCTION_MIN || p->reduction == NVN_SAMPLER_REDUCTION_MAX) {
+        if (V.sampler_minmax) {
+            red.reductionMode = p->reduction == NVN_SAMPLER_REDUCTION_MIN ? VK_SAMPLER_REDUCTION_MODE_MIN : VK_SAMPLER_REDUCTION_MODE_MAX;
+            ci.pNext = &red;
+            static _Atomic int logged; if (!atomic_exchange(&logged, 1)) VLOG("sampler reduction in use: min / max samplers (first one is mode %d)", p->reduction);
+        } else VRED_ONCE("sampler reduction mode %d not applied (samplerFilterMinmax not enabled on the device)", p->reduction);
+    }
     VkSampler s = VK_NULL_HANDLE;
     if (vk.vkCreateSampler(V.dev, &ci, NULL, &s)) return VK_NULL_HANDLE;
     g_samp = realloc(g_samp, (size_t)(g_nsamp + 1) * sizeof *g_samp); g_samp[g_nsamp++] = (samp_ent){*p, s};
