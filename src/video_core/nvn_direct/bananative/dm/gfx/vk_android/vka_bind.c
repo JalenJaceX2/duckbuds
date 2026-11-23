@@ -28,13 +28,20 @@ static uint64_t ubo_word(const vka_bstate *s, int st, int reg, unsigned off, uns
 static int ubo_tex_id(const vka_bstate *s, uint32_t h) { int t = (int)(h & 0xfffff); return t ? t + s->tex_base : 0; }
 static int ubo_samp_id(const vka_bstate *s, uint32_t h) { int x = (int)(h >> 20); return x ? x + s->samp_base : 0; }
 
+// Lichii: a combined handle read from uniform buffers: the word at (reg, off) ORed with the separate word at (sreg, soff) when the shader has one, as the hardware and
+// Lichii's other renderer combine them (vk_graphics_pipeline.cpp). Either word may carry either half: Duskbloods keeps the sampler bits in the first and the texture ID in the second
+static uint32_t tex_ubo_handle(const vka_bstate *s, int st, const dmsh_vk_bind *b, vka_read_fn rd, void *ctx) {
+    uint32_t h = (uint32_t)ubo_word(s, st, b->reg, b->off, 4, rd, ctx);
+    if (b->skind == DMSH_VK_KIND_SAMP_UBO && (b->sreg != b->reg || b->soff != b->off)) h |= (uint32_t)ubo_word(s, st, b->sreg, b->soff, 4, rd, ctx);
+    return h;
+}
 // The sampler half of a combined image sampler (skind, sreg, soff); element k of an array
 static int samp_of(const vka_bstate *s, int st, const dmsh_vk_bind *b, unsigned k, vka_read_fn rd, void *ctx) {
     switch (b->skind) {
     case DMSH_VK_KIND_SAMP_TEX: return b->sreg >= 0 && b->sreg < VKA_NTEX ? (int)(vka_tex_slot(s, st, (unsigned)b->sreg) >> 20 & 0xfff) : 0;   // the handle the texture half reads
     case DMSH_VK_KIND_SAMP: return b->sreg >= 0 && b->sreg < 128 ? (int)(s->samp[st][b->sreg] >> 20 & 0xfff) : 0;
     case DMSH_VK_KIND_SAMP_ID: return b->sreg > 0 ? b->sreg : 0;   // a constant of the shader (nvn_mtl.m NVN_RB_SAMPI): taken as it is
-    case DMSH_VK_KIND_SAMP_UBO: return ubo_samp_id(s, (uint32_t)ubo_word(s, st, b->sreg, b->soff, 4, rd, ctx));
+    case DMSH_VK_KIND_SAMP_UBO: return ubo_samp_id(s, b->kind == DMSH_VK_KIND_TEX_UBO ? tex_ubo_handle(s, st, b, rd, ctx) : (uint32_t)ubo_word(s, st, b->sreg, b->soff, 4, rd, ctx));
     case DMSH_VK_KIND_SAMP_C2A: {   // the handle at c2 byte off + 8 k, ORed with the separate sampler word at soff (nvn_mtl.m NVN_RB_SAMPA)
         uint64_t sw = b->soff != 0xFFFF ? vka_c2_handle(s, st, b->soff) : 0;
         return (int)((vka_c2_handle(s, st, b->off + 8u * k) | sw) >> 20 & 0xfff); }
@@ -84,7 +91,7 @@ int vka_walk(const vka_bstate *s, int st, const dmsh_vk_entry *e, const dmsh_vk_
                 if (p && rd && rd(ctx, p + b->soff, &a, 8) && a) { r.what = VKA_R_BUF; r.addr = a; r.size = 0; }   // the size is not known: to the end of the chunk
                 break; }
             case DMSH_VK_KIND_TEX: case DMSH_VK_KIND_TEX_UBO: case DMSH_VK_KIND_TEX_C2A: {
-                int tid = b->kind == DMSH_VK_KIND_TEX_UBO ? (noslot ? 0 : ubo_tex_id(s, (uint32_t)ubo_word(s, st, reg, b->off, 4, rd, ctx)))
+                int tid = b->kind == DMSH_VK_KIND_TEX_UBO ? (noslot ? 0 : ubo_tex_id(s, tex_ubo_handle(s, st, b, rd, ctx)))
                         : b->kind == DMSH_VK_KIND_TEX_C2A ? (int)(vka_c2_handle(s, st, b->off + 8u * k) & 0xfffff)
                         : noslot ? 0 : (int)(vka_tex_slot(s, st, (unsigned)reg) & 0xfffff);
                 int sid = b->skind ? samp_of(s, st, b, k, rd, ctx) : 0;
