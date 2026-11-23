@@ -10,8 +10,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { NQ = 2048, DESC = 96 };
-typedef struct { const char *file; int line; int kind; uint64_t draws, passes, ops; char desc[DESC]; } gp_mark;   // kind: 0 barrier, 1 submission start, 2 part start, 3 commit
+enum { NQ = 8192, DESC = 96 };
+typedef struct { const char *file; int line; int kind; uint64_t draws, passes, ops, vs, fs; char desc[DESC]; } gp_mark;   // kind: 0 barrier, 1 submission start, 2 part start, 3 commit, 4 draw (DM_VK_GPUPROF_DRAWS)
 static gp_mark g_m[NQ]; static int g_n;
 static VkQueryPool g_qp; static int g_ok = -1; static double g_tick_ns;
 static PFN_vkCmdWriteTimestamp g_write; static PFN_vkCmdResetQueryPool g_reset; static PFN_vkGetQueryPoolResults g_get;
@@ -19,6 +19,7 @@ static int g_state;                     // 0 idle, 1 recording the profiled fram
 static uint64_t g_frame, g_last_frame, g_fence; static VkCommandBuffer g_cb;
 static char g_pass[DESC]; static int g_pass_new;   // the last pass opened (vka_gp_pass), taken by the next mark
 static uint64_t g_sub_frame; static int g_sub_frame_set;
+static int g_draw_marks;   // DM_VK_GPUPROF_DRAWS=1: a timestamp after each draw of the profiled frame too (read when a profile is armed)
 int vka_gp_active;                      // marks are taken (read by vka_barrier)
 
 void vka_gp_sub_frame(uint64_t f) { g_sub_frame = f; g_sub_frame_set = 1; }   // the replay worker: the game frame of the submission it replays next
@@ -33,17 +34,24 @@ static int init(void) {
     g_tick_ns = V.props.limits.timestampPeriod; g_ok = 1;
     return 1;
 }
-static void mark(VkCommandBuffer cb, int kind, const char *file, int line) {
-    if (g_n >= NQ) return;
+static gp_mark *mark(VkCommandBuffer cb, int kind, const char *file, int line) {
+    if (g_n >= NQ) return NULL;
     gp_mark *m = &g_m[g_n]; m->file = file; m->line = line; m->kind = kind;
     uint64_t sk, di, pi; vka_draw_stats(&m->draws, &sk, &di, &pi); (void)sk; (void)di; (void)pi;
     extern uint64_t vka_n_rp; m->passes = vka_n_rp; uint64_t subs, rec; vka_exec_counts(&m->ops, &subs, &rec);
-    if (g_pass_new) { memcpy(m->desc, g_pass, DESC); g_pass_new = 0; } else m->desc[0] = 0;
+    if (g_pass_new && kind != 4) { memcpy(m->desc, g_pass, DESC); g_pass_new = 0; } else m->desc[0] = 0;   // (the pass is named at the step that ends it, not at its draws)
     vka_enc_sync();
     g_write(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_qp, (uint32_t)g_n);
     g_n++;
+    return m;
 }
 void vka_gp_mark(VkCommandBuffer cb, const char *file, int line) { if (cb == g_cb) mark(cb, 0, file, line); }
+// A draw just recorded (DM_VK_GPUPROF_DRAWS): the time from the mark before it, with its vertex (or mesh) and pixel shaders' keys
+void vka_gp_draw(VkCommandBuffer cb, uint64_t vs, uint64_t fs, const char *desc) {
+    if (!g_draw_marks || cb != g_cb) return;
+    gp_mark *m = mark(cb, 4, "draw", 0); if (!m) return;
+    m->vs = vs; m->fs = fs; snprintf(m->desc, DESC, "%s", desc);
+}
 void vka_gp_pass(const char *desc) { if (vka_gp_active) { snprintf(g_pass, DESC, "%s", desc); g_pass_new = 1; } }
 void vka_gp_part(VkCommandBuffer cb) { if (!vka_gp_active) return; g_cb = cb; mark(cb, 2, "part", 0); }
 
@@ -53,24 +61,29 @@ static void report(void) {
     static uint64_t t[NQ];
     if (g_get(V.dev, g_qp, 0, (uint32_t)g_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT)) { VLOG("gpu prof: frame %llu: results not ready", (unsigned long long)g_frame); return; }
     static step s[NQ]; int ns = 0; double tot = 0, pass = 0, xfer = 0, bare = 0, first = 0; int npass = 0;
-    for (int i = 1; i < g_n; i++) {
+    static int prev[NQ]; static step ds[NQ]; int nd = 0;   // prev: each step's mark before it that is not a draw's; ds: the draws' own times
+    for (int i = 1, p = 0; i < g_n; i++) {
+        prev[i] = p;
+        if (g_m[i].kind == 4) { ds[nd++] = (step){i, t[i] > t[i - 1] ? (t[i] - t[i - 1]) * g_tick_ns / 1e6 : 0}; continue; }
+        p = i;
         if (g_m[i].kind == 1 || g_m[i].kind == 2) continue;   // the gap before a submission or part: the GPU waited for recording
-        double ms = t[i] > t[i - 1] ? (t[i] - t[i - 1]) * g_tick_ns / 1e6 : 0;
+        const int q = prev[i];
+        double ms = t[i] > t[q] ? (t[i] - t[q]) * g_tick_ns / 1e6 : 0;
         tot += ms; s[ns++] = (step){i, ms};
-        if (g_m[i].passes > g_m[i - 1].passes) { pass += ms; npass++; }
-        else if (g_m[i].ops > g_m[i - 1].ops || g_m[i].draws > g_m[i - 1].draws || !strncmp(g_m[i].desc, "dispatch ", 9)) xfer += ms;   // (Lichii: a dispatch, vka_dispatch)
+        if (g_m[i].passes > g_m[q].passes) { pass += ms; npass++; }
+        else if (g_m[i].ops > g_m[q].ops || g_m[i].draws > g_m[q].draws || !strncmp(g_m[i].desc, "dispatch ", 9)) xfer += ms;   // (Lichii: a dispatch, vka_dispatch)
         else bare += ms;
-        if (g_m[i - 1].kind == 1) first += ms;
+        if (g_m[q].kind == 1) first += ms;
     }
     VLOG("gpu prof: frame %llu: %d timestamps, %.2f ms GPU: passes %.2f ms (%d), clears / copies / dispatches %.2f ms, steps with nothing recorded (barriers, uploads, writebacks) %.2f ms",
          (unsigned long long)g_frame, g_n, tot, pass, npass, xfer, bare);
     if (VKA_ENV("DM_VK_GPUPROF_LIST", 0))   // every step in order
-        for (int k = 0; k < ns; k++) { const gp_mark *a = &g_m[s[k].i - 1], *b = &g_m[s[k].i];
+        for (int k = 0; k < ns; k++) { const gp_mark *a = &g_m[prev[s[k].i]], *b = &g_m[s[k].i];
             VLOG("gpu prof: step #%d %.3f ms: %s:%d, %llu draws, %llu ops%s%s", s[k].i, s[k].ms, b->file, b->line, (unsigned long long)(b->draws - a->draws),
                  (unsigned long long)(b->ops - a->ops), b->desc[0] ? "; pass " : "", b->desc); }
     qsort(s, (size_t)ns, sizeof *s, by_ms);
     for (int k = 0; k < ns && k < 16; k++) {
-        const gp_mark *a = &g_m[s[k].i - 1], *b = &g_m[s[k].i];
+        const gp_mark *a = &g_m[prev[s[k].i]], *b = &g_m[s[k].i];
         VLOG("gpu prof:  #%d %.3f ms: %s:%d, %llu draws, %llu passes, %llu ops%s%s", s[k].i, s[k].ms, b->file, b->line, (unsigned long long)(b->draws - a->draws),
              (unsigned long long)(b->passes - a->passes), (unsigned long long)(b->ops - a->ops), b->desc[0] ? "; pass " : "", b->desc);
     }
@@ -83,6 +96,24 @@ static void report(void) {
     char line[1200]; size_t ln = 0; line[0] = 0;
     for (int j = 0; j < nsite && ln < sizeof line; j++) ln += (size_t)snprintf(line + ln, sizeof line - ln, " %s:%d %dx %.2fms;", site[j].f, site[j].l, site[j].n, site[j].ms);
     VLOG("gpu prof: by site:%s", line);
+    if (!nd) return;
+    // DM_VK_GPUPROF_DRAWS: the draws that cost most (the time since the mark before each, so a pass's first draw has its begin), and the time by pixel and by vertex shader
+    double dt = 0; for (int k = 0; k < nd; k++) dt += ds[k].ms;
+    qsort(ds, (size_t)nd, sizeof *ds, by_ms);
+    VLOG("gpu prof: %d draws timed, %.2f ms", nd, dt);
+    for (int k = 0; k < nd && k < 24; k++) { const gp_mark *b = &g_m[ds[k].i];
+        VLOG("gpu prof:  draw #%d %.3f ms: %s; vs %016llx fs %016llx", ds[k].i, ds[k].ms, b->desc, (unsigned long long)b->vs, (unsigned long long)b->fs); }
+    for (int by = 0; by < 2; by++) {
+        static struct { uint64_t key; int n; double ms; } agg[512]; int na = 0;
+        for (int k = 0; k < nd; k++) { const uint64_t key = by ? g_m[ds[k].i].vs : g_m[ds[k].i].fs; int j = 0;
+            while (j < na && agg[j].key != key) j++;
+            if (j == na) { if (na == 512) continue; agg[na++] = (typeof(agg[0])){key, 0, 0}; }
+            agg[j].n++; agg[j].ms += ds[k].ms; }
+        for (int a = 0; a < na; a++) for (int b = a + 1; b < na; b++) if (agg[b].ms > agg[a].ms) { typeof(agg[0]) x = agg[a]; agg[a] = agg[b]; agg[b] = x; }
+        ln = 0; line[0] = 0;
+        for (int j = 0; j < na && j < 16 && ln < sizeof line; j++) ln += (size_t)snprintf(line + ln, sizeof line - ln, " %016llx %dx %.2fms;", (unsigned long long)agg[j].key, agg[j].n, agg[j].ms);
+        VLOG("gpu prof: draws by %s shader (%d):%s", by ? "vertex" : "pixel", na, line);
+    }
 }
 // mtl_sub_begin, after the command buffer begins: arms the profile at a new frame, reports a finished one
 void vka_gp_sub_begin(VkCommandBuffer cb, uint64_t frame) {
@@ -93,7 +124,7 @@ void vka_gp_sub_begin(VkCommandBuffer cb, uint64_t frame) {
     if (g_state == 0) {
         int every = VKA_ENV("DM_VK_GPUPROF", 0);
         if (every <= 0 || frame == g_frame || (g_last_frame && frame < g_last_frame + (uint64_t)every) || !init()) return;
-        g_state = 1; g_frame = g_last_frame = frame; g_n = 0; vka_gp_active = 1; g_pass_new = 0;
+        g_state = 1; g_frame = g_last_frame = frame; g_n = 0; vka_gp_active = 1; g_pass_new = 0; g_draw_marks = VKA_ENV("DM_VK_GPUPROF_DRAWS", 0) != 0;
         g_reset(cb, g_qp, 0, NQ);
     }
     if (g_state == 1) { g_cb = cb; mark(cb, 1, "submission", 0); }

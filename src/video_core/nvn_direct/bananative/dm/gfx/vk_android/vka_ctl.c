@@ -144,7 +144,36 @@ static void stats_line(uint64_t f) {
     { char im[600]; vka_imem_stats(im, sizeof im); VLOG("ctl: %s", im); }
     { char bs[1000]; vka_tex_big_stats(bs, sizeof bs); if (bs[0]) VLOG("ctl: %s", bs); }
 }
+// DM_VK_AB (diagnostics, read at the first frame): phases of live switches, "KEY=V,KEY=V|KEY=V|..." (an empty phase sets none), each DM_VK_AB_FRAMES frames (default 900),
+// cycled: a phase clears every key the others name and sets its own (as "env" lines, applied at the next frame boundary). Each phase's last frame logs a stats line of its
+// last 60 frames, which names the switches set, so one run compares the settings at the same spot
+static void ab_frame(uint64_t f) {
+    static char spec[512]; static int np = -1, cur = -1; static uint64_t len;
+    if (np < 0) { const char *e = getenv("DM_VK_AB"); np = 0; if (!e || !*e) return;
+                  snprintf(spec, sizeof spec, "%s", e); np = 1; for (const char *c = spec; *c; c++) np += *c == '|';
+                  len = (uint64_t)VKA_ENV("DM_VK_AB_FRAMES", 900); if (len < 120) len = 120;
+                  VLOG("ctl: A/B cycle of %d phases, %llu frames each: %s", np, (unsigned long long)len, spec); }
+    if (!np) return;
+    if (f % len == len - 1) atomic_store(&g_stats, 1);
+    const int want = (int)(f / len % (uint64_t)np); if (want == cur) return;
+    cur = want;
+    char b[512]; int ph = 0;
+    for (int pass = 0; pass < 2; pass++) {   // 0: clear every key, 1: set the phase's
+        memcpy(b, spec, sizeof b); ph = 0;
+        for (char *c = b, *tok = b;; c++) {
+            if (*c && *c != '|' && *c != ',') continue;
+            const char end = *c; *c = 0;
+            char *eq = strchr(tok, '=');
+            if (eq && eq > tok) { *eq = 0; if (!pass) dm_gfx_ctl_env(tok, ""); else if (ph == want) dm_gfx_ctl_env(tok, eq + 1); }
+            if (!end) break;
+            if (end == '|') ph++;
+            tok = c + 1;
+        }
+    }
+    VLOG("ctl: A/B phase %d of %d from frame %llu", want, np, (unsigned long long)f);
+}
 void vka_ctl_frame(uint64_t f) {   // mtl_set_frame: frame f begins
+    ab_frame(f);
     snap(&g_rec[f % NREC], f);
     long c = atomic_load_explicit(&g_capture, memory_order_relaxed);
     if (c > 0) { if (!g_cap_from) { g_cap_from = f; g_cap_to = f + (uint64_t)c; VLOG("ctl: capture of frames %llu-%llu begins", (unsigned long long)f, (unsigned long long)(g_cap_to - 1)); } atomic_store(&g_capture, 0); }

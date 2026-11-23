@@ -1208,7 +1208,7 @@ static void vin_bind(const vka_dstate *d) {
     for (uint32_t st = 0; st < 16; st++) if (VI.used >> st & 1) {   // each stream at its address, as far as it is bound and placed
         VkBuffer b = g_zero.buf; VkDeviceSize o = g_zero.off, sz = 65536;
         uint64_t addr = d->vbuf[st].address, size = d->vbuf[st].size;
-        if (addr) { VkBuffer cb; VkDeviceSize co; uint64_t run = vka_addr_run(addr, size ? size : 1ull << 30, &cb, &co);
+        if (addr && !VKA_ENV("DM_VK_XP_VB_ZERO", 0)) { VkBuffer cb; VkDeviceSize co; uint64_t run = vka_addr_run(addr, size ? size : 1ull << 30, &cb, &co);
                     if (run) { b = cb; o = co; sz = run; } else VRED_ONCE("vertex stream at %#llx is not in placed guest RAM: it reads zeros", (unsigned long long)addr); }
         vb_set(st, b, o, sz, &n0, &nn, rb, ro, rs);
     }
@@ -1480,6 +1480,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         if (x1 <= x0 || y1 <= y0) return;   // an empty scissor: nothing drawn
         scr = (VkRect2D){{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
     }
+    // (DM_VK_XP_VB_ZERO=1, vin_bind: experiment (wrong picture), every vertex stream reads the zeros buffer in device memory, to split vertex fetch from guest RAM off the rest)
     { int xs = VKA_ENV("DM_VK_XP_SCISSOR", 0);   // experiment (wrong picture): every draw's scissor cut to xs x xs pixels, to split a pass's GPU time into per-pixel and per-draw work
       if (xs > 0) { if (scr.extent.width > (uint32_t)xs) scr.extent.width = (uint32_t)xs; if (scr.extent.height > (uint32_t)xs) scr.extent.height = (uint32_t)xs; } }
     DY_SET(sc, scr, vk.vkCmdSetScissor(g_cb, 0, 1, &scr));
@@ -1592,6 +1593,10 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
         else vk.vkCmdDrawIndexed(g_cb, (uint32_t)di->count, inst, 0, di->base_vertex, binst);
     }
     g_draws++;
+    if (vka_gp_active) { char b[96]; const int32_t cnt = dw ? dw->count : di->count;   // DM_VK_GPUPROF_DRAWS
+        snprintf(b, sizeof b, "%s %d x%u vp %.0fx%.0f sc %ux%u pass %ux%u", mesh ? "mesh" : ind ? "indirect" : di ? "indexed" : "arrays", cnt, inst, d->vp[0][2], d->vp[0][3],
+                 scr.extent.width, scr.extent.height, R.area.extent.width, R.area.extent.height);
+        vka_gp_draw(g_cb, sh[0] ? sh[0]->key : sh[7] ? sh[7]->key : 0, sh[1] ? sh[1]->key : 0, b); }
     PT(8);
     if (vka_nan_on() >= 2 && vka_nan_split(R.cim, R.nci)) vka_rp_end();   // DM_VK_NANSCAN=2: a scan inside the game's pass
 }

@@ -364,6 +364,7 @@ void vka_barrier_at(VkCommandBuffer cb, const char *file, int line);   // a full
 extern int vka_gp_active;
 void vka_gp_mark(VkCommandBuffer cb, const char *file, int line);
 void vka_gp_pass(const char *desc);
+void vka_gp_draw(VkCommandBuffer cb, uint64_t vs, uint64_t fs, const char *desc);   // DM_VK_GPUPROF_DRAWS: a timestamp after a draw
 void vka_gp_part(VkCommandBuffer cb);
 void vka_gp_sub_begin(VkCommandBuffer cb, uint64_t frame);
 void vka_gp_commit(VkCommandBuffer cb, uint64_t fence);
