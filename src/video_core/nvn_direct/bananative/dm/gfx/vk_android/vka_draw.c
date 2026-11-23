@@ -685,7 +685,7 @@ enum { VC_N = 1 << 15 };
 #define VC_ARENA ((VkDeviceSize)768 << 20)
 typedef struct { uint64_t addr, size, stamp; const void *span; VkDeviceSize off; uint32_t copies; uint8_t state; } vc_ent;   // state 0 empty, 1 copied, 2 guest RAM
 static vc_ent *g_vc; static VkBuffer g_vc_buf; static VkDeviceMemory g_vc_mem; static VkDeviceSize g_vc_top; static int g_vc_failed;
-static uint64_t g_vc_bytes, g_vc_ncopy, g_vc_nrecopy, g_vc_hit, g_vc_bypass;
+static uint64_t g_vc_bytes, g_vc_ncopy, g_vc_nrecopy, g_vc_hit, g_vc_bypass, g_vc_why[6], g_vc_untracked;   // why: size, table, copied too often or arena full, not one segment, no upload batch, kept in guest RAM
 static int vc_init(void) {
     if (g_vc_buf || g_vc_failed) return g_vc_buf != VK_NULL_HANDLE;
     g_vc_failed = 1;
@@ -701,18 +701,23 @@ static int vc_init(void) {
 }
 // The copy of [addr, addr + size) for this draw: 1 = *b / *o are it (an upload batch copies it before the part runs), 0 = read guest RAM
 static int vc_get(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
-    if (!size || size > (64u << 20) || !vc_init()) return 0;
+    #define VC_NO(w) do { g_vc_bypass++; g_vc_why[w]++; return 0; } while (0)
+    if (!vc_init()) return 0;
+    if (!size || size > (64u << 20)) VC_NO(0);
     uint64_t h = (addr ^ size * 0x9E3779B97F4A7C15ull) * 0xff51afd7ed558ccdull; vc_ent *e = NULL;
     for (uint32_t i = 0; i < 64; i++) { vc_ent *x = &g_vc[(h + i) & (VC_N - 1)]; if (!x->state || (x->addr == addr && x->size == size)) { e = x; break; } }
-    if (!e || e->state == 2) { g_vc_bypass++; return 0; }   // (!e: the table's neighbourhood is full)
-    if (e->state == 1 && !nvn_dirty_since_span(e->span, (const void *)(uintptr_t)addr, size, e->stamp)) { g_vc_hit++; *b = g_vc_buf; *o = e->off; return 1; }
-    if (!e->state) { e->addr = addr; e->size = size; e->span = nvn_dirty_span((const void *)(uintptr_t)addr, size); if (!e->span) { e->state = 2; g_vc_bypass++; return 0; } }
-    if (e->copies >= 4 || g_vc_top + size + 256 > VC_ARENA) { e->state = 2; g_vc_bypass++; return 0; }
+    if (!e) VC_NO(1);   // (the table's neighbourhood is full)
+    if (e->state == 2) VC_NO(5);
+    // (an untracked range, a pool the CPU cannot write such as a virtual pool's pages or a CPU_NO_ACCESS pool: copied once)
+    if (e->state == 1 && (!e->span || !nvn_dirty_since_span(e->span, (const void *)(uintptr_t)addr, size, e->stamp))) { g_vc_hit++; *b = g_vc_buf; *o = e->off; return 1; }
+    if (!e->state) { e->addr = addr; e->size = size; e->span = nvn_dirty_span((const void *)(uintptr_t)addr, size); if (!e->span) g_vc_untracked++; }
+    if (e->copies >= 4 || g_vc_top + size + 256 > VC_ARENA) { e->state = 2; VC_NO(2); }
     VkBuffer sb; VkDeviceSize so; uint64_t run = vka_addr_run(addr, size, &sb, &so);
-    if (run < size) { e->state = 2; g_vc_bypass++; return 0; }
+    if (run < size) { e->state = 2; VC_NO(3); }
     VkCommandBuffer ub = vka_up_begin();
-    if (!ub || !vka_up_is(ub)) { if (ub) vka_up_end(); g_vc_bypass++; return 0; }
-    e->stamp = nvn_dirty_now(); nvn_dirty_protect((const void *)(uintptr_t)addr, size);   // (the stamp before the GPU reads the bytes: a write after it copies again)
+    if (!ub || !vka_up_is(ub)) { if (ub) vka_up_end(); VC_NO(4); }
+    #undef VC_NO
+    if (e->span) { e->stamp = nvn_dirty_now(); nvn_dirty_protect((const void *)(uintptr_t)addr, size); }   // (the stamp before the GPU reads the bytes: a write after it copies again)
     const VkDeviceSize off = (g_vc_top + 255) & ~(VkDeviceSize)255; g_vc_top = off + size;   // a new place each time: an earlier copy may still be read by work in flight
     VkBufferCopy c = {so, off, size}; vk.vkCmdCopyBuffer(ub, sb, g_vc_buf, 1, &c);
     vka_barrier(ub); vka_up_end();
@@ -723,9 +728,11 @@ static int vc_get(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
 void vka_vc_stats(char *b, size_t n, double frames) {
     static uint64_t c0, r0, h0, y0, by0;
     if (!g_vc || frames <= 0) { if (n) b[0] = 0; return; }
-    snprintf(b, n, "vertex/uniform copies per frame: %.0f bound from copies, %.0f from guest RAM, %.1f copies (%.1f again after a CPU write), %.2f MiB copied; arena %.0f of %llu MiB",
+    snprintf(b, n, "vertex/uniform copies per frame: %.0f bound from copies, %.0f from guest RAM, %.1f copies (%.1f again after a CPU write), %.2f MiB copied; arena %.0f of %llu MiB; "
+             "guest RAM since the start by reason: size %llu, table %llu, copied too often / arena full %llu, not in one segment %llu, no upload batch %llu, kept there %llu; %llu ranges untracked (copied once)",
              (g_vc_hit - h0) / frames, (g_vc_bypass - by0) / frames, (g_vc_ncopy - c0) / frames, (g_vc_nrecopy - r0) / frames, (g_vc_bytes - y0) / frames / 1048576.0, g_vc_top / 1048576.0,
-             (unsigned long long)(VC_ARENA >> 20));
+             (unsigned long long)(VC_ARENA >> 20), (unsigned long long)g_vc_why[0], (unsigned long long)g_vc_why[1], (unsigned long long)g_vc_why[2], (unsigned long long)g_vc_why[3],
+             (unsigned long long)g_vc_why[4], (unsigned long long)g_vc_why[5], (unsigned long long)g_vc_untracked);
     c0 = g_vc_ncopy; r0 = g_vc_nrecopy; h0 = g_vc_hit; y0 = g_vc_bytes; by0 = g_vc_bypass;
 }
 static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
