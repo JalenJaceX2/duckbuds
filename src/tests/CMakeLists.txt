@@ -390,6 +390,19 @@ if (TARGET nvn_direct AND NOT WIN32)
     target_link_libraries(nvn_present_tests PRIVATE Threads::Threads Vulkan::Headers)
     add_test(NAME nvn_present_tests COMMAND nvn_present_tests)
 
+    add_executable(nvn_hostseg_tests
+        video_core/nvn_hostseg.c
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/nvn/nvn_hostseg.c)
+    target_include_directories(nvn_hostseg_tests PRIVATE
+        ${NVN_DIRECT_DIR}/bananative/gen
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/nvn/include
+        ${NVN_DIRECT_DIR}/bananative/dm/gfx/nvn
+        ${NVN_DIRECT_DIR}/bananative/dm/host)
+    set_target_properties(nvn_hostseg_tests PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
+    target_compile_definitions(nvn_hostseg_tests PRIVATE __ANDROID__ _GNU_SOURCE)
+    target_link_libraries(nvn_hostseg_tests PRIVATE Threads::Threads)
+    add_test(NAME nvn_hostseg_tests COMMAND nvn_hostseg_tests)
+
     add_executable(nvn_bind_tests
         video_core/nvn_bind.c
         ${NVN_DIRECT_DIR}/bananative/dm/gfx/vk_android/vka_bind.c)

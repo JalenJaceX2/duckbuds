@@ -26,6 +26,7 @@ add_library(nvn_direct STATIC
     nvn_window.c
     ${BN}/gfx/nvn/android_stub.c
     ${BN}/gfx/nvn/hle_nvn.c
+    ${BN}/gfx/nvn/nvn_hostseg.c
     ${BN}/gfx/nvn/nvn_capture.c
     ${BN}/gfx/nvn/nvn_tex.c
     ${BN}/gfx/tex/nvn_deswizzle.c
