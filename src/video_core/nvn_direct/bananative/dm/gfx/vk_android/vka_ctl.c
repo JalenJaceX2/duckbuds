@@ -131,6 +131,7 @@ static void stats_line(uint64_t f) {
     const frec *a = &g_rec[(f - (uint64_t)n) % NREC], *b = &g_rec[f % NREC];
     double k = n, gpu = 0; int ng = 0;
     for (uint64_t i = f - (uint64_t)n; i < f; i++) { double g = mtl_gpu_ms(i); if (g >= 0) { gpu += g; ng++; } }
+    double fps0 = b->t > a->t ? k * 1e9 / (double)(b->t - a->t) : 0;   // from the same frames as the frame time (nxhost_fps's count is never fed: vka_fps_note has no caller)
     float fps[5] = {0}; nxhost_fps(fps, 5); uint64_t peak, placed = vka_mem_placed_bytes(&peak), img_gw; int img_n; uint64_t img = vka_tex_mem(&img_n, &img_gw);
     char sw[600] = ""; size_t sn = 0;
     pthread_mutex_lock(&g_emu);
@@ -138,7 +139,7 @@ static void stats_line(uint64_t f) {
     pthread_mutex_unlock(&g_emu);
     VLOG("ctl: stats at frame %llu, last %d frames: %.1f fps (%.1f presented), %.2f ms a frame; per frame %.0f draws (%.0f skipped), %.0f dispatches, %.0f render passes, %.0f full barriers, "
          "%.0f clears / copies, %.1f submissions, recording %.2f ms, GPU %.2f ms (%d frames); placed memory %.0f MB (peak %.0f); images %.0f MB (%d; GPU-written %.0f MB, from storage %.0f MB); switches set live:%s",
-         (unsigned long long)f, n, fps[0], fps[1], (b->t - a->t) / 1e6 / k, (b->draws - a->draws) / k, (b->skipped - a->skipped) / k, (b->disp - a->disp) / k, (b->rp - a->rp) / k,
+         (unsigned long long)f, n, fps0, fps[1], (b->t - a->t) / 1e6 / k, (b->draws - a->draws) / k, (b->skipped - a->skipped) / k, (b->disp - a->disp) / k, (b->rp - a->rp) / k,
          (b->bar - a->bar) / k, (b->ops - a->ops) / k, (b->subs - a->subs) / k, (b->rec_ns - a->rec_ns) / 1e6 / k, ng ? gpu / ng : -1.0, ng, placed / 1e6, peak / 1e6, img / 1e6, img_n, img_gw / 1e6, (img - img_gw) / 1e6, sn ? sw : " none");
     { char ab[400]; vka_tex_alias_stats(ab, sizeof ab); VLOG("ctl: %s", ab); }
     { char im[600]; vka_imem_stats(im, sizeof im); VLOG("ctl: %s", im); }

@@ -2371,11 +2371,16 @@ NVN(nvnTextureWriteTexelsStrided, void, const NVNtexture *t, const NVNtextureVie
 // RHIAsyncReallocateTexture2D: nvnCommandBufferCopyTextureToTexture, a level at a time) and writes the new, finer levels from the CPU; uploaded from the storage, the copied levels held
 // what the pool had there before (another texture's data, zeros), and the Yoshis' felt sampled speckles from the moment a level streamed in. −1 when the copy cannot be mirrored (3D,
 // a format mismatch, a region out of range): the GPU copy alone then stands until the next upload
-static int mirror_prepare(const tex_t *t, unsigned level, unsigned layer) {   // unprotect (and mark written) the storage of one level of one layer
+static int mirror_write(const tex_t *t, unsigned level, unsigned layer, const NVNcopyRegion *r, const uint8_t *src, size_t row, int bw, int bh, int bpb) {   // writes a region of one level of one layer, and marks that level's storage written
     uint64_t lo = nvn_tex_level_offset(&t->d, level), hi = level + 1 < t->d.levels ? nvn_tex_level_offset(&t->d, level + 1) : t->L.layer_size;
     if (hi <= lo || hi > t->L.layer_size || (uint64_t)layer * t->L.layer_size + hi > t->L.size) return -1;
-    dm_guest_write_prepare(t->mem + (uint64_t)layer * t->L.layer_size + lo, hi - lo);
-    return 0;
+    uint64_t base = (uint64_t)layer * t->L.layer_size + lo, len = hi - lo;
+    // Lichii: through the backing memory when the storage is one run there, stamped after the write (as write_texels)
+    uint8_t *const back = nvn_direct_writable_run(t->mem, t->L.size);
+    if (!back) dm_guest_write_prepare(t->mem + base, len);
+    int bad = write_region_bl(t, back ? back : t->mem, level, layer, r, src, row, bw, bh, bpb);
+    if (back) dm_guest_write_prepare(t->mem + base, len);
+    return bad ? -1 : 0;
 }
 int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
@@ -2383,7 +2388,7 @@ int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NV
     int nz = r->depth ? r->depth : 1;
     for (int z = 0; z < nz; z++) {
         unsigned layer = layer0 + (unsigned)(r->zoffset + z);
-        if (mirror_prepare(t, level, layer) || write_region_bl(t, t->mem, level, layer, r, src + (size_t)z * img, row, bw, bh, bpb)) return -1;
+        if (mirror_write(t, level, layer, r, src + (size_t)z * img, row, bw, bh, bpb)) return -1;
     }
     return 0;
 }
@@ -2398,7 +2403,7 @@ int nvn_tex_mirror_t2t(const tex_t *s, unsigned sl, unsigned ss, const NVNcopyRe
     int nz = sr->depth ? sr->depth : 1, ok = 1;
     for (int z = 0; z < nz && ok; z++) {
         unsigned layer = ds + (unsigned)(dr->zoffset + z);
-        ok = !nvn_deswizzle(&s->d, sl, ss + (unsigned)(sr->zoffset + z), s->mem, lin, lp) && !mirror_prepare(d, dl, layer) && !write_region_bl(d, d->mem, dl, layer, dr, lin + y0 * lp + x0, lp, bw, bh, bpb);
+        ok = !nvn_deswizzle(&s->d, sl, ss + (unsigned)(sr->zoffset + z), s->mem, lin, lp) && !mirror_write(d, dl, layer, dr, lin + y0 * lp + x0, lp, bw, bh, bpb);
     }
     free(lin);
     return ok ? 0 : -1;
