@@ -20,6 +20,7 @@
 #include <limits>
 #include <atomic>
 #include <deque>
+#include <functional>
 #include <map>
 #include <optional>
 #include <memory>
@@ -89,6 +90,7 @@
 #include "core/hle/service/nx2_video_input_queue.h"
 #include "core/hle/service/nx2_present.h"
 #include "core/hle/service/nx2_present_pacer.h"
+#include "core/hle/service/nx2_present_queue.h"
 #include "core/hle/service/nx2_video_ready.h"
 #include "core/hle/service/sm/sm.h"
 #include "core/hle/service/server_manager.h"
@@ -2037,6 +2039,8 @@ public:
     }
 
     ~INx2Vi2Session() override {
+        // Wake waits on outstanding releases before their syncpoint returns to nvdrv.
+        m_releases.reset();
         {
             std::scoped_lock lk{g_nx2_hdr_change_checks.mutex};
             std::erase_if(g_nx2_hdr_change_checks.checks,
@@ -2061,7 +2065,7 @@ public:
         for (auto* event : m_events) {
             m_context.CloseEvent(event);
         }
-        // The interval belonged to this session's presents (PaceToVblank).
+        // The interval belonged to this session's presents (PresentInterval).
         Tegra::g_nx2_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
     }
 
@@ -2071,8 +2075,8 @@ private:
     }
 
     // 229(u64 client token, u32 slot, u32 image, ...fences): result, u64 mask of buffer slots the
-    // client may acquire next, four zero words. Nothing is shown yet; every slot is handed back
-    // at once (changes.patch's default mask is 0x7fff).
+    // client may acquire next (changes.patch's default mask is 0x7fff), then the presented
+    // buffer's release fence (~syncpoint, 0, value, 0), or four zero words when it is free now.
     void PresentClientBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
@@ -2148,9 +2152,33 @@ private:
         m_previous_fence_id = ~w[22];
         m_previous_fence_value = w[24];
         const auto waited = std::chrono::steady_clock::now();
-        Composite(w[5], ~w[22], w[24], w[7], w[8]);
+        const auto pacing =
+            m_present.PresentInterval(w[12], ctx.GetThread().GetOwnerProcess(), m_presents, m_vsync.get());
+        // With this frame's fence reached, return before its deadline and release the buffer
+        // through a fence instead. Not on a wait that can return with the frame unfinished, and
+        // not with timestamp recorders, which record after the pacing as before. Single-core
+        // keeps the blocking path and its tick-based speed limiter.
+        const bool queueable =
+            system.IsMulticore() && frames_ahead == 0 && (w[18] & 0xf) == 0 &&
+            (~w[22] >= 192 ||
+             system.Host1x().GetSyncpointManager().IsReadyGuest(~w[22], w[24]));
+        std::optional<Nx2PresentReleases::Release> release;
+        std::chrono::steady_clock::time_point hold_until{};
+        if (queueable) {
+            release = QueueRelease(pacing, hold_until);
+        }
+        if (!Composite(w[5], ~w[22], w[24], w[7], w[8],
+                       release ? release->on_composited : std::function<void()>{}) &&
+            release) {
+            // Nothing will read the image.
+            release->on_composited();
+        }
         const auto composited = std::chrono::steady_clock::now();
-        m_present.PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess(), m_presents, m_vsync.get());
+        if (!release) {
+            m_present.PaceToVblank(pacing);
+        } else if (composited < hold_until) {
+            m_present.SleepFor(std::chrono::duration_cast<std::chrono::nanoseconds>(hold_until - composited));
+        }
         const auto paced = std::chrono::steady_clock::now();
         if (const u32 recorder = w[18] & 0xf; recorder != 0) {
             m_recorded_ticks[recorder - 1] = system.CoreTiming().GetClockTicks();
@@ -2235,14 +2263,74 @@ private:
         }
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
-                             static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+                             static_cast<u32>(AvailableSlots >> 32),
+                             release ? ~release->id : 0U, 0, release ? release->value : 0U, 0});
     }
 
+    using PresentPacing = Nx2PresentBookkeeping::PresentPacing;
+
+    /**
+     * Queues this present's release fence in place of holding it until its deadline: the buffer is
+     * released once the deadline has passed and the renderer composited it. A present still holds
+     * until the previous release's deadline (`hold_until`), so a game cycling any number of buffer
+     * slots stays at most one frame ahead of the pacing. Returns nothing to keep the blocking
+     * path: under #2178's cap, which holds every present, or when no release can be queued.
+     */
+    std::optional<Nx2PresentReleases::Release> QueueRelease(
+        const std::optional<PresentPacing>& pacing,
+        std::chrono::steady_clock::time_point& hold_until) {
+        if (pacing && pacing->capped) {
+            return std::nullopt;
+        }
+        if (!m_releases) {
+            m_releases.emplace(
+                system.CoreTiming(), system.Host1x().GetSyncpointManager(),
+                [this]() -> std::optional<u32> {
+                    const auto service =
+                        system.ServiceManager().GetService<Nvidia::NVDRV>("nvdrv", false);
+                    if (!service) {
+                        return std::nullopt;
+                    }
+                    m_release_module = service->GetModule();
+                    return m_release_module->GetContainer().GetSyncpointManager()
+                        .TryAllocateSyncpoint(true);
+                },
+                [this](u32 id) {
+                    m_release_module->GetContainer().GetSyncpointManager().FreeSyncpoint(id);
+                });
+        }
+        hold_until = std::chrono::steady_clock::now() + m_releases->RunAhead();
+        // Deadlines keep the pacer's interval and catch-up; CoreTiming has another epoch, so the
+        // queue gets the time left.
+        Nx2PresentPacer pacer{m_present.Pacer()};
+        std::chrono::nanoseconds wait{};
+        bool reset = false;
+        if (pacing) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto step = pacer.Advance(now, pacing->interval);
+            wait = std::chrono::duration_cast<std::chrono::nanoseconds>(step.deadline - now);
+            reset = step.reset;
+        }
+        auto release = m_releases->Queue(wait);
+        if (release) {
+            m_present.Pacer() = pacer;
+            if (Common::DkbFrameTrace::Enabled()) {
+                m_present.frame_trace.deadline_reset = reset;
+            }
+        }
+        return release;
+    }
+
+    // Release fences of queued presents; m_release_module holds the nvdrv allocator of their
+    // syncpoint.
+    std::shared_ptr<Nvidia::Module> m_release_module;
+    std::optional<Nx2PresentReleases> m_releases;
+
     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
-    // is what keeps a game from running ahead of the GPU. This reply always reports every buffer
-    // free, so pace the game here instead: wait (bounded, in case the GPU waits on the CPU) until
-    // Eden's GPU thread has processed the frame. Otherwise the game laps the GPU thread and
-    // rewrites command memory it hasn't read yet.
+    // is what keeps a game from running ahead of the GPU. This reply reports every buffer free or
+    // releases it once composited, so pace the game here instead: wait (bounded, in case the GPU
+    // waits on the CPU) until Eden's GPU thread has processed the frame. Otherwise the game laps
+    // the GPU thread and rewrites command memory it hasn't read yet.
     u32 m_wait_timeouts{};
     struct PresentStats {
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
@@ -2561,7 +2649,10 @@ private:
     // surface in the console's native GOB layout at GPU address == CPU address.
     // shown_size: the present's word 7, ((height - 1) << 16) | (width - 1) of the area the game drew
     // into from the image's top-left corner (0 when it gives none). flags: word 8.
-    void Composite(u32 image_id, u32 fence_id, u32 fence_value, u32 shown_size, u32 flags) {
+    // on_composited runs once the renderer has composited the image. Returns whether a composite
+    // was requested.
+    bool Composite(u32 image_id, u32 fence_id, u32 fence_value, u32 shown_size, u32 flags,
+                   std::function<void()> on_composited) {
         NotifyHdrChange();
         u64 address{};
         u32 parent{};
@@ -2574,11 +2665,11 @@ private:
             std::scoped_lock lk{m_objects->mutex};
             const auto image = m_objects->images.find(image_id);
             if (image == m_objects->images.end()) {
-                return;
+                return false;
             }
             const auto memory = m_objects->memories.find(image->second.memory);
             if (memory == m_objects->memories.end() || memory->second.address == 0) {
-                return;
+                return false;
             }
             address = memory->second.address + image->second.offset;
             parent = memory->second.parent;
@@ -2615,7 +2706,7 @@ private:
         if (!device) {
             LOG_WARNING(Service, "nx2:vi2 present: image {} at {:#x} has no device mapping",
                         image_id, address);
-            return;
+            return false;
         }
         u32 crop_width = layout.width;
         u32 crop_height = layout.height;
@@ -2691,9 +2782,11 @@ private:
         if (fence_id < 192) {
             fences.push_back({static_cast<s32>(fence_id), fence_value});
         }
-        system.GPU().RequestComposite(std::move(layers), std::move(fences));
+        system.GPU().RequestComposite(std::move(layers), std::move(fences),
+                                      std::move(on_composited));
         DumpRanges();
         m_present.Finish(m_presents);
+        return true;
     }
 
 
@@ -3081,7 +3174,7 @@ private:
                     return std::nullopt;
                 });
             system.CoreTiming().ScheduleLoopingEvent(VblankInterval, VblankInterval, m_vsync_timer);
-            // The host's display can start this session's frames (PaceToVblank says when):
+            // The host's display can start this session's frames (PresentInterval says when):
             // each frame on screen then signals its vsync events, from the presenter's thread
             // as host1x syncpoint actions signal theirs from the GPU thread.
             VideoCore::HostVsync::AddListener(

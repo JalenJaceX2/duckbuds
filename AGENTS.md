@@ -38,6 +38,7 @@ Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Ea
 | 040032B023CA4000 | Orbitals |
 | 0400921025B32000 | Sonic Frontiers (Switch 2 Edition) |
 | 04003F40232DE000 | Hyrule Warriors: Age of Imprisonment |
+| 010015100B514000 | Super Mario Bros. Wonder (Switch 1) |
 | 040015100B514001 | Super Mario Bros. Wonder - Nintendo Switch 2 Edition + Meetup in Bellabel Park |
 | 01004D300C5AE000 | Kirby and the Forgotten Land (Switch 1) |
 | 04004D300C5AE001 | Kirby and the Forgotten Land - Nintendo Switch 2 Edition |

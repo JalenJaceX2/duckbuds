@@ -93,9 +93,16 @@ public:
         return Core::g_nx2_present_count.load(std::memory_order_relaxed);
     }
 
+    /// The interval PresentInterval holds presents to.
+    struct PresentPacing {
+        std::chrono::nanoseconds interval;
+        bool capped; ///< #2178's cap for an otherwise unpaced game
+    };
+
     /**
-     * Holds this present until the next vblank its word asks for, or for longer when an FPS limit
-     * (the setting, or EDEN_NX2_FPS_LIMIT) is below that rate.
+     * Returns the interval to hold presents to: the vblank the present word asks for, or longer
+     * when an FPS limit (the setting, or EDEN_NX2_FPS_LIMIT) is below that rate. Nothing when
+     * presents are not paced.
      *
      * Fire Emblem: Fortune's Weave sends 0x1003c during its boot logos and 0x2003c (two vblanks
      * per frame, 30 fps) after; paced at every vblank it ran at double speed.
@@ -108,9 +115,8 @@ public:
      *                    starts the frames of a game with an unlocked frame rate); null when the
      *                    presenter has none (direct presents keep the vsync timer's rate).
      */
-    void PaceToVblank(u32 timing, const Kernel::KProcess* process, u64 presents,
-                      const void* vsync_owner) {
-        auto& kernel = system.Kernel();
+    std::optional<PresentPacing> PresentInterval(u32 timing, const Kernel::KProcess* process,
+                                                 u64 presents, const void* vsync_owner) {
         const bool trace = Common::DkbFrameTrace::Enabled();
         if (trace) {
             if (frame_trace.previous_word && *frame_trace.previous_word != timing) {
@@ -178,7 +184,7 @@ public:
         }
         if (!speed_limited && fps_limit == 0 && unpaced_cap == 0) {
             Tegra::g_nx2_guest_frame_interval_ns.store(0, std::memory_order_relaxed);
-            return;
+            return std::nullopt;
         }
         if (timing != std::exchange(m_swap_word, timing)) {
             LOG_INFO(Service,
@@ -199,28 +205,52 @@ public:
         if (trace) {
             frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();
         }
+        return PresentPacing{interval, unpaced_cap != 0};
+    }
+
+    /// Holds this present until its deadline from the pacer.
+    void PaceToVblank(const std::optional<PresentPacing>& pacing) {
+        if (!pacing) {
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
-        const auto pacing = m_present_pacer.Advance(now, interval);
+        const auto step = m_present_pacer.Advance(now, pacing->interval);
+        if (Common::DkbFrameTrace::Enabled()) {
+            frame_trace.deadline_reset = step.reset;
+        }
+        if (now < step.deadline) {
+            SleepFor(std::chrono::duration_cast<std::chrono::nanoseconds>(step.deadline - now));
+        }
+    }
+
+    /// PresentInterval, then PaceToVblank.
+    void PaceToVblank(u32 timing, const Kernel::KProcess* process, u64 presents,
+                      const void* vsync_owner) {
+        PaceToVblank(PresentInterval(timing, process, presents, vsync_owner));
+    }
+
+    // Sleeps this service thread in the guest kernel. It runs on guest core 3, and a host sleep
+    // held that core for the whole wait: game threads scheduled there ran only between presents
+    // (Fortune's Weave's loader read one RomFS block per frame).
+    void SleepFor(std::chrono::nanoseconds wait) {
+        auto& kernel = system.Kernel();
+        const bool trace = Common::DkbFrameTrace::Enabled();
+        const auto sleep_start = trace ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
+        static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
+            kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
         if (trace) {
-            frame_trace.deadline_reset = pacing.reset;
+            frame_trace.sleep_requested_ms =
+                std::chrono::duration<double, std::milli>(wait).count();
+            frame_trace.sleep_actual_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - sleep_start).count();
         }
-        if (now < pacing.deadline) {
-            // Sleep this service thread in the guest kernel. It runs on guest core 3, and a host
-            // sleep held that core for the whole wait: game threads scheduled there ran only
-            // between presents (Fortune's Weave's loader read one RomFS block per frame).
-            const auto wait =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(pacing.deadline - now);
-            const auto sleep_start = trace ? std::chrono::steady_clock::now()
-                                           : std::chrono::steady_clock::time_point{};
-            static_cast<void>(Kernel::GetCurrentThread(kernel).Sleep(
-                kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
-            if (trace) {
-                frame_trace.sleep_requested_ms =
-                    std::chrono::duration<double, std::milli>(wait).count();
-                frame_trace.sleep_actual_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - sleep_start).count();
-            }
-        }
+    }
+
+    /// The pacer, for a presenter that releases buffers through fences in place of holding them
+    /// (nx2:vi2 QueueRelease advances a copy and keeps it once the release is queued).
+    Nx2PresentPacer& Pacer() {
+        return m_present_pacer;
     }
 
     /// After the frame was handed to the renderer (GPU::RequestComposite): the frame capture, the

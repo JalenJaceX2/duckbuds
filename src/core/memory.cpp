@@ -44,6 +44,7 @@
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/nx2_async_readback.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/rasterizer_download_area.h"
 
 namespace Core::Memory {
@@ -444,8 +445,12 @@ struct Memory::Impl {
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
             if (!unsafe) {
                 HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
+            } else {
+                // The caches aren't told, but constant buffer data equal to memory must be.
+                VideoCommon::Nx2FastDraw::BeginMemoryChange();
             }
             std::memcpy(ptr, reinterpret_cast<u8 const*>(buffer) + offset, copy_amount);
+            EndRasterizerWrite();
             VideoCommon::GpuTrace::NoteCpuWrite(ptr, copy_amount);
         });
     }
@@ -461,6 +466,7 @@ struct Memory::Impl {
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
             HandleRasterizerWrite(GetInteger(current_vaddr), copy_amount);
             std::memset(ptr, 0, copy_amount);
+            EndRasterizerWrite();
             VideoCommon::GpuTrace::NoteCpuWrite(ptr, copy_amount);
         });
     }
@@ -508,6 +514,7 @@ struct Memory::Impl {
             // dc cvac: Store to point of coherency
             // CPU flush -> GPU invalidate
             HandleRasterizerWrite(GetInteger(current_vaddr), block_size);
+            EndRasterizerWrite();
         };
         return PerformCacheOperation(dest_addr, size, on_rasterizer);
     }
@@ -517,6 +524,7 @@ struct Memory::Impl {
             // dc civac: Store to point of coherency, and invalidate from cache
             // CPU flush -> GPU invalidate
             HandleRasterizerWrite(GetInteger(current_vaddr), block_size);
+            EndRasterizerWrite();
         };
         return PerformCacheOperation(dest_addr, size, on_rasterizer);
     }
@@ -956,17 +964,29 @@ struct Memory::Impl {
                 VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(T));
             }
         }
+        if (rasterizer_write) [[unlikely]] {
+            EndRasterizerWrite();
+        }
     }
 
     template <typename T>
     bool WriteExclusive(Common::ProcessAddress vaddr, const T data, const T expected) {
+        bool rasterizer_write = false;
         u8* const ptr = GetPointerImpl(
             GetInteger(vaddr),
             [vaddr, data]() {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive{} @ {:#016x} = {:#016x}",
                           sizeof(T) * 8, GetInteger(vaddr), static_cast<u64>(data));
             },
-            [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(T)); });
+            [&]() {
+                HandleRasterizerWrite(GetInteger(vaddr), sizeof(T));
+                rasterizer_write = true;
+            });
+        SCOPE_EXIT {
+            if (rasterizer_write) {
+                EndRasterizerWrite();
+            }
+        };
         if (ptr) {
             const bool stored = Common::AtomicCompareAndSwap(reinterpret_cast<T*>(ptr), data, expected);
             VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(T));
@@ -976,13 +996,22 @@ struct Memory::Impl {
     }
 
     bool WriteExclusive128(Common::ProcessAddress vaddr, const u128 data, const u128 expected) {
+        bool rasterizer_write = false;
         u8* const ptr = GetPointerImpl(
             GetInteger(vaddr),
             [vaddr, data]() {
                 LOG_ERROR(HW_Memory, "Unmapped WriteExclusive128 @ {:#016x} = {:#016x}{:016X}",
                           GetInteger(vaddr), static_cast<u64>(data[1]), static_cast<u64>(data[0]));
             },
-            [&]() { HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128)); });
+            [&]() {
+                HandleRasterizerWrite(GetInteger(vaddr), sizeof(u128));
+                rasterizer_write = true;
+            });
+        SCOPE_EXIT {
+            if (rasterizer_write) {
+                EndRasterizerWrite();
+            }
+        };
         if (ptr) {
             const bool stored = Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
             VideoCommon::GpuTrace::NoteCpuWrite(ptr, sizeof(u128));
@@ -1067,7 +1096,9 @@ struct Memory::Impl {
         });
     }
 
+    /// Callers store the bytes after this and call EndRasterizerWrite once they landed.
     void HandleRasterizerWrite(VAddr v_address, size_t size) {
+        VideoCommon::Nx2FastDraw::BeginMemoryChange();
         if (Core::NvnHook::DirectMode()) {
             // NVN2 direct mode: the replay's write-tracked pools, by guest address (they have no
             // device address).
@@ -1083,6 +1114,10 @@ struct Memory::Impl {
         WriteToRasterizer(v_address, size);
         Kernel::Nx2ThreadStats::CountMemory(Kernel::Nx2ThreadStats::t_run,
                                             timing.GetClockTicks() - start, false);
+    }
+
+    void EndRasterizerWrite() {
+        VideoCommon::Nx2FastDraw::EndMemoryChange();
     }
 
     void WriteToRasterizer(VAddr v_address, size_t size) {
@@ -1136,6 +1171,10 @@ struct Memory::Impl {
     };
 
     void InvalidateGPUMemory(u8* p, size_t size) {
+        // NCE stores the bytes once the trap returns: flagged before they land (pages it
+        // untracks are flagged once unwatched).
+        VideoCommon::Nx2FastDraw::BeginMemoryChange();
+        VideoCommon::Nx2FastDraw::EndMemoryChange();
         constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
         const size_t core = (std::min)(system.GetCurrentHostThreadID(),
                                      sys_core); // any other calls threads go to syscore.
