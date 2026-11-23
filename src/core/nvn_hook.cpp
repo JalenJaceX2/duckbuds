@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -455,6 +456,54 @@ void ReadArguments(Dynarmic::A64::Jit& jit, std::array<u64, 8>& x, std::array<u6
 thread_local u32 t_halted_slot = MaxSlots;
 thread_local u64 t_halted_lr = 0;
 
+/// DM_NVN_GAMEWAIT=1 (diagnostics): where the presenting thread's frame goes, every 300 presents:
+/// NVN calls run from the JIT (all threads), halted calls and their waits by kind, and the
+/// present's waits (the replay worker's fill, the previous composite, the vblank pacing).
+struct GameWait {
+    enum Kind { Sync, Finish, Acquire, Other, Kinds };
+    bool on = std::getenv("DM_NVN_GAMEWAIT") != nullptr;
+    std::atomic<u64> call_ns{}, calls{}, halt_ns[Kinds]{}, block_ns[Kinds]{}, halts[Kinds]{};
+    u64 take_ns{}, composite_ns{}, pace_ns{}, first_ns{};
+    static u64 Now() {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count());
+    }
+    static Kind KindOf(std::string_view name) {
+        return name == "nvnSyncWait"      ? Sync
+               : name == "nvnQueueFinish" ? Finish
+               : name == "nvnWindowAcquireTexture" || name == "nvnQueueAcquireTexture" ? Acquire
+                                                                                     : Other;
+    }
+    void Log(u64 present) {
+        const u64 now = Now();
+        if (!first_ns || present % 300 != 0) {
+            if (!first_ns) first_ns = now;
+            return;
+        }
+        const double n = 300.0, ms = 1e6 * n;
+        auto x = [](std::atomic<u64>& a) { return a.exchange(0, std::memory_order_relaxed); };
+        const u64 c = x(calls), cn = x(call_ns);
+        static constexpr const char* names[Kinds]{"sync wait", "queue finish", "acquire",
+                                                  "other (submit, present...)"};
+        std::string halted;
+        for (int k = 0; k < Kinds; ++k) {
+            const u64 h = x(halts[k]), hn = x(halt_ns[k]), bn = x(block_ns[k]);
+            halted += fmt::format("; {} {:.1f}/frame {:.2f} ms (blocked {:.2f})", names[k], h / n,
+                                  hn / ms, bn / ms);
+        }
+        LOG_INFO(Core,
+                 "NVN direct: game wait up to present {}: {:.2f} ms a frame; NVN calls from the "
+                 "JIT {:.0f}/frame {:.2f} ms (all threads){}; present: fill wait {:.2f}, composite "
+                 "wait {:.2f}, pacing {:.2f} ms",
+                 present, (now - first_ns) / ms, c / n, cn / ms, halted, take_ns / ms,
+                 composite_ns / ms, pace_ns / ms);
+        take_ns = composite_ns = pace_ns = 0;
+        first_ns = now;
+    }
+};
+GameWait g_game_wait;
+
 /// Direct mode's block entries. Returns whether the JIT halts for the call (HaltedCallSvc).
 bool DirectEntry(State& state, u64 pc, Dynarmic::A64::Jit& jit, Core::Memory::Memory& memory) {
     const u64 lr = jit.GetRegister(30);
@@ -515,7 +564,12 @@ bool DirectEntry(State& state, u64 pc, Dynarmic::A64::Jit& jit, Core::Memory::Me
     std::array<u64, 8> x, v;
     ReadArguments(jit, x, v);
     u64 v0 = 0;
+    const u64 t0 = g_game_wait.on ? GameWait::Now() : 0;
     jit.SetRegister(0, nvn_direct_call(target.front, x.data(), v.data(), jit.GetSP(), lr, &v0));
+    if (g_game_wait.on) {
+        g_game_wait.call_ns.fetch_add(GameWait::Now() - t0, std::memory_order_relaxed);
+        g_game_wait.calls.fetch_add(1, std::memory_order_relaxed);
+    }
     if (nvn_direct_float_args(target.front)) {
         jit.SetVector(0, {v0, 0});
     }
@@ -726,7 +780,16 @@ void PresentDirect(Core::System& system, State& state) {
     const u64 own = ++state.presents;
     const u64 number = present.Count(Kernel::GetCurrentThread(system.Kernel()));
     nvn_direct_frame frame{};
+    u64 t = g_game_wait.on ? GameWait::Now() : 0;
     const bool shown = nvn_direct_present_take(&frame) != 0;
+    auto lap = [&t](u64& into) {
+        if (g_game_wait.on) {
+            const u64 now = GameWait::Now();
+            into += now - t;
+            t = now;
+        }
+    };
+    lap(g_game_wait.take_ns);
     if (own <= 4 || own % 600 == 0) {
         LOG_INFO(Core, "NVN direct: present #{} ({}x{} VkFormat {}, {})", own, frame.width,
                  frame.height, static_cast<int>(frame.format), shown ? "shown" : "nothing to show");
@@ -735,6 +798,7 @@ void PresentDirect(Core::System& system, State& state) {
         // The game's present waits for the previous frame's composite (as many images as the
         // window has are in flight between the replay and Lichii's presenter).
         system.GPU().WaitForComposite();
+        lap(g_game_wait.composite_ns);
         u32 crop_width = frame.crop[2] > 0 ? static_cast<u32>(frame.crop[2]) : frame.width;
         u32 crop_height = frame.crop[3] > 0 ? static_cast<u32>(frame.crop[3]) : frame.height;
         if (frame.crop[2] <= 0 && !Settings::IsDockedMode()) {
@@ -770,7 +834,12 @@ void PresentDirect(Core::System& system, State& state) {
         system.GPU().RequestComposite(std::move(layers), {});
     }
     present.Finish(own);
+    lap(g_game_wait.take_ns); // (Finish and the composite request: counted with the fill wait)
     present.PaceToVblank((frame.interval << 16) | 60, system.ApplicationProcess(), own, nullptr);
+    lap(g_game_wait.pace_ns);
+    if (g_game_wait.on) {
+        g_game_wait.Log(own);
+    }
     LogStubCensus(state, number);
 }
 } // namespace
@@ -822,6 +891,8 @@ void RunHaltedCall(Core::System& system, std::array<u64, 8>& args) {
     // wait here held the guest core, so the game's other threads there stopped (one of them may
     // be the one whose submission the GPU waits for).
     const bool sync_wait = std::string_view{nvn_direct_name(target.front)} == "nvnSyncWait";
+    const GameWait::Kind kind = GameWait::KindOf(nvn_direct_name(target.front));
+    const u64 halt_t0 = g_game_wait.on ? GameWait::Now() : 0;
     bool waited = false;
     if (nvn_direct_call_blocks(target.front, args.data())) {
         auto& kernel = system.Kernel();
@@ -837,6 +908,10 @@ void RunHaltedCall(Core::System& system, std::array<u64, 8>& args) {
             slice = (std::min)(slice * 2, s64{1'000'000});
         }
         waited = true;
+        if (g_game_wait.on) {
+            g_game_wait.block_ns[kind].fetch_add(GameWait::Now() - halt_t0,
+                                                 std::memory_order_relaxed);
+        }
         if (sync_wait) {
             args[1] = 0; // (answered from the state now, without a host wait)
         }
@@ -848,6 +923,10 @@ void RunHaltedCall(Core::System& system, std::array<u64, 8>& args) {
     args[0] = nvn_direct_call(target.front, args.data(), v.data(), 0, t_halted_lr, &v0);
     if (sync_wait && waited && args[0] == 0) {
         args[0] = 1; // NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED: it was signalled while waiting
+    }
+    if (g_game_wait.on) { // (the present's own waits are counted in PresentDirect)
+        g_game_wait.halt_ns[kind].fetch_add(GameWait::Now() - halt_t0, std::memory_order_relaxed);
+        g_game_wait.halts[kind].fetch_add(1, std::memory_order_relaxed);
     }
     if (std::string_view{nvn_direct_name(target.front)} != "nvnQueuePresentTexture") {
         return;
