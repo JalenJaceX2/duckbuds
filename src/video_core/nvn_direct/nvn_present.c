@@ -174,12 +174,20 @@ static VkImageView frame_view(const vka_img* im, VkFormat format) {
     return vk.vkCreateImageView(V.dev, &vi, NULL, &v) ? VK_NULL_HANDLE : v;
 }
 
+// Lichii: DM_VK_PRESENT_LAG=1 (default, live): a present hands Lichii the present before it, which the worker has filled while the game ran this frame, so the game's next
+// frame runs while the worker records this one (with 0, the present waits until the worker has recorded the whole frame, and the game's CPU work and the recording take
+// turns: Duskbloods' lobby ~11 + ~15 ms, run readtexels2). One frame more latency. The window's acquire still waits for Lichii's composite of an image before the game
+// draws into it again (nvn_direct_present_composite_pending). Switching it drops the present held, or shows nothing for one present
+static _Thread_local uint64_t t_lagged;
 int nvn_direct_present_take(nvn_direct_frame* out) {
     memset(out, 0, sizeof *out);
     out->interval = t_interval ? t_interval : 1;
-    const uint64_t tk = t_ticket;
-    if (!tk) return 0;
+    const uint64_t now_tk = t_ticket;
+    if (!now_tk) return 0;
     t_ticket = 0;
+    uint64_t tk = now_tk;
+    if (VKA_ENV("DM_VK_PRESENT_LAG", 1)) { tk = t_lagged; t_lagged = now_tk; if (!tk) return 0; }
+    else t_lagged = 0;
     pthread_mutex_lock(&g_mu);
     while (g_filled < tk && !vka_stopping()) pthread_cond_wait(&g_cv, &g_mu);
     const pres_t p = g_pres[tk % NPRES];
