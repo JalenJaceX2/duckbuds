@@ -2194,6 +2194,25 @@ int nvn_vpool_page_unmapped(uint64_t a) {
     if (v && a < (uint64_t)(uintptr_t)v->base + v->len) { uint64_t o = a - (uint64_t)(uintptr_t)v->base; const vpte *e = o < v->size ? vpt_get(v, o) : NULL; r = !e || !e->phys; }
     pthread_mutex_unlock(&g_vp_mu); return r;
 }
+// Lichii: the physical memory behind [a, a+n) of a virtual pool when one run of consecutive physical pages backs all of it: 1 and *phys; 0 = a lies in no virtual pool;
+// -1 = in one, but a page is unmapped or the pages are not consecutive. The CPU writes a virtual pool's bytes through the physical pool (the dirty tracker's spans are
+// physical pools only: a virtual pool has no span), so the replay's VRAM vertex copies track their writes there (vka_draw.c vc_resolve)
+int nvn_vpool_phys(uint64_t a, uint64_t n, const uint8_t **phys) {
+    pthread_mutex_lock(&g_vp_mu);
+    int lo = 0, hi = g_nvp; while (lo < hi) { int m = (lo + hi) / 2; if ((uint64_t)(uintptr_t)g_vp[m]->base <= a) lo = m + 1; else hi = m; }
+    const struct vpool *v = lo ? g_vp[lo - 1] : NULL; int r = 0;
+    if (v && n && a < (uint64_t)(uintptr_t)v->base + v->len) {
+        const uint64_t o = a - (uint64_t)(uintptr_t)v->base, at0 = o & ~0xFFFull; const uint8_t *p0 = NULL; r = 1;
+        for (uint64_t at = at0; at < o + n && r > 0; at += 0x1000) {
+            const vpte *e = at < v->size ? vpt_get(v, at) : NULL;
+            if (!e || !e->phys) r = -1;
+            else if (!p0) p0 = e->phys;
+            else if (e->phys != p0 + (at - at0)) r = -1;
+        }
+        if (r > 0) *phys = p0 + (o - at0);
+    }
+    pthread_mutex_unlock(&g_vp_mu); return r;
+}
 void nvn_sparse_protect(const void *pool, uint64_t a, uint64_t n) { vpt_walk(pool, a, n, ~0ull, run_protect, 0); }
 static int run_any(const uint8_t *p, uint64_t n, uint64_t unused) { (void)p; (void)n; (void)unused; return 1; }
 int nvn_sparse_any(const void *pool, uint64_t a, uint64_t n) {   // some page of [a, a+n) has memory behind it (leaves never mapped are skipped 2 MB at a time)

@@ -683,9 +683,9 @@ static int rd_cb(void *ctx, uint64_t addr, void *out, size_t n) { (void)ctx; ret
 // GPU writes vertex or uniform data): an experiment to measure where the GPU time goes, not a fix
 enum { VC_N = 1 << 15 };
 #define VC_ARENA ((VkDeviceSize)768 << 20)
-typedef struct { uint64_t addr, size, stamp; const void *span; VkDeviceSize off; uint32_t copies; uint8_t state; } vc_ent;   // state 0 empty, 1 copied, 2 guest RAM
+typedef struct { uint64_t addr, size, stamp; const void *span; const uint8_t *phys; VkDeviceSize off; uint32_t copies; uint8_t state; } vc_ent;   // state 0 empty, 1 copied, 2 guest RAM; phys: where the CPU writes the bytes
 static vc_ent *g_vc; static VkBuffer g_vc_buf; static VkDeviceMemory g_vc_mem; static VkDeviceSize g_vc_top; static int g_vc_failed;
-static uint64_t g_vc_bytes, g_vc_ncopy, g_vc_nrecopy, g_vc_hit, g_vc_bypass, g_vc_why[6], g_vc_untracked;   // why: size, table, copied too often or arena full, not one segment, no upload batch, kept in guest RAM
+static uint64_t g_vc_bytes, g_vc_ncopy, g_vc_nrecopy, g_vc_hit, g_vc_bypass, g_vc_why[6], g_vc_untracked, g_vc_trk_direct, g_vc_trk_vpool;   // why: size, table, copied too often or arena full, not one segment, no upload batch, kept in guest RAM
 static int vc_init(void) {
     if (g_vc_buf || g_vc_failed) return g_vc_buf != VK_NULL_HANDLE;
     g_vc_failed = 1;
@@ -709,15 +709,18 @@ static int vc_get(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
     if (!e) VC_NO(1);   // (the table's neighbourhood is full)
     if (e->state == 2) VC_NO(5);
     // (an untracked range, a pool the CPU cannot write such as a virtual pool's pages or a CPU_NO_ACCESS pool: copied once)
-    if (e->state == 1 && (!e->span || !nvn_dirty_since_span(e->span, (const void *)(uintptr_t)addr, size, e->stamp))) { g_vc_hit++; *b = g_vc_buf; *o = e->off; return 1; }
-    if (!e->state) { e->addr = addr; e->size = size; e->span = nvn_dirty_span((const void *)(uintptr_t)addr, size); if (!e->span) g_vc_untracked++; }
+    if (e->state == 1 && (!e->span || !nvn_dirty_since_span(e->span, e->phys, size, e->stamp))) { g_vc_hit++; *b = g_vc_buf; *o = e->off; return 1; }
+    // A virtual pool has no span of its own: its CPU writes land in the physical pool behind it (nvn_vpool_phys), whose span sees them
+    if (!e->state) { int nvn_vpool_phys(uint64_t a, uint64_t n, const uint8_t **phys);
+                     e->addr = addr; e->size = size; e->phys = (const uint8_t *)(uintptr_t)addr; e->span = nvn_dirty_span(e->phys, size);
+                     if (e->span) g_vc_trk_direct++; else if (nvn_vpool_phys(addr, size, &e->phys) > 0 && (e->span = nvn_dirty_span(e->phys, size))) g_vc_trk_vpool++; else g_vc_untracked++; }
     if (e->copies >= 4 || g_vc_top + size + 256 > VC_ARENA) { e->state = 2; VC_NO(2); }
     VkBuffer sb; VkDeviceSize so; uint64_t run = vka_addr_run(addr, size, &sb, &so);
     if (run < size) { e->state = 2; VC_NO(3); }
     VkCommandBuffer ub = vka_up_begin();
     if (!ub || !vka_up_is(ub)) { if (ub) vka_up_end(); VC_NO(4); }
     #undef VC_NO
-    if (e->span) { e->stamp = nvn_dirty_now(); nvn_dirty_protect((const void *)(uintptr_t)addr, size); }   // (the stamp before the GPU reads the bytes: a write after it copies again)
+    if (e->span) { e->stamp = nvn_dirty_now(); nvn_dirty_protect(e->phys, size); }   // (the stamp before the GPU reads the bytes: a write after it copies again)
     const VkDeviceSize off = (g_vc_top + 255) & ~(VkDeviceSize)255; g_vc_top = off + size;   // a new place each time: an earlier copy may still be read by work in flight
     VkBufferCopy c = {so, off, size}; vk.vkCmdCopyBuffer(ub, sb, g_vc_buf, 1, &c);
     vka_barrier(ub); vka_up_end();
@@ -729,10 +732,10 @@ void vka_vc_stats(char *b, size_t n, double frames) {
     static uint64_t c0, r0, h0, y0, by0;
     if (!g_vc || frames <= 0) { if (n) b[0] = 0; return; }
     snprintf(b, n, "vertex/uniform copies per frame: %.0f bound from copies, %.0f from guest RAM, %.1f copies (%.1f again after a CPU write), %.2f MiB copied; arena %.0f of %llu MiB; "
-             "guest RAM since the start by reason: size %llu, table %llu, copied too often / arena full %llu, not in one segment %llu, no upload batch %llu, kept there %llu; %llu ranges untracked (copied once)",
+             "guest RAM since the start by reason: size %llu, table %llu, copied too often / arena full %llu, not in one segment %llu, no upload batch %llu, kept there %llu; ranges tracked %llu directly, %llu through a virtual pool's physical pages, %llu untracked (copied once)",
              (g_vc_hit - h0) / frames, (g_vc_bypass - by0) / frames, (g_vc_ncopy - c0) / frames, (g_vc_nrecopy - r0) / frames, (g_vc_bytes - y0) / frames / 1048576.0, g_vc_top / 1048576.0,
              (unsigned long long)(VC_ARENA >> 20), (unsigned long long)g_vc_why[0], (unsigned long long)g_vc_why[1], (unsigned long long)g_vc_why[2], (unsigned long long)g_vc_why[3],
-             (unsigned long long)g_vc_why[4], (unsigned long long)g_vc_why[5], (unsigned long long)g_vc_untracked);
+             (unsigned long long)g_vc_why[4], (unsigned long long)g_vc_why[5], (unsigned long long)g_vc_trk_direct, (unsigned long long)g_vc_trk_vpool, (unsigned long long)g_vc_untracked);
     c0 = g_vc_ncopy; r0 = g_vc_nrecopy; h0 = g_vc_hit; y0 = g_vc_bytes; by0 = g_vc_bypass;
 }
 static int ubo_desc(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *bi) {
