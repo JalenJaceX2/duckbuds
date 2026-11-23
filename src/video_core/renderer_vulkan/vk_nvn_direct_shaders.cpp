@@ -12,6 +12,7 @@
 #include <fstream>
 #include <optional>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include "common/logging.h"
@@ -561,12 +562,27 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
     const std::vector<u32> spirv{
         Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, bindings)};
     if (env.DumpKey() != 0) {
-        // (beside the program: its translation as the replay builds it, for spirv-dis)
-        std::ofstream{std::filesystem::path{std::getenv("EDEN_NX2_SHADER_DUMP")} /
-                          fmt::format("{:016x}-direct-{}.spv", env.DumpKey(), source.first_binding),
-                      std::ios::binary}
-            .write(reinterpret_cast<const char*>(spirv.data()),
+        // Beside the program: its translation as the replay builds it, for spirv-dis. A program
+        // has a translation per draw state (depth mode, input types, a geometry shader's input
+        // primitive), which can be made at once on two threads: each is named by its SPIR-V's
+        // hash, written whole under a name of its own and then renamed into place.
+        u64 hash = 0xcbf29ce484222325ULL;
+        for (const u32 word : spirv) {
+            hash = (hash ^ word) * 0x100000001b3ULL;
+        }
+        const auto path = std::filesystem::path{std::getenv("EDEN_NX2_SHADER_DUMP")} /
+                          fmt::format("{:016x}-direct-{}-{:016x}.spv", env.DumpKey(),
+                                      source.first_binding, hash);
+        auto partial = path;
+        partial += fmt::format(".{}.part", std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        std::ofstream file{partial, std::ios::binary};
+        file.write(reinterpret_cast<const char*>(spirv.data()),
                    static_cast<std::streamsize>(spirv.size() * sizeof(u32)));
+        file.close();
+        std::error_code error;
+        if (!file || (std::filesystem::rename(partial, path, error), error)) {
+            std::filesystem::remove(partial, error);
+        }
         LOG_INFO(Render_Vulkan, "NVN direct: dumped program {:016x} ({}): {} SPIR-V words",
                  env.DumpKey(), static_cast<int>(stage), spirv.size());
     }
