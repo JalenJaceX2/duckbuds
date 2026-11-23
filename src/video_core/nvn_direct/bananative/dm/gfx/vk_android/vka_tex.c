@@ -528,12 +528,12 @@ static vka_img *img_create_(const tex_t *t, const vka_fmt *f, uint32_t base, int
     }
     // Views in another format: only an 8-bit / BC / ASTC UNORM image as its sRGB twin (NVN sRGB formats are stored as UNORM, and UNORM textures have sRGB views; the
     // only reinterpretation DKB's level makes). A two-entry format list instead of a bare MUTABLE_FORMAT keeps Adreno's UBWC compression on the image; every other image
-    // takes views of its own format only
+    // takes views of its own format only, and the learned ones (float or integer images: Duskbloods samples its RGBA8UI targets through RGBA8 sRGB views)
     // DM_VK_UBWC=0: every colour image MUTABLE_FORMAT without a list, as before (any view format; no UBWC on Adreno)
     int ubwc = VKA_ENV("DM_VK_UBWC", 1);   // live: images made from now on
     VkFormat alt = f->kind == 0 && srgb_twin(f->vk) != f->vk ? srgb_twin(f->vk) : VK_FORMAT_UNDEFINED;
     VkFormat fls[6] = {f->vk, alt}; int nfl = 2;
-    if (ubwc && f->kind == 0) { pthread_mutex_lock(&g_vlmu); im->nx = vl_formats(f->vk, im->w, im->h, im->xfmt, VL_PER_IMAGE); pthread_mutex_unlock(&g_vlmu); for (int k = 0; k < im->nx; k++) fls[nfl++] = im->xfmt[k]; }   // learned view formats
+    if (ubwc && f->kind <= 2) { pthread_mutex_lock(&g_vlmu); im->nx = vl_formats(f->vk, im->w, im->h, im->xfmt, VL_PER_IMAGE); pthread_mutex_unlock(&g_vlmu); for (int k = 0; k < im->nx; k++) fls[nfl++] = im->xfmt[k]; }   // learned view formats
     if (!alt && im->nx) fls[1] = fls[--nfl];   // (no sRGB twin: no UNDEFINED entry in the list)
     VkImageFormatListCreateInfo fli = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO, .viewFormatCount = (uint32_t)nfl, .pViewFormats = fls};
     VkImageCreateFlags fl = alt || im->nx || (!ubwc && f->kind == 0) ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
@@ -1503,8 +1503,8 @@ int vka_img_lists(vka_img *im, VkFormat v) { pthread_mutex_lock(&g_tmu); int r =
 
 // A view of im in fmt, outside its format list (img_create), is not made: the pair is learned for the images made from now on (Learned view formats). Caller holds g_tmu
 static void view_unlisted(const vka_img *im, VkFormat fmt) {
-    int learned = 0;   // (only uncompressed colour formats of one texel size: vl_learn checks the pair)
-    if (im->f.kind == 0 && !compressed(&im->f)) { pthread_mutex_lock(&g_vlmu); learned = vl_learn(im->f.vk, fmt, im->w, im->h); pthread_mutex_unlock(&g_vlmu); }
+    int learned = 0;   // (only uncompressed colour formats of one texel size, float or integer: vl_learn checks the pair)
+    if (im->f.kind <= 2 && !compressed(&im->f)) { pthread_mutex_lock(&g_vlmu); learned = vl_learn(im->f.vk, fmt, im->w, im->h); pthread_mutex_unlock(&g_vlmu); }
     if (learned)
         VLOG("image VkFormat %d (NVN %#x, %ux%u) asked for a view as VkFormat %d, which its format list does not have: viewed in its own format; learned (images of this format and size made from now on, and in the next runs, take it)", im->f.vk, im->d.format, im->w, im->h, fmt);
     else { static struct { VkFormat a, b; } seen[32]; static int ns; int k = 0;
@@ -2063,6 +2063,7 @@ static VkImageView view_of(const treg_ent *e, vka_img *im, int vt_want, int stor
     // What the image's type lets the view be (img_create: 3D for a 3D target, 1D for the 1D targets, cube-compatible for square 2D images of whole cubes)
     int img3d = im->d.target == NVN_TEXTURE_TARGET_3D;
     if ((vt == VK_IMAGE_VIEW_TYPE_3D) != img3d || vt == VK_IMAGE_VIEW_TYPE_1D || vt == VK_IMAGE_VIEW_TYPE_1D_ARRAY) return VK_NULL_HANDLE;   // no 1D images (img_create)
+    if (vt == VK_IMAGE_VIEW_TYPE_CUBE && na < 6 && a0 + 6 <= im->layers) na = 6;   // a cube reads the 6 faces from its first layer, whatever layer count the view names (a face's)
     if (vt == VK_IMAGE_VIEW_TYPE_CUBE || vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) {
         if (im->w != im->h || im->layers < 6 || im->layers % 6 || im->samples > 1 || na < 6) return VK_NULL_HANDLE;
         if (vt == VK_IMAGE_VIEW_TYPE_CUBE) na = 6; else na -= na % 6;
