@@ -401,6 +401,7 @@ D(nvnMemoryPoolBuilderGetSize, 0, { return (uint64_t)((size_t (*)(const NVNmemor
 D(nvnMemoryPoolBuilderSetDefaults, 0, { ((void (*)(NVNmemoryPoolBuilder*))fn)((NVNmemoryPoolBuilder*)host_ptr(x[0])); return 0; })
 D(nvnMemoryPoolBuilderSetDevice, 0, { ((void (*)(NVNmemoryPoolBuilder*, NVNdevice*))fn)((NVNmemoryPoolBuilder*)host_ptr(x[0]), (NVNdevice*)host_ptr(x[1])); return 0; })
 D(nvnMemoryPoolBuilderSetFlags, 0, { ((void (*)(NVNmemoryPoolBuilder*, int))fn)((NVNmemoryPoolBuilder*)host_ptr(x[0]), (int)x[1]); return 0; })
+D(nvnMemoryPoolBuilderSetNativeHandleNVX, 0, { ((void (*)(NVNmemoryPoolBuilder*, uint64_t))fn)((NVNmemoryPoolBuilder*)host_ptr(x[0]), (uint64_t)x[1]); return 0; })
 D(nvnMemoryPoolBuilderSetStorage, 0, { ((void (*)(NVNmemoryPoolBuilder*, void*, size_t))fn)((NVNmemoryPoolBuilder*)host_ptr(x[0]), (void*)host_ptr(x[1]), (size_t)x[2]); return 0; })
 D(nvnMemoryPoolFinalize, 0, { ((void (*)(NVNmemoryPool*))fn)((NVNmemoryPool*)host_ptr(x[0])); return 0; })
 D(nvnMemoryPoolFlushMappedRange, 0, { ((void (*)(const NVNmemoryPool*, ptrdiff_t, size_t))fn)((const NVNmemoryPool*)host_ptr(x[0]), (ptrdiff_t)x[1], (size_t)x[2]); return 0; })

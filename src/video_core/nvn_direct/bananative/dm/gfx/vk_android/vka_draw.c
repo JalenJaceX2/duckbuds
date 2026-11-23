@@ -115,7 +115,21 @@ int vka_state_op(vka_dstate *d, uint32_t op, const void *a) {
         case 5: memcpy(&d->ds, b->bytes, sizeof d->ds); break;
         }
         break; }
-    case OP_BIND_VATTR: { const p_bind_vattr *b = a; if (b->first >= 0 && b->first + b->n <= 32) { memcpy(&d->attr[b->first], b->st, 4 * (size_t)b->n); if (b->first + b->n > d->nattr) d->nattr = b->first + b->n; } break; }
+    case OP_BIND_VATTR: {
+        const p_bind_vattr *b = a;
+        if (b->first < 0 || b->n < 0 || b->first > 32 || b->n > 32 - b->first) break;
+        const int end = b->first + b->n;
+        for (int loc = b->first; loc < end; loc++) {
+            memcpy(&d->attr[loc], &b->st[loc - b->first], sizeof d->attr[loc]);
+            vka_fmt vf;
+            const uint64_t type = !d->attr[loc].fmt || !vka_fmt_of(d->attr[loc].fmt, &vf) ? DMSH_VK_TYPE_FLOAT
+                                : vf.kind == 1 ? DMSH_VK_TYPE_UINT
+                                : vf.kind == 2 ? DMSH_VK_TYPE_SINT : DMSH_VK_TYPE_FLOAT;
+            d->vin_types = (d->vin_types & ~(3ull << (2 * loc))) | (type << (2 * loc));
+        }
+        if (end > d->nattr) d->nattr = end;
+        break;
+    }
     case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; if (b->first >= 0 && b->first + b->n <= 16) { memcpy(&d->stream[b->first], b->st, 8 * (size_t)b->n); if (b->first + b->n > d->nstream) d->nstream = b->first + b->n; } break; }
     case OP_BIND_VBUF: case OP_BIND_VBUF1: { p_bind_vbuf tmp; const p_bind_vbuf *b = vbuf_rec(op, a, &tmp); if (b->first >= 0 && b->first + b->n <= 16) memcpy(&d->vbuf[b->first], b->r, sizeof *b->r * (size_t)b->n); break; }
     case OP_BIND_UBO: case OP_BIND_UBO_SMALL: { p_bind_buf tmp; const p_bind_buf *b = bind_buf_rec(op, a, &tmp); if (b->stage >= 0 && b->stage < VKA_NSTAGE && b->index >= 0 && b->index < 16) d->b.ubo[b->stage][b->index] = (vka_range){b->addr, b->size}; break; }
@@ -1173,6 +1187,7 @@ static int resolve(const prog_t *p, int st, vka_shader **out, unsigned *bad) {
 static struct { VkVertexInputBindingDescription2EXT b[33]; VkVertexInputAttributeDescription2EXT a[32]; uint32_t nb, na, used, zb; int zero; } VI;
 static void vin_build(const vka_dstate *d, const vka_shader *vs, vka_gkey *k) {
     VI.nb = VI.na = VI.used = 0; VI.zero = 0;
+    k->vin_types = vs->e->vin_types;
     VI.zb = V.max_vin_bindings > 32 ? 31 : V.max_vin_bindings > 16 ? V.max_vin_bindings - 1 : 15;   // the zero buffer's binding: past the 16 streams when the device has room
     for (uint32_t loc = 0; loc < 32; loc++) {
         if (!(vs->e->vin_mask >> loc & 1)) continue;

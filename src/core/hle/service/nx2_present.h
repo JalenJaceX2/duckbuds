@@ -26,6 +26,7 @@
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/frontend/framebuffer_layout.h"
+#include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
@@ -60,22 +61,37 @@ inline u32 Nx2VsyncRateHz() {
  */
 struct Nx2HdrChangeChecks {
     std::mutex mutex;
-    std::vector<std::pair<const void*, std::function<void()>>> checks; ///< by session
+    /// By session: adds the events to signal, opened, to its argument.
+    std::vector<std::pair<const void*, std::function<void(std::vector<Kernel::KEvent*>&)>>> checks;
 };
 inline Nx2HdrChangeChecks g_nx2_hdr_change_checks;
 
-/// Runs the HDR-change check of every live nx2:vi2 session, for a present made outside nx2:vi2.
-inline void Nx2NotifyHdrChange() {
-    std::scoped_lock lock{g_nx2_hdr_change_checks.mutex};
-    for (const auto& check : g_nx2_hdr_change_checks.checks) {
-        check.second();
+/// Signals and closes the events a check opened, with no lock held: a signal can switch this host
+/// thread to another guest thread, which may present and run the checks again.
+inline void Nx2SignalHdrEvents(Kernel::KernelCore& kernel,
+                               const std::vector<Kernel::KEvent*>& events) {
+    for (Kernel::KEvent* const event : events) {
+        event->Signal(kernel);
+        event->Close(kernel);
     }
+}
+
+/// Runs the HDR-change check of every live nx2:vi2 session, for a present made outside nx2:vi2.
+inline void Nx2NotifyHdrChange(Kernel::KernelCore& kernel) {
+    std::vector<Kernel::KEvent*> events;
+    {
+        std::scoped_lock lock{g_nx2_hdr_change_checks.mutex};
+        for (const auto& check : g_nx2_hdr_change_checks.checks) {
+            check.second(events);
+        }
+    }
+    Nx2SignalHdrEvents(kernel, events);
 }
 
 /**
  * What a Switch 2 game's present does besides showing its image, for both presenters: nx2:vi2's
  * PresentClientBuffer (the presents of the game's NVN driver) and NVN2 direct mode's
- * nvnQueuePresentTexture (core/nvn_hook.cpp). The present count and times the
+ * nvnQueuePresentTexture (core/nvn_hook.cpp, dotfiles-25x.7). The present count and times the
  * bench and the debug tools read, thread statistics, pacing to the vblank, the frame capture, the
  * speed limiter and perf stats.
  */
@@ -322,7 +338,18 @@ private:
             const char* value = std::getenv("EDEN_NX2_FRAME_CAPTURE_EVERY");
             return value != nullptr ? (std::max)(u64{1}, static_cast<u64>(std::strtoull(value, nullptr, 10))) : u64{120};
         }();
-        if (directory == nullptr || (presents % every) != 1 % every ||
+        // EDEN_NX2_FRAME_CAPTURE_FROM=<present> (+ _COUNT, default 60): also every present of that
+        // window (consecutive frames, to see what changes between them: dotfiles-25x.17).
+        static const u64 from = [] {
+            const char* value = std::getenv("EDEN_NX2_FRAME_CAPTURE_FROM");
+            return value != nullptr ? static_cast<u64>(std::strtoull(value, nullptr, 10)) : u64{0};
+        }();
+        static const u64 count = [] {
+            const char* value = std::getenv("EDEN_NX2_FRAME_CAPTURE_COUNT");
+            return value != nullptr ? static_cast<u64>(std::strtoull(value, nullptr, 10)) : u64{60};
+        }();
+        const bool in_window = from != 0 && presents >= from && presents < from + count;
+        if (directory == nullptr || (!in_window && (presents % every) != 1 % every) ||
             m_capture_pending->exchange(true)) {
             return;
         }

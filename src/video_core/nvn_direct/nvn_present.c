@@ -269,23 +269,24 @@ int nvn_direct_present_frame(uint64_t id, nvn_direct_frame* out) {
     if (h->id == id) h->queued = 0;
     // A frame dropped already (Lichii composited it late): the newest one held instead.
     if (h->id != id || !h->im) h = &g_held[g_frames % NHELD];
-    const int ok = h->im != NULL;
+    const int ok = h->im != NULL && !vka_stopping() && !vka_hung();
     if (ok) {
         *out = h->frame;
         h->sampling = 1;
     }
     pthread_mutex_unlock(&g_held_mu);
     if (!ok) return 0;
-    // Drawn on the replay's queues: Lichii samples it once the GPU is past its fence (bounded:
-    // a frame whose GPU work waits on the CPU is shown as far as it got, without a GPU wait for
-    // its queue: Lichii's queue would wait as long).
+    // Drawn on the replay's queues: Lichii samples it once the GPU is past its fence.
     if (out->fence && !vka_wait_fence(out->fence, 1000000000ull)) {
         static _Atomic int n;
-        if (atomic_fetch_add(&n, 1) < 8) VRED("present: frame %llu's fence %llu not reached in 1 s: shown as it is", (unsigned long long)out->id, (unsigned long long)out->fence);
-        out->semaphore = VK_NULL_HANDLE;
+        if (atomic_fetch_add(&n, 1) < 8) VRED("present: frame %llu's fence %llu not reached in 1 s: dropped", (unsigned long long)out->id, (unsigned long long)out->fence);
+        composite_done(out->id, 0);
+        return 0;
     }
-    // A stopped or hung replay reads every fence as done but may never signal it on the GPU.
-    if (vka_stopping() || vka_hung()) out->semaphore = VK_NULL_HANDLE;
+    if (vka_stopping() || vka_hung()) {
+        composite_done(out->id, 0);
+        return 0;
+    }
     // out->semaphore: the composite's submission also waits for it (its queue's own timeline, not
     // every queue's), which makes the image's writes visible to Lichii's queue (the CPU wait above
     // alone does not); its value is reached already.

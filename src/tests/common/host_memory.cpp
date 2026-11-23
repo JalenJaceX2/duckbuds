@@ -435,6 +435,38 @@ TEST_CASE("HostMemory: Partial unmap preserves the protections of both kept piec
 #endif
 
 #ifdef _WIN32
+TEST_CASE("HostMemory: Partial unmaps keep the rest of the view readable", "[common]") {
+    if (!MapsSingleGuestPages()) {
+        SKIP("Host pages larger than 4 KiB only map whole host pages");
+    }
+    HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);
+    constexpr size_t Base = 0x400000;
+    constexpr size_t Size = 0x400000;
+    constexpr size_t Unmaps = 512;
+    mem.Map(Base, 0, Size, PERMS, HEAP);
+    volatile u8* const last = mem.VirtualBasePointer() + Base + Size - 0x1000;
+    *last = 0x5a;
+    std::atomic<bool> started{};
+    std::atomic<bool> done{};
+    u64 wrong = 0;
+    std::thread reader([&] {
+        started = true;
+        while (!done.load(std::memory_order_relaxed)) {
+            wrong += *last != 0x5a;
+        }
+    });
+    while (!started) {
+        std::this_thread::yield();
+    }
+    // Each unmap of the first page left takes the view down and maps back the rest of it.
+    for (size_t page = 0; page < Unmaps; ++page) {
+        mem.Unmap(Base + page * 0x1000, 0x1000, HEAP);
+    }
+    done = true;
+    reader.join();
+    REQUIRE(wrong == 0);
+}
+
 TEST_CASE("HostMemory: Trim zero pages keeps contents", "[common]") {
     constexpr size_t Page = 0x1000;
     HostMemory mem(BACKING_SIZE, VIRTUAL_SIZE);

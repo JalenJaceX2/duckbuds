@@ -120,12 +120,8 @@ int main(void) {
     CHECK(nvn_direct_present_composite_pending(1));
     CHECK(!nvn_direct_present_composite_pending(2));   // another window image
     CHECK(!nvn_direct_present_composite_pending(3));   // a texture without an image
-    // Not past its own fence in 1 s: shown as it is, without a GPU wait for its queue (Lichii's
-    // queue would wait as long); the image is the compositor's until the composite is done
-    CHECK(nvn_direct_present_frame(first.id, &shown) && shown.id == first.id);
-    CHECK(shown.semaphore == VK_NULL_HANDLE);
-    CHECK(nvn_direct_present_composite_pending(1));
-    nvn_direct_present_composited(shown.id, 0);   // (a composite that did not sample it)
+    // Not past its own fence in 1 s: dropped, not sampled, and the image is no longer the compositor's
+    CHECK(!nvn_direct_present_frame(first.id, &shown));
     CHECK(!nvn_direct_present_composite_pending(1));
     own_fence_done = 1;
     // vka_dev.c's ring lost the fence meanwhile: the signal taken at the present stands
@@ -188,8 +184,6 @@ int main(void) {
     CHECK(nvn_direct_present_composite_pending(2));
     stopping = 1;
     CHECK(!nvn_direct_present_composite_pending(2));
-    // A stopped replay reads every fence as done but may never signal it: shown without a GPU wait
-    CHECK(nvn_direct_present_frame(last.id, &shown) && shown.id == last.id && shown.semaphore == VK_NULL_HANDLE);
     CHECK(images[0].holds == 2 && images[1].holds == 2);   // the held frames' references only
     puts("nvn_present_tests: ok");
     return 0;

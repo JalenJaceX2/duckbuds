@@ -290,6 +290,18 @@ private:
 struct NvnDirectMemory {
     const Device* device;
     NvmlProcessMemory nvml;
+    bool owns_cache_dir{};
+
+    ~NvnDirectMemory() {
+        if (!owns_cache_dir) {
+            return;
+        }
+#ifdef _WIN32
+        _putenv_s("DM_TEMP", "");
+#else
+        unsetenv("DM_TEMP");
+#endif
+    }
 };
 
 namespace {
@@ -299,7 +311,7 @@ namespace {
 /// submission of the replay holds the scheduler's submit lock. Returns whether the replay is up.
 bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const Device& device,
                     Scheduler& scheduler, NvnDirectAstc* astc, NvnDirectShaders& shaders,
-                    NvnDirectMemory& memory, VideoCore::ShaderNotify& shader_notify) {
+                    NvnDirectMemory& memory_source, VideoCore::ShaderNotify& shader_notify) {
     std::vector<const char*> extensions;
     for (const std::string& name : device.GetLoadedExtensions()) {
         extensions.push_back(name.c_str());
@@ -332,7 +344,7 @@ bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const 
         .memory_budget = [](void* context) -> uint64_t {
             return static_cast<NvnDirectMemory*>(context)->device->GetDeviceMemoryBudget();
         },
-        .memory_context = &memory,
+        .memory_context = &memory_source,
         .pipeline_building = [](void* notify) {
             static_cast<VideoCore::ShaderNotify*>(notify)->MarkShaderBuilding();
         },
@@ -388,10 +400,11 @@ bool AdoptNvnDirect(const vk::InstanceDispatch& dld, VkInstance instance, const 
             dir /= fmt::format("{:016x}", title);
         }
         if (Common::FS::CreateDirs(dir)) {
+            const auto cache_dir = Common::FS::PathToUTF8String(dir);
 #ifdef _WIN32
-            _putenv_s("DM_TEMP", Common::FS::PathToUTF8String(dir).c_str()); // (getenv's environment)
+            memory_source.owns_cache_dir = _putenv_s("DM_TEMP", cache_dir.c_str()) == 0;
 #else
-            setenv("DM_TEMP", Common::FS::PathToUTF8String(dir).c_str(), 1);
+            memory_source.owns_cache_dir = setenv("DM_TEMP", cache_dir.c_str(), 1) == 0;
 #endif
         }
     }
@@ -529,8 +542,25 @@ try
     };
     Report();
 #ifdef LICHII_NVN_DIRECT
+    if (const char* trace = std::getenv("EDEN_NX2_VRAM_TRACE");
+        trace != nullptr && std::strcmp(trace, "1") == 0) {
+        vram_trace = std::jthread([this](std::stop_token stop) {
+            NvmlProcessMemory nvml{device};
+            while (!stop.stop_requested()) {
+                std::this_thread::sleep_for(std::chrono::seconds{1});
+                const u64 process = nvml.Get();
+                const u64 slack = device.GetDeviceMemorySlack();
+                const u64 heaps = device.GetDeviceMemoryUsage() + slack;
+                LOG_INFO(Render_Vulkan,
+                         "VRAM trace: NVML {} MiB, heap usage {} MiB (VMA unused {} MiB), "
+                         "outside the heaps {} MiB",
+                         process >> 20, heaps >> 20, slack >> 20,
+                         (static_cast<s64>(process) - static_cast<s64>(heaps)) >> 20);
+            }
+        });
+    }
     if (device.IsNvnDirect()) {
-        // ASTC the device cannot sample: decoded and re-compressed to BC on the GPU (.8).
+        Core::NvnHook::TraceStartup("before replay setup");
         if (!device.IsOptimalAstcSupported() && device.IsKhrPushDescriptorSupported()) {
             nvn_direct_astc.emplace(device, memory_allocator);
         }
@@ -540,14 +570,9 @@ try
         if (!AdoptNvnDirect(dld, *instance, device, scheduler,
                             nvn_direct_astc ? &*nvn_direct_astc : nullptr, *nvn_direct_shaders,
                             *nvn_direct_memory, gpu_.ShaderNotify())) {
-            // Before the game runs: it falls back to GPU emulation on this device rather than
-            // run with nothing to show.
-            nvn_direct_memory.reset();
-            nvn_direct_shaders.reset();
-            nvn_direct_astc.reset();
-            device.EndNvnDirect();
-            Core::NvnHook::DirectFailed();
+            throw std::runtime_error{"NVN direct replay rejected the Vulkan device"};
         }
+        Core::NvnHook::DirectStarted();
     }
 #endif
 } catch (const vk::Exception& exception) {
@@ -556,18 +581,34 @@ try
 }
 
 RendererVulkan::~RendererVulkan() {
-    scheduler.RegisterOnSubmit([] {});
-#ifdef HAS_FLYHIGH
-    frame_gen.DrainFlyHighSubmissions();
-#endif
 #ifdef LICHII_NVN_DIRECT
     // NVN2 direct mode: the replay's threads leave the device (and the ASTC
     // decode it calls back into) before both go away, and its objects go once the device is idle.
     if (device.IsNvnDirect()) {
         nvn_direct_park();
-        void(device.GetLogical().WaitIdle());
+        scheduler.WaitWorker();
+        present_manager.WaitPresent();
+        scheduler.RegisterOnSubmit([] {});
+#ifdef HAS_FLYHIGH
+        frame_gen.DrainFlyHighSubmissions();
+#endif
+        const auto result = device.GetLogical().WaitIdle();
+        if (result == VK_ERROR_DEVICE_LOST) {
+            device.ReportLoss();
+        }
+        if (result != VK_SUCCESS) {
+            LOG_CRITICAL(Render_Vulkan, "NVN direct: the device did not reach idle ({})",
+                         static_cast<int>(result));
+            Common::Log::Flush();
+            std::_Exit(EXIT_FAILURE);
+        }
         nvn_direct_destroy();
+        return;
     }
+#endif
+    scheduler.RegisterOnSubmit([] {});
+#ifdef HAS_FLYHIGH
+    frame_gen.DrainFlyHighSubmissions();
 #endif
     void(device.GetLogical().WaitIdle());
 }
@@ -580,20 +621,24 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
 #ifdef LICHII_NVN_DIRECT
     // NVN2 direct mode: the replay's frame is taken once for the whole composite (every layer,
     // screenshot and applet capture shows it): from here until nvn_direct_present_composited the
-    // game's acquires of its image wait.
+    // game's acquires of its image wait. Without a usable frame (none taken, its fence not reached
+    // in time, or the replay stopped) nothing is composited.
     nvn_direct_frame replay_frame{};
-    if (device.IsNvnDirect() && framebuffers.size() == 1) {
-        const auto address = framebuffers.front().address + framebuffers.front().offset;
-        if ((address & NVN_DIRECT_FRAME_TAG) != 0 &&
-            nvn_direct_present_frame(address & ~NVN_DIRECT_FRAME_TAG, &replay_frame)) {
-            // Drawn on a replay queue: the first submission that samples it waits for that
-            // queue's timeline (the CPU wait in nvn_direct_present_frame orders the work, not its
-            // writes).
-            if (replay_frame.semaphore != VK_NULL_HANDLE) {
-                scheduler.WaitOnNextSubmit(replay_frame.semaphore, replay_frame.semaphore_value);
-            }
-            rasterizer.SetDirectDisplayFrame(&replay_frame);
+    if (device.IsNvnDirect()) {
+        if (framebuffers.size() != 1) {
+            return;
         }
+        const auto address = framebuffers.front().address + framebuffers.front().offset;
+        if ((address & NVN_DIRECT_FRAME_TAG) == 0 ||
+            !nvn_direct_present_frame(address & ~NVN_DIRECT_FRAME_TAG, &replay_frame)) {
+            return;
+        }
+        // Drawn on a replay queue: the first submission that samples it waits for that queue's
+        // timeline (the CPU wait in nvn_direct_present_frame orders the work, not its writes).
+        if (replay_frame.semaphore != VK_NULL_HANDLE) {
+            scheduler.WaitOnNextSubmit(replay_frame.semaphore, replay_frame.semaphore_value);
+        }
+        rasterizer.SetDirectDisplayFrame(&replay_frame);
     }
     SCOPE_EXIT {
         if (device.IsNvnDirect()) {
@@ -638,6 +683,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::Present};
         return present_manager.GetRenderFrame();
     }();
+    frame->replay_image = device.IsNvnDirect();
     const auto acquired = trace ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
 

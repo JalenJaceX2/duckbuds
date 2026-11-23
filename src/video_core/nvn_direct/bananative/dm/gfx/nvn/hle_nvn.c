@@ -336,6 +336,15 @@ NVN(nvnMemoryPoolBuilderSetDefaults, void, NVNmemoryPoolBuilder *b) { memset(b, 
 NVN(nvnMemoryPoolBuilderSetDevice, void, NVNmemoryPoolBuilder *b, NVNdevice *d) { ((pool_builder_t *)b)->dev = d; }
 NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size_t n) { ((pool_builder_t *)b)->mem = m; ((pool_builder_t *)b)->size = n; }
 NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
+// Lichii: a pool over a Switch 2 native image (Mario Kart World: GameChat's camera images, nx2:gsv 1211, each handle queried with gsv 428 first). The builder gets no storage, size or
+// flags: the pool is the image's guest memory, as SetStorage would give it, CPU-uncached and GPU-cached unless flags were set.
+NVN_NOPROTO(nvnMemoryPoolBuilderSetNativeHandleNVX, void, NVNmemoryPoolBuilder *b, uint64_t handle) {
+    pool_builder_t *s = (pool_builder_t *)b; uint64_t address = 0, size = 0;
+    if (!nvn_direct_native_image(handle, &address, &size)) { LOG("[RED] MemoryPoolBuilderSetNativeHandleNVX: native image %#llx is unknown or has no memory", (unsigned long long)handle); return; }
+    s->mem = (void *)(uintptr_t)nvn_direct_host_of(address); s->size = size;
+    if (!s->flags) s->flags = NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+    LOG("MemoryPoolBuilderSetNativeHandleNVX: native image %llu at %#llx+%#llx", (unsigned long long)handle, (unsigned long long)address, (unsigned long long)size);
+}
 static uint8_t *vpool_reserve(pool_t *o); static void vpool_release(pool_t *o);   // sparse virtual pools, see MapVirtual
 // Live pools, for threads that read a texture's pool after the game's call returned (the Vulkan replay). A registered texture keeps its pool's pointer, a guest address: the game
 // may finalize the pool and unmap the memory holding the pool object (and the texture's storage) while the texture ID is still registered and not yet written by the replay
@@ -387,19 +396,24 @@ uint64_t nvn_pool_live(const void *pool, unsigned *flags, int *sparse) {
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     pthread_mutex_lock(&g_pl_mu);   // (a pool initialized again without a Finalize: readers see its new fields only with its new serial)
+    const int reinit = pl_find(o) != NULL;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size; o->vp = NULL; o->vmode = 0;
     pl_put(o, ++g_plgen); pthread_mutex_unlock(&g_pl_mu);
+    if (reinit) nvn_dirty_remove_range(o);
     if (!o->mem && (o->flags & 0x200)) { uint8_t *vr = vpool_reserve(o); if (vr) o->mem = vr; }   // a virtual pool's own address range, which its mappings fill (see MapVirtual)
-    else if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); pc_add(o); }
+    else if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o, o->mem, o->size); pc_add(o); }
     if (!o->mem && !(o->flags & 0x200)) LOG("[RED] MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, o->size);
     if (getenv("DM_NVN_VLOG")) { LOG("[nvn] MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, (unsigned long long)o->size, o->flags); void dm_backtrace(uint64_t fp); dm_backtrace((uint64_t)__builtin_frame_address(0)); }
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
     return 1;
 }
 static void fl_add(const uint8_t *a, uint64_t n); static void fl_drop(const uint8_t *a, uint64_t n);   // flushed ranges, see nvn_flushed
-NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { pthread_rwlock_wrlock(&g_pl_use); pl_del((const pool_t *)p); pthread_rwlock_unlock(&g_pl_use); pc_del((const pool_t *)p); if (((pool_t *)p)->flags & 0x200 && ((pool_t *)p)->vp) vpool_release((pool_t *)p);
+void nvn_hostseg_release(uintptr_t lo, uintptr_t hi);   // (command memory, nvn_hostseg.h)
+NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { pthread_rwlock_wrlock(&g_pl_use); pl_del((const pool_t *)p); pthread_rwlock_unlock(&g_pl_use); nvn_dirty_remove_range(p); pc_del((const pool_t *)p); if (((pool_t *)p)->flags & 0x200 && ((pool_t *)p)->vp) vpool_release((pool_t *)p);
     if (((pool_t *)p)->mem && !(((pool_t *)p)->flags & 0x200)) {   // A virtual pool's storage is borrowed from a physical pool; do not unregister it
- nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); fl_drop(((pool_t *)p)->mem, ((pool_t *)p)->size); } mtl_alias_drop_pool(p); ((pool_t *)p)->magic = 0; }
+ // Lichii: recordings in the pool's memory are dead with it, and so are the host-lent segments they continue in
+ nvn_hostseg_release((uintptr_t)((pool_t *)p)->mem, (uintptr_t)((pool_t *)p)->mem + ((pool_t *)p)->size);
+ mtl_pool_del(((pool_t *)p)->mem); fl_drop(((pool_t *)p)->mem, ((pool_t *)p)->size); } mtl_alias_drop_pool(p); ((pool_t *)p)->magic = 0; }
 static void ft_flush(const uint8_t *a, uint64_t n);
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {   // see ft_add and nvn_flushed
     const pool_t *o = (const pool_t *)p;
@@ -647,16 +661,29 @@ int nvn_flushed(const void *p, uint64_t n) {   // whether the CPU flushed any of
     pthread_mutex_unlock(&g_fl_mu);
     return r;
 }
+static uint8_t *copy_packaged_texture(const tex_builder_t *s, uint64_t size);
+
 NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b) {
     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
+    nvn_texlayout layout;
+    nvn_tex_layout(&s->d, &layout);
+    uint8_t *packaged = NULL;
+    if (s->pkg_data) {
+        packaged = copy_packaged_texture(s, layout.size);
+        if (!packaged) {
+            static atomic_flag warned = ATOMIC_FLAG_INIT;
+            if (!atomic_flag_test_and_set(&warned)) LOG("[RED] TextureInitialize: packaged texture storage is unavailable");
+            return 0;
+        }
+    }
     // Re-initializing a texture object that is still live (without a Finalize first): release the host texture of the old serial first. SMBW re-initializes its transient render targets on the same object every frame and never Finalizes them;
     //   previously every init created a new private MTLTexture and the old one stayed in the serial table forever, so GPU memory grew about 13 MB per frame (killed by the memory watchdog at 24 GB)
     if (o->magic == MAGIC('T', 'E', 'X', 0) && o->serial) { static uint64_t n; if (!n++) LOG("[nvn] TextureInitialize on a texture object that is still live (no Finalize): releasing the old host texture (first case ser=%llu)", (unsigned long long)o->serial); mtl_tex_release(o); }
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8); o->set_swz = s->set_swz; o->stencil = s->stencil; o->swz = s->swz;
-    nvn_tex_layout(&o->d, &o->L);
-    o->mem = s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
+    o->L = layout;
+    o->mem = s->pkg_data ? packaged : s->pool && s->pool->mem ? s->pool->mem + s->off : NULL;
     o->serial = nvn_new_serial(); mtl_tex_init(o);
     if (o->mem) pc_use(o->pool, 't', o->off, o->L.size);
     if (o->mem && o->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) mtl_pool_need(o->mem, o->L.size, "a linear texture");   // its GPU content is copied back into the storage (vka_tex_writeback)
@@ -669,8 +696,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
             (unsigned long long)o->off, o->d.target, o->d.format, o->d.flags, o->d.samples, o->d.width, o->d.height, o->d.depth, o->d.levels, o->d.stride, (unsigned long long)o->L.size); }
     }
     // See SetPackagedTextureData. Linear textures are not re-uploaded as packaged: they are created on the pool buffer (tex_linear), whatever the pool's CPU access, and read what was copied in
-    if (s->pkg_data && o->mem) {
-        memcpy(o->mem, s->pkg_data, o->L.size);
+    if (packaged) {
         if (!(o->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) mtl_tex_cpu_written(o);
     }
     OLOG("Texture %p %ux%ux%u lv%u fmt=%#x tgt=%d flags=%#x size=%#llx", (void *)t, o->d.width, o->d.height, o->d.depth,
@@ -820,24 +846,29 @@ void nvn_ctl_lens(const void *control, uint32_t *nctl, uint32_t *ncode) {
     memcpy(&own, c + 0x20, 4);
     *nctl = own >= 0x760 && own < 0x880 ? own : 0x880;
 }
+void nvn_shader_hash(const void *control, const void *code, uint32_t size, uint8_t out[8]) {
+    uint32_t nctl, ncode;
+    nvn_ctl_lens(control, &nctl, &ncode);
+    uint8_t md[32]; plat_sha256_t hc; plat_sha256_init(&hc);
+    // Profile key shader_key_skip: bytes of the control section hashed as zeros (shader_split.py key_ctl). Batman: Arkham Knight's engine shares one control section among shaders whose
+    // sections differ only in GLSLC's compile information (+0x778..+0x791, +0x7d0..+0x7e7): it hands a program the section of an earlier shader with the same rest, so the bytes there name another shader
+    if (nvn2_ctl(control)) {
+        uint8_t ctl[NVN2_KEY_CTL]; memcpy(ctl, control, NVN2_KEY_CTL); memset(ctl + 0x30, 0, 4);
+        plat_sha256_update(&hc, ctl, NVN2_KEY_CTL);
+    } else if (DM_GAME_SHADER_KEY_SKIP_LEN && DM_GAME_SHADER_KEY_SKIP_OFF + DM_GAME_SHADER_KEY_SKIP_LEN <= nctl) {
+        uint8_t ctl[0x880]; memcpy(ctl, control, nctl); memset(ctl + DM_GAME_SHADER_KEY_SKIP_OFF, 0, DM_GAME_SHADER_KEY_SKIP_LEN);
+        plat_sha256_update(&hc, ctl, nctl);
+    } else plat_sha256_update(&hc, control, nctl);
+    if (code && size == ncode) plat_sha256_update(&hc, code, size);
+    plat_sha256_final(md, &hc); memcpy(out, md, 8);
+}
 static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
     uint32_t ncode = 0, nctl; void *mb; uint64_t mo;
     if (!sd->control) return 0;
     nvn_ctl_lens(sd->control, &nctl, &ncode);
     int code = sd->data && ncode && ncode < (1u << 24);
     if (mapped && !(code && mtl_addr(sd->data, ncode, &mb, &mo))) return 0;
-    uint8_t md[32]; plat_sha256_t hc; plat_sha256_init(&hc);
-    // Profile key shader_key_skip: bytes of the control section hashed as zeros (shader_split.py key_ctl). Batman: Arkham Knight's engine shares one control section among shaders whose
-    // sections differ only in GLSLC's compile information (+0x778..+0x791, +0x7d0..+0x7e7): it hands a program the section of an earlier shader with the same rest, so the bytes there name another shader
-    if (nvn2_ctl(sd->control)) {
-        uint8_t ctl[NVN2_KEY_CTL]; memcpy(ctl, sd->control, NVN2_KEY_CTL); memset(ctl + 0x30, 0, 4);
-        plat_sha256_update(&hc, ctl, NVN2_KEY_CTL);
-    } else if (DM_GAME_SHADER_KEY_SKIP_LEN && DM_GAME_SHADER_KEY_SKIP_OFF + DM_GAME_SHADER_KEY_SKIP_LEN <= nctl) {
-        uint8_t ctl[0x880]; memcpy(ctl, sd->control, nctl); memset(ctl + DM_GAME_SHADER_KEY_SKIP_OFF, 0, DM_GAME_SHADER_KEY_SKIP_LEN);
-        plat_sha256_update(&hc, ctl, nctl);
-    } else plat_sha256_update(&hc, sd->control, nctl);
-    if (code) plat_sha256_update(&hc, (const void *)(uintptr_t)sd->data, ncode);
-    plat_sha256_final(md, &hc); memcpy(out, md, 8);
+    nvn_shader_hash(sd->control, code ? (const void *)(uintptr_t)sd->data : NULL, ncode, out);
     return 1;
 }
 int prog_key(const prog_t *p, unsigned st, uint8_t key[8]) {
@@ -1603,7 +1634,12 @@ static uint8_t *vpool_reserve(pool_t *o) {   // → the reserved range, or NULL
     uint64_t len = o->size < (64ull << 30) ? o->size : 64ull << 30;
 #endif
     len = (len + (uint64_t)getpagesize() - 1) & ~((uint64_t)getpagesize() - 1);
+#if defined(_WIN32)   // Lichii: an alias region of the guest memory (nvn_direct_alias_pages maps into it there)
+    void *a = nvn_direct_alias_reserve(len);
+    if (!a) a = MAP_FAILED;
+#else
     void *a = mmap(NULL, len, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+#endif
     if (a == MAP_FAILED) { LOG("[RED] virtual pool %p: cannot reserve %#llx bytes of address space (errno %d)", (const void *)o, (unsigned long long)len, errno); return NULL; }
     struct vpool *v = calloc(1, sizeof *v);
     if (!v || !(v->pt = calloc((o->size + (2u << 20) - 1) >> 21, sizeof *v->pt))) die("sparse pool allocation failed");
@@ -1623,7 +1659,11 @@ static void vpool_drop(pool_t *o) {   // caller holds g_vp_mu
 #if !PLAT_APPLE
     mtl_pool_alias(v->base, v->len < v->size ? v->len : v->size, NULL);   // (the GPU's aliases go with the range: a pool reserved there later starts unmapped)
 #endif
+#if defined(_WIN32)
+    nvn_direct_alias_release(v->base);
+#else
     munmap(v->base, v->len);
+#endif
     for (uint64_t l = 0; l < (v->size + (2u << 20) - 1) >> 21; l++) free(v->pt[l]);
     for (int i = 0; i < g_nvp; i++) if (g_vp[i] == v) { memmove(&g_vp[i], &g_vp[i + 1], (size_t)(g_nvp - 1 - i) * sizeof *g_vp); g_nvp--; break; }
     free(v->pt); free(v); o->vp = NULL;
@@ -1647,6 +1687,58 @@ static void vrun_set(struct vpool *v, uint64_t lo, uint64_t hi, int mapped) {
 }
 // Page table of a sparse pool (see above). Caller holds g_vp_mu
 static const vpte *vpt_get(const struct vpool *v, uint64_t o) { const vpte *l = v->pt[o >> 21]; return l ? &l[(o >> 12) & (VPT_LEAF - 1)] : NULL; }
+
+static uint8_t *copy_packaged_texture(const tex_builder_t *s, uint64_t size) {
+    if (!s->pool || !size || s->off < 0) return NULL;
+    const uintptr_t src = (uintptr_t)s->pkg_data;
+    if (size > UINTPTR_MAX - src) return NULL;
+    uint8_t *result = NULL;
+    nvn_pool_use(1);
+    pthread_mutex_lock(&g_pl_mu);
+    const pool_t *pool = s->pool;
+    if (!pl_find(pool) || !pool->mem || (uint64_t)s->off > pool->size ||
+        size > pool->size - (uint64_t)s->off || pool->size > UINTPTR_MAX - (uintptr_t)pool->mem) goto done;
+    const uintptr_t dst = (uintptr_t)pool->mem + (uint64_t)s->off;
+    const int virtual = (pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) != 0;
+    if (virtual) pthread_mutex_lock(&g_vp_mu);
+    const struct vpool *v = virtual ? pool->vp : NULL;
+    if (!virtual || (v && v->pool == pool && v->base == pool->mem && v->size == pool->size)) {
+        int ok = 1;
+        for (int write = 0; write < 2 && ok; ++write) {
+            for (uint64_t i = 0; i < size;) {
+                uintptr_t at = dst + i;
+                if (v) {
+                    const uint64_t offset = (uint64_t)s->off + i;
+                    const vpte *entry = vpt_get(v, offset);
+                    if (!entry || !entry->phys || ((uintptr_t)entry->phys & 0xfff)) { ok = 0; break; }
+                    at = (uintptr_t)entry->phys + (offset & 0xfff);
+                }
+                const void *from = nvn_direct_guest_backing(src + i);
+                void *to = nvn_direct_guest_backing(at);
+                if (!from || !to) { ok = 0; break; }
+                uint64_t n = 0x1000 - (at & 0xfff);
+                const uint64_t src_left = 0x1000 - ((src + i) & 0xfff);
+                if (n > src_left) n = src_left;
+                if (n > size - i) n = size - i;
+                if (write) {
+                    memmove(to, from, n);
+                    if (virtual) dm_guest_write_prepare((void *)at, n);
+                }
+                i += n;
+            }
+        }
+        if (ok) {
+            if (!virtual) dm_guest_write_prepare((void *)dst, size);
+            result = (uint8_t *)dst;
+        }
+    }
+    if (virtual) pthread_mutex_unlock(&g_vp_mu);
+done:
+    pthread_mutex_unlock(&g_pl_mu);
+    nvn_pool_use(0);
+    return result;
+}
+
 static void vpt_set(struct vpool *v, uint64_t voff, uint64_t size, const uint8_t *phys) {
     uint64_t gen = atomic_fetch_add(&g_vp_gen, 1) + 1;
     for (uint64_t o = 0; o < size; o += 0x1000) {
@@ -1674,7 +1766,11 @@ static int vpool_map(struct vpool *v, const map_req *r) {   // caller holds g_vp
 #if !PLAT_APPLE
         mtl_pool_alias((void *)to, r->size, NULL);
 #endif
+#if defined(_WIN32)
+        nvn_direct_alias_unmap((void *)to, r->size);
+#else
         if (mmap((void *)to, r->size, PROT_NONE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) == MAP_FAILED) { LOG("[RED] virtual pool unmap %#lx+%#llx failed (errno %d)", (unsigned long)to, (unsigned long long)r->size, errno); return 0; }
+#endif
         vrun_set(v, (uint64_t)r->voff, (uint64_t)r->voff + r->size, 0); return 1;
     }
     uintptr_t from = (uintptr_t)ph->mem + (uintptr_t)r->poff;
@@ -3306,7 +3402,11 @@ NVN_NOPROTO(nvnCommandBufferPushComputeConstantsDeferred, void, NVNcommandBuffer
 void nvn_hle_destroy(void) {
     for (int i = 0; i < g_nvp; i++) {
         struct vpool *v = g_vp[i];
+#if defined(_WIN32)
+        nvn_direct_alias_release(v->base);
+#else
         munmap(v->base, v->len);
+#endif
         for (uint64_t l = 0; l < (v->size + (2u << 20) - 1) >> 21; l++) free(v->pt[l]);
         free(v->pt); free(v);
     }

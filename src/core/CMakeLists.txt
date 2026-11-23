@@ -1087,6 +1087,7 @@ add_library(core STATIC
     hle/service/nx2_fence_action.h
     hle/service/nx2_frame_interval.h
     hle/service/nx2_movie_clock.h
+    hle/service/nx2_native_image_lookup.h
     hle/service/nx2_video_input_queue.h
     hle/service/nx2_image_layout.h
     hle/service/nx2_present_pacer.h

@@ -67,10 +67,16 @@ void StopDirect();
 /// exports in the application's modules (after they are loaded). Logs the decision.
 void Install(Core::System& system, Kernel::KProcess& process);
 
+/// The Vulkan replay started successfully, before the guest runs.
+void DirectStarted();
+
 /// Direct mode, the Vulkan renderer being made (before the game runs): the direct renderer could
 /// not start on the device. The boot falls back to GPU emulation, and so does every later boot
 /// in this process that asks for the direct renderer. Logged.
 void DirectFailed();
+
+/// EDEN_NX2_NVN_STARTUP_TRACE=1: logs the process's memory at a startup phase of a direct boot.
+void TraceStartup(std::string_view phase);
 
 /// The boot is over (the end of System::ShutdownMainProcess): its hook state goes, and the direct
 /// renderer's front end and replay return to their state before the first boot
@@ -79,6 +85,15 @@ void Uninstall();
 
 /// The renderer Install chose for the current (or last) boot.
 [[nodiscard]] RendererChoice Choice();
+
+/// This process was started by MainWindow::RelaunchForGame (LICHII_RELAUNCH_WAIT_PID): it does not
+/// relaunch again (NeedsFreshProcess).
+void MarkRelaunched();
+
+/// The next boot, under the current settings, asks for the direct renderer, and an earlier boot's
+/// direct renderer could not be reset: the boot would fall back (RendererChoice::NotReset) unless
+/// a fresh process runs it (NeedsFreshProcess).
+[[nodiscard]] bool DirectNeedsFreshProcess();
 
 /// UserConfig::block_entry_hook (null unless the direct renderer is asked for).
 Dynarmic::A64::BlockEntryHook (*BlockEntryHookFunction())(u64 pc);

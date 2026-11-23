@@ -422,7 +422,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Runs the game's graphics calls (NVN) directly on Vulkan instead of emulating the "
               "Switch GPU. Can be much faster, but is experimental: some games may render wrong "
               "or crash.\nGames it cannot run (32-bit games, games without NVN) use the normal "
-              "renderer; the status bar says why. Vulkan only. Takes effect when a game starts."));
+              "renderer; the status bar says why. When the renderer cannot be reset for a later "
+              "game, Lichii restarts automatically. Vulkan only. Takes effect when a game starts."));
     INSERT(Settings, native_async_draws, tr("Switch 2 draws and compute with unbuilt shaders:"),
            tr("Only applies when \"Don't wait for shaders that are still compiling\" is on. Decides "
               "what Switch 2 work does when its pipeline is still building. Only work that redraws "

@@ -87,6 +87,7 @@
 #include "core/hle/service/nx2_frame_interval.h"
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_movie_clock.h"
+#include "core/hle/service/nx2_native_image_lookup.h"
 #include "core/hle/service/nx2_video_input_queue.h"
 #include "core/hle/service/nx2_present.h"
 #include "core/hle/service/nx2_present_pacer.h"
@@ -1784,6 +1785,25 @@ struct Nx2NativeObjects {
         const auto image = images.find(id);
         return image != images.end() ? image->second.decoder_mutex : nullptr;
     }
+
+    /// The guest address and size of native image handle (image i of a pool is its id + i), once
+    /// its memory is bound.
+    std::optional<std::pair<u64, u64>> ImageRange(u32 handle) {
+        std::scoped_lock lk{mutex};
+        auto it = images.upper_bound(handle);
+        if (it == images.begin()) {
+            return std::nullopt;
+        }
+        --it;
+        const Image& image = it->second;
+        const auto memory = memories.find(image.memory);
+        if (handle - it->first >= image.count || memory == memories.end() ||
+            memory->second.address == 0) {
+            return std::nullopt;
+        }
+        return std::pair{memory->second.address + image.offset + (handle - it->first) * image.size,
+                         image.size};
+    }
 };
 
 // GameChat's graphics side (nn::chat::gsv), handed out by gsv 1202. Read from the SDK's
@@ -2035,7 +2055,8 @@ public:
             {359, &INx2Vi2Session::StubReplyZeroed, "Unknown359"},
         });
         std::scoped_lock lk{g_nx2_hdr_change_checks.mutex};
-        g_nx2_hdr_change_checks.checks.emplace_back(this, [this] { NotifyHdrChange(); });
+        g_nx2_hdr_change_checks.checks.emplace_back(
+            this, [this](std::vector<Kernel::KEvent*>& events) { CollectHdrChange(events); });
     }
 
     ~INx2Vi2Session() override {
@@ -2894,6 +2915,14 @@ private:
     // presents and on the game's for NVN direct mode's (Nx2NotifyHdrChange); costs an atomic load
     // and a lock while nothing changes.
     void NotifyHdrChange() {
+        std::vector<Kernel::KEvent*> events;
+        CollectHdrChange(events);
+        Nx2SignalHdrEvents(system.Kernel(), events);
+    }
+
+    // NotifyHdrChange's check: the events to signal, opened, added to events. They are signalled
+    // (Nx2SignalHdrEvents) once m_hdr_mutex and the checks' mutex are released.
+    void CollectHdrChange(std::vector<Kernel::KEvent*>& events) {
         const u64 generation = Common::DisplayHdrMonitor::Instance().Generation();
         std::scoped_lock lk{m_hdr_mutex};
         if (generation == m_hdr_generation) {
@@ -2907,8 +2936,9 @@ private:
         }
         LOG_INFO(Service, "nx2:vi2 display HDR state changed, signalling the game");
         for (u32 index = 0; index < m_native_events.size(); ++index) {
-            if ((m_hdr_change_slots >> index) & 1 && m_native_events[index]) {
-                m_native_events[index]->Signal(system.Kernel());
+            Kernel::KEvent* const event = m_native_events[index];
+            if ((m_hdr_change_slots >> index) & 1 && event && event->Open(system.Kernel())) {
+                events.push_back(event);
             }
         }
     }
@@ -4224,9 +4254,21 @@ public:
             {1612, &INx2GraphicsSystemSession::DestroyNativeImage, "DestroyFeatureImagePool1612"},
             {1691, &INx2GraphicsSystemSession::CalculateChatImagePoolSize, "CalculateFeatureImagePoolSize1691"},
         });
+        std::scoped_lock lk{g_nx2_native_image_lookup.mutex};
+        g_nx2_native_image_lookup.owner = this;
+        g_nx2_native_image_lookup.range = [objects = m_objects](u32 handle) {
+            return objects->ImageRange(handle);
+        };
     }
 
     ~INx2GraphicsSystemSession() override {
+        {
+            std::scoped_lock lk{g_nx2_native_image_lookup.mutex};
+            if (g_nx2_native_image_lookup.owner == this) {
+                g_nx2_native_image_lookup.owner = nullptr;
+                g_nx2_native_image_lookup.range = nullptr;
+            }
+        }
         if (m_syncpt_memory != nullptr) {
             system.Host1x().GetSyncpointManager().SetGuestMirror({});
         }

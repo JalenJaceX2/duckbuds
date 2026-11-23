@@ -4,9 +4,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-void nvn_dirty_add_range(const void *mem, size_t size);           // Register a memory pool as a tracked range (the first call registers the page-fault hook and the host pre-write hook)
+void nvn_dirty_add_range(const void *pool, const void *mem, size_t size);   // Lichii: track this pool's pages, keyed by pool object
 void nvn_dirty_stat(int *live, int *peak, int *cap);                // number of registered memory pools, peak, tracking table capacity (for the memory readout line)
-void nvn_dirty_remove_range(const void *mem);                     // Pool destruction: restore protected pages to writable and mark invalid
+void nvn_dirty_remove_range(const void *pool);                   // Lichii: remove this pool's registration; other pools can share its pages
 int nvn_dirty_tracked(const void *addr, size_t len);
 void nvn_dirty_protect(const void *addr, size_t len);              // Set the covered pages read-only
 void nvn_dirty_hold(const void *addr, size_t len);                 // Unprotect (and stamp) every protected page of [addr, addr+len) and protect nothing more until nvn_dirty_unhold

@@ -245,7 +245,7 @@ vka_shader *vka_shader_make(const vka_shlib *L, uint64_t key) {
 }
 
 // A shader by key (the prewarm threads, vka_pso.c): Lichii's recompiled shaders, those translated so far (nvn_recompile.c); NULL = not translated or refused
-vka_shader *vka_shader_by_key(uint64_t key, int gl_depth, uint32_t gs_in) { return vka_rc_by_key(key, gl_depth, gs_in); }
+vka_shader *vka_shader_by_key(uint64_t key, int gl_depth, uint32_t gs_in, uint64_t vin_types) { return vka_rc_by_key(key, gl_depth, gs_in, vin_types); }
 
 // Lichii: the keys program stages asked for that the recompiler could not place, each counted once and logged (the first 256) with how many there are so far
 static pthread_mutex_t g_miss_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -291,7 +291,10 @@ void mtl_prog_release(prog_t *p) {
 }
 void mtl_prog_prefetch(const prog_t *p) { vka_rc_keep(p); }   // modules are made at the program's first draw (vka_prog_shaders); Lichii: the recompiler's copies of the control sections
 
-int vka_progsh_current(const vka_progsh *ps) { return (!ps->depth || ps->depth == 1 + !vka_depth_zero()) && (!ps->gs_in || ps->gs_in == vka_rc_gs_input()); }
+int vka_progsh_current(const vka_progsh *ps) {
+    return (!ps->depth || (ps->depth == 1 + !vka_depth_zero() && ps->vin_types == vka_rc_vin_types())) &&
+           (!ps->gs_in || ps->gs_in == vka_rc_gs_input());
+}
 int vka_prog_shaders(const prog_t *p, vka_progsh *out) {
     memset(out, 0, sizeof *out);
     if (!p || !p->serial) return 0;
@@ -301,6 +304,7 @@ int vka_prog_shaders(const prog_t *p, vka_progsh *out) {
     // The pixel stage last: drawn after the program's mesh shader, it reads that shader's per-primitive outputs as such (vka_rc_shader prim_inputs)
     // Lichii: the pre-rasterization stages in the depth mode now (resolved again for the program after a switch: the other mode's translations stay kept)
     uint32_t prim = 0; const int gl_depth = !vka_depth_zero(); out->depth = (uint8_t)(1 + gl_depth);
+    out->vin_types = vka_rc_vin_types();
     for (int pass = 0; pass < 2; pass++)
         for (unsigned i = 0; i < p->nstage && i < 6; i++) {
             uint8_t md[8];

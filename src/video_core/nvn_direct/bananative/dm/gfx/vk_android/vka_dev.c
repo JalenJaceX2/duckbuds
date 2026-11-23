@@ -28,8 +28,10 @@ int nvn_direct_adopt_device(const nvn_direct_device *d) {
     // (the array of extension names is the caller's, for the call: the replay keeps its own copy; the names live as long as the device)
     const char **ext = malloc((d->extension_count ? d->extension_count : 1) * sizeof *ext); if (!ext) return 0;
     if (d->extension_count) memcpy(ext, d->extensions, d->extension_count * sizeof *ext);
-    pthread_mutex_lock(&g_init_mu); if (!g_adopted && !g_state) { g_adopt = *d; g_adopt.extensions = ext; ext = NULL; g_adopted = 1; } pthread_mutex_unlock(&g_init_mu);
-    free(ext);
+    pthread_mutex_lock(&g_init_mu);
+    if (g_adopted || g_state) { pthread_mutex_unlock(&g_init_mu); free(ext); return 0; }
+    g_adopt = *d; g_adopt.extensions = ext; g_adopted = 1;
+    pthread_mutex_unlock(&g_init_mu);
     VLOG("asynchronous pipelines (draws skipped until their pipeline is made): %s (asynchronous shader building setting)", g_adopt.async_pipelines ? "on" : "off");
     if (g_adopt.scale_up && (g_adopt.scale_up != 1 || g_adopt.scale_shift)) {   // (Lichii's recompiler reads the scale)
         vka_scale_up = g_adopt.scale_up; vka_scale_shift = g_adopt.scale_shift;
@@ -39,6 +41,15 @@ int nvn_direct_adopt_device(const nvn_direct_device *d) {
     if (g_adopt.memory_usage) { V.pd = d->physical; vka_heap_line(h, sizeof h); u = g_adopt.memory_usage(g_adopt.memory_context); VLOG("VRAM before the replay starts: host use %.0f MiB; driver %s", u / 1048576.0, h); }
     int ok = vka_init();
     if (ok && g_adopt.memory_usage) { vka_heap_line(h, sizeof h); u = g_adopt.memory_usage(g_adopt.memory_context); (void)b; VLOG("VRAM after the replay started: host use %.0f MiB; driver %s", u / 1048576.0, h); }
+    if (!ok) {
+        for (int i = 0; i < NVN_DIRECT_MAX_QUEUES; i++) if (V.qtl[i]) vk.vkDestroySemaphore(V.dev, V.qtl[i], NULL);
+        if (V.tl) vk.vkDestroySemaphore(V.dev, V.tl, NULL);
+#if !defined(_WIN32)
+        if (V.udmabuf) close(V.udmabuf_fd);
+#endif
+        free(ext);
+        g_adopt = (nvn_direct_device){0};
+    }
     return ok;
 }
 
@@ -230,6 +241,8 @@ static int init_once(void) {
     V.host_import = !V.placed && x_host && vk.vkGetMemoryHostPointerPropertiesEXT && pemh.minImportedHostPointerAlignment;
     if (V.host_import) V.placed_align = pemh.minImportedHostPointerAlignment > 4096 ? pemh.minImportedHostPointerAlignment : 4096;
     if (V.host_import) vka_mem_import_choose(x_dmabuf);
+    // Lichii: with no way to show the GPU the guest's pools nothing renders: the replay does not start, and the game runs on GPU emulation instead (Core::NvnHook::DirectFailed)
+    if (!V.placed && !V.host_import) { VRED("no VK_EXT_map_memory_placed or VK_EXT_external_memory_host: the GPU sees no memory pool, so the replay does not start"); return 0; }
     V.max_push = V.push_desc ? ppd.maxPushDescriptors : 0;
     if (V.mesh && !vk.vkCmdDrawMeshTasksEXT) V.mesh = V.task = 0;
     V.draw_indirect_count = f12.drawIndirectCount && vk.vkCmdDrawIndirectCount && vk.vkCmdDrawIndexedIndirectCount;
@@ -277,7 +290,6 @@ static int init_once(void) {
          "uniform alignment %llu (range %llu), storage alignment %llu, subgroups %u (%u-%u)",
          V.push_desc ? "yes" : "no", V.max_push, V.vin_dyn ? "yes" : "no", V.null_desc ? "yes" : "no", V.idx8 ? "yes" : "no", V.divisor ? "yes" : "no", V.logic_op ? "yes" : "no",
          V.dual_src ? "yes" : "no", V.geom ? "yes" : "no", V.tess ? "yes" : "no", (unsigned long long)V.ub_align, (unsigned long long)V.ub_range, (unsigned long long)V.sb_align, V.subgroup_size, V.subgroup_min, V.subgroup_max);
-    if (!V.placed && !V.host_import) VRED("no VK_EXT_map_memory_placed or VK_EXT_external_memory_host: the GPU sees no memory pool");
     if (!swap) VRED("no VK_KHR_swapchain: nothing is presented");
     vka_pso_start();   // Lichii: the pipeline cache, the prewarm and the compute pipelines made ahead from the start, not from the first pipeline
     return 1;
@@ -374,6 +386,7 @@ typedef struct { uint64_t fence; void *ops; int n; void (*run)(void *, int); } p
 static post_rec g_post[POST_RING];
 typedef struct after_rec { struct after_rec *next; uint64_t fence; void (*fn)(void *); void *arg; } after_rec;
 static after_rec *g_after;
+static int g_device_idle;
 static uint64_t g_fence, g_submitted, g_done;
 static uint64_t g_fdone[FQ_RING];   // with several queues: fences done, by slot (a fence past g_done may be done before the fences before it)
 static pthread_mutex_t g_fmu = PTHREAD_MUTEX_INITIALIZER;
@@ -415,7 +428,7 @@ int vka_wait_done(uint64_t fence, uint64_t timeout_ns) { return wait_fence(fence
 int vka_wait_fence(uint64_t fence, uint64_t timeout_ns) { return wait_fence(fence, timeout_ns, 1); }
 void vka_after(uint64_t fence, void (*fn)(void *), void *arg) {
     pthread_mutex_lock(&g_fmu);
-    if (g_done >= fence) { pthread_mutex_unlock(&g_fmu); fn(arg); return; }
+    if (g_device_idle || (g_done >= fence && !vka_hung())) { pthread_mutex_unlock(&g_fmu); fn(arg); return; }
     after_rec *a = malloc(sizeof *a); *a = (after_rec){g_after, fence, fn, arg}; g_after = a;
     pthread_mutex_unlock(&g_fmu);
 }
@@ -543,7 +556,9 @@ static void *completion_main(void *arg) {
         pthread_mutex_lock(&g_fmu);
         if (v > g_done) __atomic_store_n(&g_done, v, __ATOMIC_RELEASE);
         after_rec *run = NULL, **pp = &g_after;
-        while (*pp) { after_rec *a = *pp; if (a->fence <= g_done) { *pp = a->next; a->next = run; run = a; } else pp = &a->next; }
+        if (!vka_hung()) {
+            while (*pp) { after_rec *a = *pp; if (a->fence <= g_done) { *pp = a->next; a->next = run; run = a; } else pp = &a->next; }
+        }
         pthread_cond_broadcast(&g_fcv); pthread_mutex_unlock(&g_fmu);
         while (run) { after_rec *a = run; run = a->next; a->fn(a->arg); free(a); }
     }
@@ -806,7 +821,7 @@ void vka_exec_destroy(void); void vka_draw_destroy(void); void vka_enc_destroy(v
 void vka_dlss_destroy(void); void vka_nan_destroy(void); void vka_gprof_destroy(void); void nvn_present_destroy(void); void vka_census_line(void);
 void vka_destroy(void) {
     atomic_store(&g_hung, 0);   // (the GPU is idle: what a hang or the stop kept from being freed goes now, and what is deferred from now on runs at once)
-    pthread_mutex_lock(&g_fmu); after_rec *run = g_after; g_after = NULL; __atomic_store_n(&g_done, g_fence, __ATOMIC_RELEASE); pthread_mutex_unlock(&g_fmu);
+    pthread_mutex_lock(&g_fmu); g_device_idle = 1; after_rec *run = g_after; g_after = NULL; __atomic_store_n(&g_done, g_fence, __ATOMIC_RELEASE); pthread_mutex_unlock(&g_fmu);
     while (run) { after_rec *a = run; run = a->next; a->fn(a->arg); free(a); }
     nvn_present_destroy();
     vka_capture_destroy(); vka_ctl_destroy(); vka_dlss_destroy(); vka_nan_destroy(); vka_gprof_destroy();
@@ -822,6 +837,7 @@ void vka_destroy(void) {
     vk.vkDestroySemaphore(V.dev, V.tl, NULL);
     vka_census_line();
     free((void *)g_adopt.extensions);
+    __atomic_store_n(&g_state, -1, __ATOMIC_RELEASE);
 }
 #endif
 

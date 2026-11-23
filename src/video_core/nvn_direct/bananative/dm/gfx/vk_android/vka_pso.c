@@ -798,7 +798,7 @@ static const char PW_MAGIC[8] = "NXVKPW1", PW_MAGIC2[8] = "NXVKPW2";
 static uint32_t gkey_layout(void) {
     static const uint32_t o[] = {offsetof(vka_gkey, dfmt), offsetof(vka_gkey, ncolor), offsetof(vka_gkey, samples), offsetof(vka_gkey, topo), offsetof(vka_gkey, poly_mode),
         offsetof(vka_gkey, fs_variant), offsetof(vka_gkey, alpha_func), offsetof(vka_gkey, gs_fx), offsetof(vka_gkey, vin_u), offsetof(vka_gkey, att), offsetof(vka_gkey, sample_mask), offsetof(vka_gkey, vin_static),
-        offsetof(vka_gkey, va), offsetof(vka_gkey, vb), sizeof(vka_gkey), 3 /* the format's own version */};
+        offsetof(vka_gkey, vin_types), offsetof(vka_gkey, va), offsetof(vka_gkey, vb), sizeof(vka_gkey), 4};
     return (uint32_t)fnv(o, sizeof o, 1469598103934665603ull);
 }
 // A record of the file before it is used: a file from another build, a truncated or damaged one must not reach pstate_fill (an ncolor of 200 indexes past cf[8]).
@@ -967,8 +967,8 @@ static void *pw_main(void *a) {
         vka_shader *sh[VKA_NSTAGE]; memset(sh, 0, sizeof sh); int bad = !pw_rec_ok(&r, kb);
         vka_gkey k; memset(&k, 0, sizeof k); if (!bad && r.kind != 1) memcpy(&k, kb, r.klen < sizeof k ? r.klen : sizeof k);
         if (bad) {}
-        else if (r.kind == 1) { if (!(sh[5] = vka_shader_by_key(r.key[0], 1, 0))) bad = 1; }
-        else for (int s = 0; s < 5; s++) if (r.key[s] && !(sh[s] = vka_shader_by_key(r.key[s], k.gl_depth, s == 2 ? r.gs_in : 0))) bad = 1;   // (Lichii: recompiled in the record's depth mode)
+        else if (r.kind == 1) { if (!(sh[5] = vka_shader_by_key(r.key[0], 1, 0, 0))) bad = 1; }
+        else for (int s = 0; s < 5; s++) if (r.key[s] && !(sh[s] = vka_shader_by_key(r.key[s], k.gl_depth, s == 2 ? r.gs_in : 0, s == 0 ? k.vin_types : 0))) bad = 1;   // (Lichii: recompiled in the record's depth mode)
         vka_layout lay;
         if (!bad && !vka_layout_of(sh, r.kind == 1, &lay)) bad = 1;
         int made = 0;
@@ -1171,6 +1171,17 @@ VkPipeline vka_gfx_pipeline(vka_shader *const sh[VKA_NSTAGE], const vka_layout *
 }
 
 // ---------- Compute pipelines ----------
+// Compute program cs's pipeline in layout lay (cs_obtain, vka_cs_ahead_shader)
+static VkResult cs_create(vka_shader *cs, const vka_layout *lay, const char *what, VkPipeline *p) {
+    int spill = 0;   // shared memory in the spill buffer (vka_draw.c spill_dispatch): dispatched in parts with a base workgroup
+    for (unsigned i = 0; i < cs->e->bind_count; i++) if (cs->b[i].kind == DMSH_VK_KIND_SHARED_SPILL) spill = 1;
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .flags = spill ? VK_PIPELINE_CREATE_DISPATCH_BASE_BIT : 0, .layout = lay->layout,
+        .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = cs->mods[DMSH_VK_MOD_BASE], .pName = "main"}};
+    int bs = build_begin(what, cs->key, 0);
+    VkResult r = vk.vkCreateComputePipelines(V.dev, g_pc, 1, &ci, NULL, p);
+    build_end(bs);
+    return r;
+}
 typedef struct { vka_shader *cs; VkPipelineLayout layout; } ckey;
 static kmap g_cs = {.klen = sizeof(ckey)};
 static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, int *made) {
@@ -1188,10 +1199,6 @@ static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, 
     pthread_mutex_unlock(&g_mu);
     pc_open();
     uint64_t t0 = now_ns();
-    int spill = 0;   // shared memory in the spill buffer (vka_draw.c spill_dispatch): dispatched in parts with a base workgroup
-    for (unsigned i = 0; i < cs->e->bind_count; i++) if (cs->b[i].kind == DMSH_VK_KIND_SHARED_SPILL) spill = 1;
-    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .flags = spill ? VK_PIPELINE_CREATE_DISPATCH_BASE_BIT : 0, .layout = lay->layout,
-        .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = cs->mods[DMSH_VK_MOD_BASE], .pName = "main"}};
     VkPipeline p = VK_NULL_HANDLE; VkResult r; int over = 0;
     // Shared memory past the device's limit is invalid usage (the driver may refuse, crash or run it with less). The translator keeps a program's shared memory past
     // DMSH_VK_SHARED_MAX in a storage buffer (DMSH_VK_KIND_SHARED_SPILL), and e->shared is then what stays in workgroup memory; a program still over this device's
@@ -1201,7 +1208,7 @@ static VkPipeline cs_obtain(vka_shader *cs, const vka_layout *lay, int prewarm, 
     if (smax && cs->e->shared > smax && !VKA_ENV("DM_VK_CS_SHARED_OVER", 0)) {
         r = VK_ERROR_FEATURE_NOT_PRESENT; over = 1;
         static _Atomic int n; if (atomic_fetch_add(&n, 1) < 16) VRED("compute program %016llx takes %u bytes of shared memory, the device at most %u: not made, its dispatches are skipped (the first 16 are logged; the count is in the pipeline line)", (unsigned long long)cs->key, cs->e->shared, smax);
-    } else { int bs = build_begin("compute pipeline", cs->key, 0); r = vk.vkCreateComputePipelines(V.dev, g_pc, 1, &ci, NULL, &p); build_end(bs); }
+    } else r = cs_create(cs, lay, "compute pipeline", &p);
     pthread_mutex_lock(&g_mu);
     if (over) { p = VK_NULL_HANDLE; g_ncs_over++; } else if (r) { p = VK_NULL_HANDLE; g_nfail++; } else { g_ncs++; g_made++; if (!prewarm) g_frame_made++; }
     { uint64_t dns = now_ns() - t0; g_create_ms += dns / 1e6; if (!prewarm) g_create_ns += dns; }
@@ -1240,7 +1247,22 @@ static void lib_ahead_make(vka_shader *s, int part, const vka_gkey *k, int scrat
 }
 static void lib_ahead_one(const ahead_item *it) {
     vka_gkey k; memset(&k, 0, sizeof k); lib_default_key(&k);
-    lib_ahead_make(vka_shader_by_key(it->key, k.gl_depth, 0), it->part, &k, 0);
+    lib_ahead_make(vka_shader_by_key(it->key, k.gl_depth, 0, 0), it->part, &k, 0);
+}
+// Lichii: a speculative translation's compute pipeline, for the caches only (nvn_recompile.c spec_one): made and destroyed, so the first dispatch of the program makes
+// its own from the pipeline and driver caches instead of compiling on the frame path when the two translations are the same. s is a vka_shader_scratch one
+void vka_cs_ahead_shader(vka_shader *s) {
+    if (!s) return;
+    const uint32_t smax = V.props.limits.maxComputeSharedMemorySize;
+    if (smax && s->e->shared > smax) return;   // (not made at its dispatch either: cs_obtain)
+    vka_shader *sh[VKA_NSTAGE] = {0}; sh[5] = s;
+    vka_layout lay; memset(&lay, 0, sizeof lay);
+    if (!layout_slow(sh, 1, &lay) || !lay.layout) return;
+    vka_pipeline_notify(0);
+    pc_open();
+    VkPipeline p = VK_NULL_HANDLE;
+    if (cs_create(s, &lay, "compute pipeline (speculative)", &p) == VK_SUCCESS) vk.vkDestroyPipeline(V.dev, p, NULL);
+    vka_pipeline_notify(1);
 }
 // A speculative translation's stage library in the most common state, for the caches only (nvn_recompile.c spec_main): part 1 a vertex shader, 2 a pixel shader;
 // s is a vka_shader_scratch one

@@ -48,6 +48,9 @@ void nvn_direct_unmap_view(void* view, uint64_t size) { g_memory.unmap_view(g_me
 int nvn_direct_track_pages(uint64_t address, uint64_t size, int armed) {
     return g_memory.track_pages ? g_memory.track_pages(g_memory.context, address, size, armed) : 1;
 }
+int nvn_direct_native_image(uint64_t handle, uint64_t* address, uint64_t* size) {
+    return g_memory.native_image ? g_memory.native_image(g_memory.context, handle, address, size) : 0;
+}
 int nvn_direct_backing_file(uint64_t address, uint64_t* offset) {
     if (g_memory.backing_fd < 0 || !g_memory.backing) return -1;
     const uint8_t* const backing = g_memory.backing(g_memory.context, address);
@@ -55,6 +58,29 @@ int nvn_direct_backing_file(uint64_t address, uint64_t* offset) {
     *offset = (uint64_t)(backing - g_memory.backing_base);
     return g_memory.backing_fd;
 }
+#if defined(_WIN32)
+// Windows: the range is one of HostMemory's alias regions, and each run of pages that follow each
+// other in the backing memory is one view of its section.
+void* nvn_direct_alias_reserve(uint64_t size) { return g_memory.alias_reserve(g_memory.context, size); }
+void nvn_direct_alias_unmap(void* at, uint64_t size) { g_memory.alias_unmap(g_memory.context, at, size); }
+void nvn_direct_alias_release(void* range) { g_memory.alias_release(g_memory.context, range); }
+uint64_t nvn_direct_alias_pages(void* to, uint64_t host, uint64_t size) {
+    const int guest = host >= g_arena && host - g_arena < g_guest_size && g_memory.backing;
+    uint64_t missing = 0;
+    g_memory.alias_unmap(g_memory.context, to, size);
+    for (uint64_t o = 0, n; o < size; o += n) {
+        const uint8_t* const backing = guest ? g_memory.backing(g_memory.context, host - g_arena + o) : NULL;
+        n = 0x1000;
+        while (backing && o + n < size && g_memory.backing(g_memory.context, host - g_arena + o + n) == backing + n) {
+            n += 0x1000;
+        }
+        if (!backing || !g_memory.alias_map(g_memory.context, (uint8_t*)to + o, (uint64_t)(backing - g_memory.backing_base), n)) {
+            missing += n;
+        }
+    }
+    return missing;
+}
+#else
 uint64_t nvn_direct_alias_pages(void* to, uint64_t host, uint64_t size) {
     const int guest = host >= g_arena && host - g_arena < g_guest_size;
     uint64_t missing = 0;
@@ -75,6 +101,12 @@ uint64_t nvn_direct_alias_pages(void* to, uint64_t host, uint64_t size) {
     }
     return missing;
 }
+#endif
+void* nvn_direct_guest_backing(uint64_t host) {
+    if (host < g_arena || host - g_arena >= g_guest_size || !g_memory.backing) return NULL;
+    return g_memory.backing(g_memory.context, host - g_arena);
+}
+
 void* nvn_direct_writable(uint64_t host) {
     const uint64_t guest = guest_addr(host);
     if (guest >= g_guest_size || !g_memory.backing) return (void*)(uintptr_t)host_addr(host);

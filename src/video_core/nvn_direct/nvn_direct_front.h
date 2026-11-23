@@ -28,15 +28,26 @@ int nvn_direct_track_pages(uint64_t address, uint64_t size, int armed);
 /// backing_fd) and the page's offset in it (*offset); -1 when there is no file or the guest has
 /// not mapped the page.
 int nvn_direct_backing_file(uint64_t address, uint64_t* offset);
+/// nvn_direct_memory's native_image: the guest range of a Switch 2 native image handle.
+int nvn_direct_native_image(uint64_t handle, uint64_t* address, uint64_t* size);
 /// Maps the guest memory at host (an arena pointer) at to, for size bytes (both page aligned),
 /// replacing what was mapped there: the same pages, read-write, as a virtual pool's range maps
 /// its physical pool's. Pages with no guest memory behind them are made inaccessible. Returns
 /// those pages' bytes.
 uint64_t nvn_direct_alias_pages(void* to, uint64_t host, uint64_t size);
+#if defined(_WIN32)
+/// A virtual pool's range for nvn_direct_alias_pages (nvn_direct_memory's alias_reserve; NULL on
+/// failure), its pages made inaccessible again, and the range given back.
+void* nvn_direct_alias_reserve(uint64_t size);
+void nvn_direct_alias_unmap(void* at, uint64_t size);
+void nvn_direct_alias_release(void* range);
+#endif
 /// Where the host writes a value into guest memory at host (an arena pointer or the game's
 /// address): its backing memory, which write tracking never protects. Anything else (a host
 /// segment): unchanged. The value must not cross a page.
 void* nvn_direct_writable(uint64_t host);
+/// Writable backing for one guest arena page, or NULL for an unmapped or non-guest address.
+void* nvn_direct_guest_backing(uint64_t host);
 /// Where the replay reads guest memory at host (an arena pointer): its backing memory, which a
 /// guest unmap never takes away, NULL when the guest has not mapped the page (the arena's page is
 /// then inaccessible). In a virtual pool's range: unchanged, NULL where nothing is mapped.

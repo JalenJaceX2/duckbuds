@@ -29,9 +29,14 @@ const char* nvn_names[NVN_NFUNC] = {
 #include "nvn_names.inc"
 };
 void* nvn_thunk[NVN_NFUNC];
-void nvn_unimpl_entry(void) { abort(); }
-void nvn_prof_entry(void) { abort(); }
-void nvn_big_entry(void) { abort(); }
+// The slot table tells implementations from these by address (nvn_dispatch.c nvn_direct_init), so
+// each has a body of its own: identical ones are folded into one address by the Windows linker
+// (/OPT:ICF), and every implementation wrapped for the big stack then read as a profiled one with
+// no implementation behind it.
+void dm_host_shutdown(const char* why);
+void nvn_unimpl_entry(void) { dm_host_shutdown("nvn_unimpl_entry ran"); }
+void nvn_prof_entry(void) { dm_host_shutdown("nvn_prof_entry ran"); }
+void nvn_big_entry(void) { dm_host_shutdown("nvn_big_entry ran"); }
 
 typedef struct module_t module_t;
 module_t* g_mod;

@@ -21,6 +21,7 @@
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/core_timing.h"
@@ -37,6 +38,7 @@
 #include "core/nvn_direct_choice.h"
 #include "core/nvn_hook.h"
 #include "core/hle/service/nx2_image_layout.h"
+#include "core/hle/service/nx2_native_image_lookup.h"
 #include "core/hle/service/nx2_present.h"
 #include "video_core/framebuffer_config.h"
 #include "dynarmic/interface/A64/a64.h"
@@ -91,7 +93,9 @@ constexpr size_t FrameHistorySize = 8;
 struct State {
     u64 program_id{}; ///< DirectProgramId()
     std::map<u64, std::string> modules; ///< by base
+    bool replay_started{};
     bool direct_ready{}; ///< nvn_direct_init ran
+    bool first_image{};
     std::atomic<u64> halted_calls{};
     std::optional<Service::Nx2PresentBookkeeping> present;
     u64 presents{};
@@ -143,6 +147,7 @@ std::unique_ptr<State> g_state;
 /// The direct renderer failed to start on the device in this process (DirectFailed).
 bool g_replay_failed{};
 bool g_not_reset{}; ///< an earlier boot's direct renderer state could not be reset (Uninstall)
+bool g_relaunched{}; ///< this process was started for a game by a relaunch (MarkRelaunched)
 RendererChoice g_choice{RendererChoice::SettingOff};
 
 State* Get() {
@@ -438,6 +443,39 @@ void* Backing(void* context, u64 address) {
     return state.process->GetMemory().GetPointerSilent(address);
 }
 
+/// nvn_direct_memory's native_image: nx2:gsv's images.
+int NativeImage(void*, u64 handle, u64* address, u64* size) {
+    auto& lookup = Service::g_nx2_native_image_lookup;
+    std::scoped_lock lock{lookup.mutex};
+    if (!lookup.range || handle > UINT32_MAX) {
+        return 0;
+    }
+    const auto range = lookup.range(static_cast<u32>(handle));
+    if (!range) {
+        return 0;
+    }
+    *address = range->first;
+    *size = range->second;
+    return 1;
+}
+
+#ifdef _WIN32
+/// nvn_direct_memory's alias calls: HostMemory's alias regions.
+void* AliasReserve(void* context, u64 size) {
+    return static_cast<State*>(context)->host_memory->ReserveAliasRegion(size);
+}
+int AliasMap(void* context, void* address, u64 backing_offset, u64 size) {
+    return static_cast<State*>(context)->host_memory->MapAlias(static_cast<u8*>(address),
+                                                               backing_offset, size);
+}
+void AliasUnmap(void* context, void* address, u64 size) {
+    static_cast<State*>(context)->host_memory->UnmapAlias(static_cast<u8*>(address), size);
+}
+void AliasRelease(void* context, void* region) {
+    static_cast<State*>(context)->host_memory->ReleaseAliasRegion(static_cast<u8*>(region));
+}
+#endif
+
 /// The guest's x0-x7 and the low halves of v0-v7.
 void ReadArguments(Dynarmic::A64::Jit& jit, std::array<u64, 8>& x, std::array<u64, 8>& v) {
     for (size_t i = 0; i < 8; ++i) {
@@ -554,9 +592,17 @@ bool DirectEntry(State& state, u64 pc, Dynarmic::A64::Jit& jit, Core::Memory::Me
                                           .unmap_view = UnmapPoolView,
                                           .track_pages = TrackPages,
                                           .backing = Backing,
+                                          .native_image = NativeImage,
                                           .context = &state,
                                           .backing_fd = state.host_memory->BackingFd(),
-                                          .backing_base = state.host_memory->BackingBasePointer()};
+                                          .backing_base = state.host_memory->BackingBasePointer(),
+#ifdef _WIN32
+                                          .alias_reserve = AliasReserve,
+                                          .alias_map = AliasMap,
+                                          .alias_unmap = AliasUnmap,
+                                          .alias_release = AliasRelease,
+#endif
+            };
             nvn_direct_init(page_table.GetImpl().fastmem_arena,
                             u64{1} << page_table.GetAddressSpaceWidth(), &views,
                             state.process->IsSwitch2(), state.sdk_major);
@@ -619,9 +665,42 @@ u64 DirectProgramId() {
 
 void StopDirect() {
 #ifdef LICHII_NVN_DIRECT
-    if (DirectMode()) {
+    if (const auto* state = Get(); state && state->replay_started) {
         nvn_direct_stop();
     }
+#endif
+}
+
+void TraceStartup(std::string_view phase) {
+#ifdef LICHII_NVN_DIRECT
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_NVN_STARTUP_TRACE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled || !DirectAsked()) {
+        return;
+    }
+    const auto memory = Common::GetProcessMemoryUsage();
+    const auto physical = Common::GetAvailablePhysicalMemory();
+    constexpr auto mib = [](u64 bytes) { return bytes >> 20; };
+    const auto commit_room = memory.system_commit_limit != 0
+                                 ? fmt::to_string(mib(memory.system_commit_limit -
+                                                      std::min(memory.system_commit,
+                                                               memory.system_commit_limit)))
+                                 : "unavailable";
+#ifdef _WIN32
+    constexpr auto process_counter = "private commit";
+#else
+    constexpr auto process_counter = "data size";
+#endif
+    LOG_INFO(Core,
+             "NVN startup memory ({}): process {} {} MiB, working set {} MiB, "
+             "system commit headroom {} MiB, available physical RAM {} MiB",
+             phase, process_counter, memory.commit ? fmt::to_string(mib(memory.commit)) : "unavailable",
+             memory.working_set ? fmt::to_string(mib(memory.working_set)) : "unavailable",
+             commit_room, physical ? fmt::to_string(mib(physical)) : "unavailable");
+#else
+    (void)phase;
 #endif
 }
 
@@ -721,17 +800,17 @@ void Install(Core::System& system, Kernel::KProcess& process) {
         .vulkan = Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan,
         .is_64bit = process.Is64Bit(),
         .has_nvn = state_owner != nullptr && !state_owner->bootstrap_entries.empty(),
+        .fastmem = process.GetPageTable().GetImpl().fastmem_arena != nullptr,
         .replay_failed = g_replay_failed,
         .not_reset = g_not_reset,
     });
-    if (built || IsFallback(g_choice)) {
-        LOG_INFO(Core, "Renderer: {} ({})",
-                 IsDirect(g_choice) ? "NVN direct renderer" : "GPU emulation",
-                 Describe(g_choice));
-    }
     if (state_owner == nullptr || !IsDirect(g_choice)) {
+        if (built || IsFallback(g_choice)) {
+            LOG_INFO(Core, "Renderer: GPU emulation ({})", Describe(g_choice));
+        }
         return;
     }
+    LOG_INFO(Core, "Renderer request: NVN direct renderer ({})", Describe(g_choice));
     State& state = *state_owner;
     InstallDirect(state);
     LOG_INFO(Core,
@@ -742,10 +821,17 @@ void Install(Core::System& system, Kernel::KProcess& process) {
     g_state = std::move(state_owner);
 }
 
+void DirectStarted() {
+    Get()->replay_started = true;
+    LOG_INFO(Core, "Renderer: NVN direct renderer ({})", Describe(g_choice));
+    TraceStartup("replay started");
+}
+
 void DirectFailed() {
     g_replay_failed = true;
     g_choice = RendererChoice::ReplayFailed;
     LOG_WARNING(Core, "Renderer: GPU emulation ({})", Describe(g_choice));
+    TraceStartup("replay refused");
     // The game has not run yet: without a state its NVN driver runs, on GPU emulation.
     g_state.reset();
 }
@@ -764,6 +850,24 @@ void Uninstall() {
 
 RendererChoice Choice() {
     return g_choice;
+}
+
+void MarkRelaunched() {
+    g_relaunched = true;
+}
+
+bool DirectNeedsFreshProcess() {
+#ifdef LICHII_NVN_DIRECT
+    return NeedsFreshProcess({
+        .direct_asked = DirectAsked(),
+        .vulkan = Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan,
+        .replay_failed = g_replay_failed,
+        .not_reset = g_not_reset,
+        .relaunched = g_relaunched,
+    });
+#else
+    return false;
+#endif
 }
 
 Dynarmic::A64::BlockEntryHook (*BlockEntryHookFunction())(u64 pc) {
@@ -810,7 +914,7 @@ void LogStubCensus(State& state, u64 present) {
 /// speed limiter, perf stats, pacing to the vblank, and as nx2:vi2's Composite the display
 /// HDR-change check.
 void PresentDirect(Core::System& system, State& state) {
-    Service::Nx2NotifyHdrChange();
+    Service::Nx2NotifyHdrChange(system.Kernel());
     if (!state.present) {
         state.present.emplace(system);
     }
@@ -824,12 +928,17 @@ void PresentDirect(Core::System& system, State& state) {
         state.latest_frame = own;
     }
     nvn_direct_frame frame{};
-    const bool shown = nvn_direct_present_take(&frame) != 0;
+    const bool acquired = nvn_direct_present_take(&frame) != 0;
     if (own <= 4 || own % 600 == 0) {
         LOG_INFO(Core, "NVN direct: present #{} ({}x{} VkFormat {}, {})", own, frame.width,
-                 frame.height, static_cast<int>(frame.format), shown ? "shown" : "nothing to show");
+                 frame.height, static_cast<int>(frame.format),
+                 acquired ? "image acquired" : "no image");
     }
-    if (shown) {
+    if (acquired) {
+        if (!std::exchange(state.first_image, true)) {
+            LOG_INFO(Core, "NVN direct: first replay image acquired at guest present #{}", own);
+            TraceStartup("first replay image");
+        }
         // The game's present waits for the previous frame's composite (as many images as the
         // window has are in flight between the replay and Lichii's presenter).
         system.GPU().WaitForComposite();

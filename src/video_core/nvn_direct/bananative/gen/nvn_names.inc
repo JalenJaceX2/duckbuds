@@ -738,3 +738,4 @@
 "nvnCommandBufferConvertCooperativeVectorMatrix",
 "nvnDeviceGetCooperativeVectorMatrixSize",
 "nvnDeviceConvertCooperativeVectorMatrix",
+"nvnMemoryPoolBuilderSetNativeHandleNVX",

@@ -775,6 +775,7 @@ uint64_t vka_frame(void);
 // The GPU's view of the same bytes: copied out of the pool's buffer in this submission, compared with what the CPU reads once it is done
 typedef struct { vka_span s; const uint8_t *mem; uint64_t serial; } gv_t;
 static void gview_report(void *arg) {
+    if (vka_stopping()) return;
     gv_t *g = arg; char a[40], b[40]; for (int j = 0; j < 16; j++) { snprintf(a + 2 * j, 3, "%02x", g->s.ptr[j]); snprintf(b + 2 * j, 3, "%02x", g->mem[j]); }
     char sd[400]; void vka_mem_describe(uint64_t, char *, size_t); vka_mem_describe((uint64_t)(uintptr_t)g->mem, sd, sizeof sd);
     char mp_[200] = ""; { FILE *f = fopen("/proc/self/maps", "re"); char ln[512]; uintptr_t ad = (uintptr_t)g->mem;
@@ -1473,6 +1474,10 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
             if (ucb) { vka_up_point(vka_up_cur(ucb)); vka_up_end(); }   // (an upload of many pieces, upload_mt, checks the batch budget only here)
             throttle = ucb != VK_NULL_HANDLE;
         }
+    } else {   // Lichii: what the texture is (fmt_of_slow logs only its format, once)
+        static uint64_t logged[4]; unsigned b = (unsigned)t->d.format & 255;
+        if (!(__atomic_fetch_or(&logged[b >> 6], 1ull << (b & 63), __ATOMIC_RELAXED) >> (b & 63) & 1))
+            VRED("texture serial %llu format %#x target %d %ux%ux%u levels %u: no image (no Vulkan format)", (unsigned long long)t->serial, t->d.format, t->d.target, t->d.width, t->d.height, t->d.depth, t->d.levels);
     }
     if (im) im->used = g_tick;
     map_put(t->serial, im);

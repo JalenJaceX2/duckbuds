@@ -668,7 +668,9 @@ static void alias_drop_buf(VkBuffer buf, VkDeviceSize lo, VkDeviceSize hi);   //
 typedef struct { VkBuffer buf; VkDeviceMemory mem; void *view; size_t n; } import_free;
 static void import_free_run(void *arg) {
     import_free *f = arg;
-    if (!vka_hung()) { vk.vkDestroyBuffer(V.dev, f->buf, NULL); vk.vkFreeMemory(V.dev, f->mem, NULL); if (f->view) nvn_direct_unmap_view(f->view, f->n); }
+    vk.vkDestroyBuffer(V.dev, f->buf, NULL);
+    vk.vkFreeMemory(V.dev, f->mem, NULL);
+    if (f->view) nvn_direct_unmap_view(f->view, f->n);
     free(f);
 }
 static void import_free_after(uint64_t fence, VkBuffer buf, VkDeviceMemory mem, void *view, size_t n) {
@@ -810,20 +812,13 @@ static void unplace(const seg_t *sp) {
         if (last) pack_free(s.pack, fence);
         return;
     }
-    if (s.import && !vka_hung() && !vka_wait_done(fence, 0)) {
+    if (s.import) {   // Lichii: an import (import_seg): nothing to copy back, the pages are the guest's; its view goes with the memory (kept, as the memory, while the GPU may use it)
         alias_drop_buf(s.buf, 0, n);
-        import_free *f = malloc(sizeof *f); *f = (import_free){s.buf, s.mem, s.view, n};
-        vka_after(fence, import_free_run, f);
+        import_free_after(fence, s.buf, s.mem, s.view, n);
         return;
     }
     int waited = vka_wait_done(fence, vka_hang_ns()) && !vka_hung();
     alias_drop_buf(s.buf, 0, n);
-    if (s.import) {   // Lichii: an import (import_seg): nothing to copy back, the pages are the guest's; its view goes with the memory (kept, as the memory, while the GPU may use it)
-        seg_free(&s, waited, fence);
-        if (waited && s.view) nvn_direct_unmap_view(s.view, n);
-        static int nlog; if (nlog++ < 4) VLOG("pool memory %#lx+%#zx: import given back (%.2f GiB imported)", (unsigned long)s.lo, n, vka_mem_placed_bytes(NULL) / 1073741824.0);
-        return;
-    }
 #if !defined(_WIN32)   // (a placed segment: never there)
     prun pr[MAXRUN]; int npr = prot_runs(s.lo, s.hi, pr, MAXRUN), exact = prot_known(pr, &npr, s.lo, s.hi);
     swap_begin(s.lo, s.hi);

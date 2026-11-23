@@ -348,12 +348,6 @@ public:
         return nvn_direct;
     }
 
-    /// NVN2 direct mode: the replay could not start on the device, which then serves GPU
-    /// emulation alone (Core::NvnHook::DirectFailed).
-    void EndNvnDirect() {
-        nvn_direct = false;
-    }
-
     /// NVN2 direct mode: the graphics family's queues made for the replay (index 0 is
     /// GetGraphicsQueue's).
     std::span<const VkQueue> GetNvnDirectQueues() const {

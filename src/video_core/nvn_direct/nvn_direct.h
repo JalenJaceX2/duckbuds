@@ -248,12 +248,25 @@ typedef struct nvn_direct_memory {
     /// The backing memory of the guest page at address (never write-protected), NULL when the
     /// guest has not mapped it.
     void* (*backing)(void* context, uint64_t address);
+    /// The guest range [*address, *address + *size) of a Switch 2 native image handle (nx2:gsv's
+    /// images, as gsv 428 answers it); 0 when the handle names no image with bound memory.
+    int (*native_image)(void* context, uint64_t handle, uint64_t* address, uint64_t* size);
     void* context;
     /// The file behind the backing memory (Lichii's memfd), -1 when there is none, and the
     /// backing view's base: the backing byte at p is the file's byte p - backing_base. Pools are
     /// imported as udmabufs of it where the driver refuses host-pointer imports of it (amdgpu).
     int backing_fd;
     const uint8_t* backing_base;
+#if defined(_WIN32)
+    /// Windows, where there is no file to map: a virtual pool's host range (HostMemory's alias
+    /// regions), inaccessible until alias_map maps backing memory [backing_offset, backing_offset
+    /// + size) into it at address (0 on failure); alias_unmap makes pages inaccessible again and
+    /// alias_release gives the range back.
+    void* (*alias_reserve)(void* context, uint64_t size);
+    int (*alias_map)(void* context, void* address, uint64_t backing_offset, uint64_t size);
+    void (*alias_unmap)(void* context, void* address, uint64_t size);
+    void (*alias_release)(void* context, void* region);
+#endif
 } nvn_direct_memory;
 
 /// Takes the front end's slot table (the names of upstream's names.txt, in its order), the
@@ -317,9 +330,7 @@ typedef struct nvn_direct_frame {
     uint64_t fence;
     /// The timeline semaphore and value the replay queue that drew the image signals on the GPU at
     /// fence (reached once nvn_direct_present_frame gives the frame), for the composite's
-    /// submission to wait on. VK_NULL_HANDLE without a fence (nothing drew it), and when
-    /// nvn_direct_present_frame shows the frame as it is (its fence not reached in time, or the
-    /// replay stopped).
+    /// submission to wait on. VK_NULL_HANDLE only without a fence (nothing drew it).
     VkSemaphore semaphore;
     uint64_t semaphore_value;
 } nvn_direct_frame;
@@ -334,9 +345,10 @@ typedef struct nvn_direct_frame {
 int nvn_direct_present_take(nvn_direct_frame* frame);
 
 /// On Lichii's GPU thread, once per composite: the frame taken with id (the newest one held if it
-/// was let go already), once the GPU finished drawing it (waits, bounded). 0: no frame was ever
-/// taken. From the present until then, and from a frame given here until
-/// nvn_direct_present_composited, the game's acquires of its image wait.
+/// was let go already), once the GPU finished drawing it (waits, bounded). 0: no usable frame (none
+/// taken, its fence not reached in time, or the replay stopped). From the present until then, and
+/// from a frame given here until nvn_direct_present_composited, the game's acquires of its image
+/// wait.
 int nvn_direct_present_frame(uint64_t id, nvn_direct_frame* frame);
 
 /// On Lichii's GPU thread, after nvn_direct_present_frame gave frame id: the composite that
