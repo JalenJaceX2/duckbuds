@@ -218,6 +218,9 @@ static int init_once(void) {
     VLOG("driver: %s (%s), driver ID %d, conformance %u.%u.%u.%u, driver version %#x; %s", pdr.driverName, pdr.driverInfo, pdr.driverID, pdr.conformanceVersion.major,
          pdr.conformanceVersion.minor, pdr.conformanceVersion.subminor, pdr.conformanceVersion.patch, V.props.driverVersion, vka_driver_tag() ? "custom (DM_VK_DRIVER)" : "the system's");
     V.driver_id = (int)pdr.driverID;
+    V.tb_ualign = (uint32_t)p13.uniformTexelBufferOffsetAlignmentBytes; V.tb_salign = (uint32_t)p13.storageTexelBufferOffsetAlignmentBytes;   // (Lichii)
+    V.tb_usingle = p13.uniformTexelBufferOffsetSingleTexelAlignment; V.tb_ssingle = p13.storageTexelBufferOffsetSingleTexelAlignment;
+    if (!V.tb_ualign || !V.tb_salign) V.tb_ualign = V.tb_salign = (uint32_t)V.props.limits.minTexelBufferOffsetAlignment, V.tb_usingle = V.tb_ssingle = 0;
     { const char *e = getenv("DM_VK_GPL"); int want = !(e && !strcmp(e, "0"));   // restart only: the libraries are made with the device's pipelines
       V.gpl = want && x_gpl && fgpl.graphicsPipelineLibrary && pgpl.graphicsPipelineLibraryFastLinking;
       VLOG("graphics pipeline libraries: %s", V.gpl ? "on (a pipeline the cache lacks is linked from stage libraries, the optimized one is made in the background; DM_VK_GPL=0 off)"

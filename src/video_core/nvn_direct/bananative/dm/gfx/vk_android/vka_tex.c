@@ -2391,10 +2391,10 @@ int vka_tex_id_format(int id) {
     pthread_mutex_unlock(&g_tmu);
     return f;
 }
-// Lichii: texture ID id as a texel buffer (vka_draw.c tbuf_view): a buffer texture's storage address (*addr) and bytes (*bytes: its width in texels, at most the device's
+// Lichii: texture ID id as a texel buffer (vka_draw.c tbuf_view): a buffer texture's storage address (*addr), texel size (*texel) and bytes (*bytes: its width in texels, at most the device's
 // texel buffer elements), and the Vulkan format of its NVN format (its view's) when the device makes texel buffers of it (storage: storage texel buffers, else uniform
 // ones); VK_FORMAT_UNDEFINED otherwise (not registered, not a buffer texture, its pool finalized, no such format)
-VkFormat vka_tex_id_buffer(int id, int storage, uint64_t *addr, uint64_t *bytes) {
+VkFormat vka_tex_id_buffer(int id, int storage, uint64_t *addr, uint64_t *bytes, uint32_t *texel) {
     pthread_mutex_lock(&g_tmu);
     treg_ent e = id > 0 && id < g_ntreg && g_treg[id].t.serial ? g_treg[id] : (treg_ent){0};
     pthread_mutex_unlock(&g_tmu);
@@ -2410,7 +2410,7 @@ VkFormat vka_tex_id_buffer(int id, int storage, uint64_t *addr, uint64_t *bytes)
     }
     if (f == VK_FORMAT_UNDEFINED || bpb <= 0 || !(bf & (storage ? VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT : VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT))) return VK_FORMAT_UNDEFINED;
     uint64_t texels = e.t.d.width < V.props.limits.maxTexelBufferElements ? e.t.d.width : V.props.limits.maxTexelBufferElements;
-    *addr = (uint64_t)(uintptr_t)e.t.mem; *bytes = texels * (uint64_t)bpb;
+    *addr = (uint64_t)(uintptr_t)e.t.mem; *bytes = texels * (uint64_t)bpb; *texel = (uint32_t)bpb;
     return f;
 }
 int vka_tex_id_storage_pending(int id) {

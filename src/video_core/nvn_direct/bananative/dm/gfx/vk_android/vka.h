@@ -108,6 +108,9 @@ typedef struct {
     // The driver (VkPhysicalDeviceDriverProperties.driverID: VK_DRIVER_ID_QUALCOMM_PROPRIETARY, VK_DRIVER_ID_MESA_TURNIP, ...). A per-driver default keys on this and on
     // feature queries, never on the driver's name; each such default keeps its DM_VK_* switch (android/README.md "Custom GPU drivers")
     int driver_id;
+    // Lichii: texel buffer view offsets (Vulkan 1.3's uniform / storage TexelBufferOffsetAlignmentBytes and SingleTexelAlignment: an offset of a whole texel is enough
+    // where single), as GPU emulation's buffer cache aligns them (Device::GetTexelBufferOffsetAlignment)
+    uint32_t tb_ualign, tb_salign; int tb_usingle, tb_ssingle;
     VkDeviceSize ub_align, sb_align, ub_range, sb_range;
     VkDeviceSize placed_align, max_alloc;
     uint32_t guest_type, local_type, upload_type;   // guest RAM (DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT|HOST_CACHED, or the nearest), images, upload arenas
@@ -382,7 +385,7 @@ int vka_tex_id_pending(int id);                     // texture ID id is register
 VkImageView vka_tex_id_view_rec(int id, VkCommandBuffer cb, uint8_t dim, int storage, VkImageLayout *layout, int *scaled);   // the same on the recording thread, through a memo (DM_VK_TEX_MEMO); *scaled: its image is (vka_img.scaled)
 int vka_tex_id_pending_rec(int id, uint8_t dim);
 int vka_tex_id_storage_pending(int id);            // texture ID id's image exists without storage use and would be remade with it at its next storage binding (a draw ends its pass first)
-VkFormat vka_tex_id_buffer(int id, int storage, uint64_t *addr, uint64_t *bytes);   // Lichii: texture ID id's storage as a texel buffer and its Vulkan format (VK_FORMAT_UNDEFINED = none)
+VkFormat vka_tex_id_buffer(int id, int storage, uint64_t *addr, uint64_t *bytes, uint32_t *texel);   // Lichii: texture ID id's storage as a texel buffer and its Vulkan format (VK_FORMAT_UNDEFINED = none)
 void vka_tbuf_retire(uint64_t fence);               // Lichii: the texel buffer views made since the last call belong to fence (vka_draw.c tbuf_view)
 VkSampler vka_samp_id_rec(int id);
 VkSampler vka_samp_id(int id);                      // sampler ID id; VK_NULL_HANDLE = not registered

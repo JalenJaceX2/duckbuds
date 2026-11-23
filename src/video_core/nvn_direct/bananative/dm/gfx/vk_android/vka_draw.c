@@ -846,15 +846,20 @@ void vka_tbuf_retire(uint64_t fence) {
 // Texture ID r->tid as the texel buffer binding r: VK_NULL_HANDLE (unbound, reported once) when it is not a buffer texture Vulkan can view where it lies
 static VkBufferView tbuf_view(const vka_shader *sh, const vka_res *r) {
     int storage = r->desc == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
-    uint64_t addr = 0, bytes = 0; VkBuffer b; VkDeviceSize o;
-    VkFormat f = vka_tex_id_buffer(r->tid, storage, &addr, &bytes);
+    uint64_t addr = 0, bytes = 0; uint32_t texel = 1; VkBuffer b; VkDeviceSize o;
+    VkFormat f = vka_tex_id_buffer(r->tid, storage, &addr, &bytes, &texel);
     uint64_t run = f != VK_FORMAT_UNDEFINED && bytes ? vka_addr_run(addr, bytes, &b, &o) : 0;   // (bytes: whole texels)
+    // The view's offset: a whole texel where the device takes single-texel alignment (a three-component format's texel being one component), else its alignment in bytes,
+    // as GPU emulation binds texel buffers. A game's buffer textures sit at any texel of its pools
+    const uint32_t unit = texel % 3 ? texel : texel / 3, bytes_align = storage ? V.tb_salign : V.tb_ualign;
+    const uint64_t align = (storage ? V.tb_ssingle : V.tb_usingle) && unit < bytes_align ? unit : bytes_align;
     const char *why = f == VK_FORMAT_UNDEFINED ? "not a buffer texture in a format the device views" : !run ? "its storage is not in placed guest RAM"
                     : run < bytes ? "its storage lies across two placed segments (one view holds one buffer)"
-                    : o % V.props.limits.minTexelBufferOffsetAlignment ? "its storage is not at an offset the device views" : NULL;
+                    : o % align ? "its storage is not at an offset the device views" : NULL;
     if (why) {
         static _Atomic int n; if (atomic_fetch_add(&n, 1) < 8) { char d[320]; vka_tex_id_desc(r->tid, d, sizeof d);
-            VRED("shader %016llx binding %u: texture ID %d as a texel buffer: %s, it reads as unbound (%s)", (unsigned long long)sh->key, r->binding, r->tid, why, d); }
+            VRED("shader %016llx binding %u: texture ID %d as a texel buffer: %s, it reads as unbound (%s; offset %#llx, alignment %llu)", (unsigned long long)sh->key, r->binding, r->tid, why, d,
+                 (unsigned long long)o, (unsigned long long)align); }
         return VK_NULL_HANDLE;
     }
     if (storage && (r->flags & DMSH_VK_BF_RW)) vka_tex_gw_opaque(addr, run);   // the shader may store into it
