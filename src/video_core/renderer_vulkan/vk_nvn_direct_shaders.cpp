@@ -532,6 +532,9 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
     if (stage == Shader::Stage::Fragment) {
         runtime_info.per_primitive_generics = source.per_primitive_inputs;
     }
+    if (stage == Shader::Stage::Geometry) {
+        runtime_info.input_topology = static_cast<Shader::InputTopology>(source.input_topology);
+    }
     if (stage == Shader::Stage::VertexB || stage == Shader::Stage::TessellationEval ||
         stage == Shader::Stage::Geometry || stage == Shader::Stage::Mesh) {
         runtime_info.convert_depth_mode = source.convert_depth != 0;

@@ -59,6 +59,7 @@ typedef struct nvn_direct_shader_source {
     uint8_t vertex_input_types[32]; ///< vertex: generic input types, 0 float, 1 signed, 2 unsigned
     int convert_depth;         ///< pre-rasterization stages: z from -w..w to 0..w (the GL depth mode)
     uint32_t per_primitive_inputs; ///< fragment after a mesh program: the generic inputs it writes per primitive
+    uint32_t input_topology;   ///< geometry: Shader::InputTopology of the draw's primitives
     void* context;
     uint32_t (*read_cbuf)(void* context, uint32_t bank, uint32_t offset);
     /// 1 = the size bytes at guest address were read into out

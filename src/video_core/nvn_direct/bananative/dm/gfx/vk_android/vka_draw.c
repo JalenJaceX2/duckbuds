@@ -1308,7 +1308,7 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
                VRED_ONCE("indirect-count multi-draws read their count on the CPU at replay"); }
     d->b.base_instance = mesh ? 0 : (uint32_t)(dw ? dw->base_instance : di->base_instance);   // (a 3D mesh draw's z: hle_nvn.c)
     vka_shader *sh[VKA_NSTAGE] = {0}; unsigned bad = 0;
-    vka_rc_draw(d);   // Lichii: the state shaders recompiled at this draw read (nvn_recompile.c)
+    vka_rc_draw(d, mesh ? -1 : dw ? dw->prim : di->prim);   // Lichii: the state shaders recompiled at this draw read (nvn_recompile.c)
     PT(0);
     // An NVN2 mesh draw (nvnCommandBufferDrawMeshTasks and its indirect, 3D and multi-draw forms, hle_nvn.c): the task (optional) and mesh shaders of one program, the
     // fragment stage's shader, in a mesh pipeline (vka_pso.c pstate_fill) drawn with vkCmdDrawMeshTasks*EXT: no vertex input, primitive type or index buffer
@@ -1622,7 +1622,7 @@ void vka_dispatch(vka_dstate *d, const p_dispatch *dp) {
     vka_rp_end();
     vka_shader *sh[VKA_NSTAGE] = {0}; unsigned bad = 0;
     d->b.dispatch[0] = (uint32_t)dp->x; d->b.dispatch[1] = (uint32_t)dp->y; d->b.dispatch[2] = (uint32_t)dp->z; d->b.nvn2 = (uint32_t)vka_nvn2();
-    vka_rc_draw(d);   // Lichii: the state shaders recompiled at this dispatch read (nvn_recompile.c)
+    vka_rc_draw(d, -1);   // Lichii: the state shaders recompiled at this dispatch read (nvn_recompile.c)
     if (!resolve(d->cprog, 5, &sh[5], &bad)) SKIP("dispatch skipped: a program without shaders");
     if (bad) { g_skipped++, vka_skip_line[__LINE__ & 2047]++; return; }
     if (!sh[5]) SKIP("dispatch with no compute shader bound: skipped");

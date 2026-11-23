@@ -291,7 +291,7 @@ void mtl_prog_release(prog_t *p) {
 }
 void mtl_prog_prefetch(const prog_t *p) { vka_rc_keep(p); }   // modules are made at the program's first draw (vka_prog_shaders); Lichii: the recompiler's copies of the control sections
 
-int vka_progsh_current(const vka_progsh *ps) { return !ps->depth || ps->depth == 1 + !vka_depth_zero(); }
+int vka_progsh_current(const vka_progsh *ps) { return (!ps->depth || ps->depth == 1 + !vka_depth_zero()) && (!ps->gs_in || ps->gs_in == vka_rc_gs_input()); }
 int vka_prog_shaders(const prog_t *p, vka_progsh *out) {
     memset(out, 0, sizeof *out);
     if (!p || !p->serial) return 0;
@@ -310,6 +310,7 @@ int vka_prog_shaders(const prog_t *p, vka_progsh *out) {
             vka_shader *sh = vka_rc_shader(p, i, key, st == 1 ? prim : 0, gl_depth, &st);
             if (st < 0 || st >= VKA_NSTAGE) { out->bad |= VKA_BAD_MISSING; missing_key(key, i); continue; }
             if (st == 7) prim = vka_rc_prim(key);
+            if (st == 2) out->gs_in = (uint8_t)vka_rc_gs_input();
             out->sh[st] = sh;
             if (!sh) out->bad |= 1u << st;
         }

@@ -409,8 +409,9 @@ typedef struct vka_shader {
 } vka_shader;
 // by NVN stage; bad: stages whose shader is refused (bit = NVN stage) or VKA_BAD_MISSING (their draws are skipped). Lichii: depth, recompiled shaders' depth mode
 // (1 + gl_depth: the pre-rasterization stages are translated for one, vka_rc_shader; 0: any)
-typedef struct { vka_shader *sh[VKA_NSTAGE]; unsigned bad; uint8_t depth; } vka_progsh;
-int vka_progsh_current(const vka_progsh *ps);   // 1 = ps's shaders fit the depth mode now
+// Lichii: gs_in, a geometry shader's input primitive (vka_rc_gs_input; 0: no geometry shader)
+typedef struct { vka_shader *sh[VKA_NSTAGE]; unsigned bad; uint8_t depth, gs_in; } vka_progsh;
+int vka_progsh_current(const vka_progsh *ps);   // 1 = ps's shaders fit the depth mode and the draw's primitive now
 #define VKA_BAD_MISSING (1u << VKA_NSTAGE)   // vka_progsh.bad: a stage's shader is not in the library (its NVN stage unknown)
 int vka_prog_shaders(const prog_t *p, vka_progsh *out);      // 1 = resolved (stages the program lacks are NULL); 0 = no program
 void vka_prog_put(uint64_t serial, const vka_progsh *ps);   // a program made by the host itself (the selftest), by serial
@@ -429,7 +430,8 @@ VkShaderModule vka_shader_vin_module(vka_shader *s, uint32_t umask, uint32_t sma
 // stage, -1 without a kept control section); a shader by key; a recompiled compute shader's c[0]
 void vka_rc_keep(const prog_t *p);
 typedef struct vka_dstate vka_dstate;
-void vka_rc_draw(const vka_dstate *d);
+void vka_rc_draw(const vka_dstate *d, int prim);   // (Lichii: prim, the draw's NVN primitive; -1 a dispatch)
+uint32_t vka_rc_gs_input(void);                     // Lichii: 1 + the Shader::InputTopology a geometry shader is translated for at this draw
 vka_shader *vka_rc_shader(const prog_t *p, unsigned i, uint64_t key, uint32_t prim_inputs, int gl_depth, int *st);
 int vka_rc_stage(uint64_t key);         // NVN stage of a kept control section, -1 none
 uint32_t vka_rc_prim(uint64_t key);     // a recompiled mesh shader's generic outputs per primitive

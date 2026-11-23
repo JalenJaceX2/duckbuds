@@ -147,7 +147,20 @@ static void guard_poll(void) {
 
 // The draw or dispatch whose shaders are resolved now (vka_draw.c): the state translation reads
 static const vka_dstate* g_draw;
-void vka_rc_draw(const vka_dstate* d) { g_draw = d; guard_poll(); }
+static int g_prim = -1;   // Lichii: its NVN primitive (-1: a dispatch)
+void vka_rc_draw(const vka_dstate* d, int prim) { g_draw = d; g_prim = prim; guard_poll(); }
+// Lichii: a geometry shader's input primitive for the draw now, 1 + Shader::InputTopology: the hardware hands a geometry shader the draw's primitives, which
+// no part of the program names, so the shader is translated for the draw's class of primitive (as GPU emulation's pipeline cache does). Without it every
+// geometry shader read points: Unreal's colour grading LUT (Orbitals: 32 slices drawn by a geometry shader from triangles) stayed black, and so did its scene
+uint32_t vka_rc_gs_input(void) {
+    switch (g_prim) {
+    case NVN_DRAW_PRIMITIVE_POINTS: return 1 + 0;
+    case NVN_DRAW_PRIMITIVE_LINES: case NVN_DRAW_PRIMITIVE_LINE_LOOP: case NVN_DRAW_PRIMITIVE_LINE_STRIP: return 1 + 1;
+    case NVN_DRAW_PRIMITIVE_LINES_ADJACENCY: case NVN_DRAW_PRIMITIVE_LINE_STRIP_ADJACENCY: return 1 + 2;
+    case NVN_DRAW_PRIMITIVE_TRIANGLES_ADJACENCY: case NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP_ADJACENCY: return 1 + 4;
+    default: return 1 + 3;   // triangles, strips, fans, quads, polygons, patches
+    }
+}
 
 // ---------- NVN2 compute's c[0] ----------
 typedef struct { unsigned ub, sb, hb, ib, size, push; } cs_layout;
@@ -369,6 +382,7 @@ typedef struct { vka_shader* sh; int st; uint32_t prim; } rc_shader;   // prim: 
 static int rc_depth_stage(int st) { return st == 0 || st == 2 || st == 4 || st == 7; }
 // The slot of a translation: its shader key, with a pixel shader's per-primitive inputs and a depth stage's depth mode. GL's (NVN's default, Mario Kart World's)
 // keeps the key's own slot, which every translation had before the mode was part of it: those kept from earlier runs are placed by their record's gl_depth (disk_open)
+// (Lichii: for a geometry shader, prim_inputs is its input primitive instead: vka_rc_gs_input)
 static uint64_t rc_translation_slot(uint64_t key, uint32_t prim_inputs, int st, int gl_depth) {
     uint64_t slot = prim_inputs ? key ^ ((uint64_t)prim_inputs << 32 | 0x9e1u) : key;
     return rc_key(rc_depth_stage(st) && !gl_depth ? slot ^ 0xd3b7a1e5c4f20961ull : slot);
@@ -388,7 +402,8 @@ static int rc_translate(const prog_t* p, unsigned i, const rc_control* control, 
     rc_ctx* x = calloc(1, sizeof *x); if (!x) { snprintf(why, whyn, "out of memory"); return 0; }
     x->d = d; x->st = st; x->control = control; x->code = (const uint8_t*)(uintptr_t)nvn_direct_host_of(data); x->ncode = ncode;
     nvn_direct_shader_source src = {.nvn_stage = (uint32_t)st, .control = control->bytes, .code = x->code, .code_size = ncode, .code_address = nvn_direct_guest_of(data),
-                                    .first_binding = rc_first_binding(rc_vks(st)), .convert_depth = gl_depth, .per_primitive_inputs = st == 1 ? prim_inputs : 0, .context = x,
+                                    .first_binding = rc_first_binding(rc_vks(st)), .convert_depth = gl_depth, .per_primitive_inputs = st == 1 ? prim_inputs : 0,
+                                    .input_topology = st == 2 && prim_inputs ? prim_inputs - 1 : 0, .context = x,
                                     .read_cbuf = rc_cbuf, .read_memory = rc_read, .texture_info = rc_texture};
     if (st == 0 && d)   // vertex inputs typed as the draw's attributes (the integer formats' classes): vka_draw.c then binds them retyping none
         for (int loc = 0; loc < 16 && loc < d->nattr; loc++) {
@@ -622,6 +637,7 @@ vka_shader* vka_rc_shader(const prog_t* p, unsigned i, uint64_t key, uint32_t pr
     *st = -1;
     const rc_control* control = rc_control_of(key);
     if (!control) return NULL;
+    if (control->stage == 2) prim_inputs = vka_rc_gs_input();   // (Lichii)
     uint64_t slot = rc_translation_slot(key, prim_inputs, (int)control->stage, gl_depth);
     rc_shader* r = rc_lookup(slot);
     if (!r) {
