@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <string>
@@ -53,7 +54,9 @@ constexpr u32 MaxSlots = 4096;
 /// What the game gets for nvnDeviceGetProcAddress (not exported: games get it from
 /// nvnBootstrapLoader): a lookup like nvnBootstrapLoader's.
 constexpr u32 LookupSlot = 0;
-constexpr u32 FirstNameSlot = 1;
+/// Where a guest call the hook makes after an NVN call returns (CallGuest).
+constexpr u32 GuestCallReturnSlot = 1;
+constexpr u32 FirstNameSlot = 2;
 
 struct Slot {
     /// The front end's slot (-1: no implementation, the stub answers 0) and whether the call
@@ -494,6 +497,35 @@ void GetLatestFrameNumber(State& state, Core::Memory::Memory& memory, u64 out) {
     memory.Write64(out, latest);
 }
 
+/// Runs the guest call an NVN call owes the game (nvn_direct_guest_call_take) as the call returns:
+/// the JIT goes on at the guest function, on the calling guest thread, with the call's x0 and the
+/// return address (lr) its caller expects pushed on the guest's stack, and returns to
+/// GuestCallReturnSlot, which pops them and returns to the caller as the NVN call would have. The
+/// guest function may make NVN calls and block like any guest code. The caller sees the call's
+/// x0 but not its v0: the calls that owe one (command recording) return no float.
+void CallGuest(State& state, Dynarmic::A64::Jit& jit, Core::Memory::Memory& memory,
+               const nvn_direct_guest_call& call, u64 result, u64 lr) {
+    const u64 sp = jit.GetSP() - 16;
+    memory.Write64(sp, result);
+    memory.Write64(sp + 8, lr);
+    jit.SetSP(sp);
+    for (size_t i = 0; i < std::size(call.x); ++i) {
+        jit.SetRegister(i, call.x[i]);
+    }
+    jit.SetRegister(30, SyntheticAddress(state, GuestCallReturnSlot));
+    jit.SetRegister(16, call.function);
+}
+
+/// GuestCallReturnSlot: the guest function CallGuest ran returned.
+void ReturnFromGuestCall(Dynarmic::A64::Jit& jit, Core::Memory::Memory& memory) {
+    const u64 sp = jit.GetSP();
+    const u64 lr = memory.Read64(sp + 8);
+    jit.SetRegister(0, memory.Read64(sp));
+    jit.SetSP(sp + 16);
+    jit.SetRegister(30, lr);
+    jit.SetRegister(16, lr);
+}
+
 /// Direct mode's block entries. Returns whether the JIT halts for the call (HaltedCallSvc).
 bool DirectEntry(State& state, u64 pc, Dynarmic::A64::Jit& jit, Core::Memory::Memory& memory) {
     const u64 lr = jit.GetRegister(30);
@@ -536,6 +568,10 @@ bool DirectEntry(State& state, u64 pc, Dynarmic::A64::Jit& jit, Core::Memory::Me
         jit.SetRegister(16, lr);
         return false;
     }
+    if (slot == GuestCallReturnSlot) {
+        ReturnFromGuestCall(jit, memory);
+        return false;
+    }
     const Slot& target = state.slots[slot];
     jit.SetRegister(16, lr);
     if (target.front < 0 || !nvn_direct_implemented(target.front)) {
@@ -558,9 +594,13 @@ bool DirectEntry(State& state, u64 pc, Dynarmic::A64::Jit& jit, Core::Memory::Me
     std::array<u64, 8> x, v;
     ReadArguments(jit, x, v);
     u64 v0 = 0;
-    jit.SetRegister(0, nvn_direct_call(target.front, x.data(), v.data(), jit.GetSP(), lr, &v0));
+    const u64 result = nvn_direct_call(target.front, x.data(), v.data(), jit.GetSP(), lr, &v0);
+    jit.SetRegister(0, result);
     if (nvn_direct_float_args(target.front)) {
         jit.SetVector(0, {v0, 0});
+    }
+    if (nvn_direct_guest_call call; nvn_direct_guest_call_take(&call)) {
+        CallGuest(state, jit, memory, call, result, lr);
     }
     return false;
 }

@@ -1015,7 +1015,7 @@ static void cmd_new_segment(cmd_t *o, uint8_t *mem, size_t n) {
     uint8_t *start = align8(mem), *end = mem + n;
     if (o->recording == 1 && o->cur) { if (cs_on() && o->end > o->cur) { pthread_mutex_lock(&g_cs_mu); g_cs.waste += (uint64_t)(o->end - o->cur); pthread_mutex_unlock(&g_cs_mu); } put_hdr(o->cur, OP_JUMP, 16); memcpy(o->cur + 8, &start, 8);
         o->used += 16; }   // the JUMP also occupies guest memory of this recording: count it in used, so the game packing the next recording right behind by used does not overwrite it
-    o->cur = start; o->end = end;
+    o->cur = start; o->end = end; o->seg = start;
 }
 // Host-supplied segment when the game's own command memory runs out: when the game's out-of-memory callback cannot allocate from its command memory pool, it calls AddCommandMemory with an empty pool (p = NULL, n = 0)
 // (opening the advanced stats page on the level 88 sorceress save: many list items in one frame, and the original implementation segfaulted here reading NULL+8). Our records are larger than real-device NVN commands, so the budget the game reserved for real-device usage is not necessarily enough,
@@ -1051,7 +1051,13 @@ static uint8_t *hostseg_take(const cmd_t *o, size_t n) {
     pthread_mutex_lock(&g_hostseg_mu);
     int in_seg = 0;   // by the segment's end too: a small segment can end where another one starts
     for (int i = 0; i < g_nhostseg && cur; i++) if (cur >= (uintptr_t)g_hostseg[i].mem && o->end == g_hostseg[i].mem + g_hostseg[i].n) { lo = g_hostseg[i].org_lo; hi = g_hostseg[i].org_hi; in_seg = 1; break; }
-    if (!in_seg && o && o->recording && o->cur) { lo = o->recording == 1 && o->begin && (uintptr_t)o->begin <= cur ? (uintptr_t)o->begin : cur; hi = cur + 16; }
+    // (Lichii: the recording's bytes in this guest segment only: from its first record when that is in it, else from the segment's start, where it went on from a
+    // segment before it. A recording that began in a lent segment had its begin there, a host address: the range from it to cur took in every guest address below,
+    // and the next AddCommandMemory reclaimed the segment while its handle was live: Orbitals' replay then walked a reused segment and crashed)
+    if (!in_seg && o && o->recording && o->cur) {
+        const uintptr_t seg = o->seg && (uintptr_t)o->seg <= cur ? (uintptr_t)o->seg : cur;
+        lo = o->recording == 1 && o->begin && (uintptr_t)o->begin >= seg && (uintptr_t)o->begin <= cur ? (uintptr_t)o->begin : seg; hi = cur + 16;
+    }
     for (int i = 0; i < g_nhostseg && !m; i++)
         if (!g_hostseg[i].busy && g_hostseg[i].n == n) { g_hostseg[i] = (hostseg_t){ g_hostseg[i].mem, n, f, 1, lo, hi }; m = g_hostseg[i].mem; }
     if (!m && g_hostseg_bytes + n <= HOSTSEG_CAP && (m = malloc(n))) {
@@ -1070,6 +1076,14 @@ static void hostseg_release(uintptr_t lo, uintptr_t hi) {
     for (int i = 0; i < g_nhostseg; i++) if (g_hostseg[i].busy && g_hostseg[i].org_hi > lo && g_hostseg[i].org_lo < hi) g_hostseg[i].busy = 0;
     pthread_mutex_unlock(&g_hostseg_mu);
 }
+// Lichii: the recording in progress goes on in [lo, hi) of the game's memory, which its out-of-memory callback just added (nvn_direct_guest_call_owe): a segment it was lent before
+// any of its records were in the game's memory (the callback runs after the call that needed it) knew no guest range, so it is reclaimed with this one
+static void hostseg_adopt(const cmd_t *o, uintptr_t lo, uintptr_t hi) {
+    pthread_mutex_lock(&g_hostseg_mu);
+    for (int i = 0; i < g_nhostseg && o->cur; i++)
+        if (o->cur >= g_hostseg[i].mem && o->end == g_hostseg[i].mem + g_hostseg[i].n) { if (!g_hostseg[i].org_lo && !g_hostseg[i].org_hi) { g_hostseg[i].org_lo = lo; g_hostseg[i].org_hi = hi; } break; }
+    pthread_mutex_unlock(&g_hostseg_mu);
+}
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
     const pool_t *pl = (const pool_t *)p;
     if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } size_t sz = hostseg_size(CB(c), !pl, n); cmd_new_segment(CB(c), hostseg_take(CB(c), sz), sz); return; }
@@ -1084,6 +1098,8 @@ NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemory
     // there; the shadow spreads the game's addresses (x4) because these records outgrow the NVN2 driver's commands (BindTexture: 24 bytes against 16-20) and the game
     // places each recording right behind the driver's last one
     nvn_direct_host_written((const uint8_t *)NVN_CMDMEM_ADDR(pl->mem + off), n);   // Lichii: the records are written in place: never write-tracked (nvn_tracking.c)
+    // (the first record header only: the recording may end at once with an 8-byte END there, and the game may pack the next recording right behind it)
+    if (CB(c)->recording == 1) hostseg_adopt(CB(c), (uintptr_t)align8(NVN_CMDMEM_ADDR(pl->mem + off)), (uintptr_t)align8(NVN_CMDMEM_ADDR(pl->mem + off)) + sizeof(op_hdr));
     cmd_new_segment(CB(c), NVN_CMDMEM_ADDR(pl->mem + off), n);
     CB(c)->used = 0;   // GetCommandMemoryUsed counts from the start of the memory the game last added, across recordings (see there)
 }
@@ -1098,7 +1114,12 @@ static uint8_t *cmd_alloc_keep(cmd_t *o, uint32_t size, uint32_t keep) {
         // The game's callback cannot supply enough (newer-SDK games hand out small chunks sized for real-device commands, or disable the callback and manage memory themselves): continue recording in a host segment instead of aborting
         if (1) {   // Lichii: the game's callback is guest code, which a host call made from the JIT cannot run: a host-lent segment every time (upstream: !o->cb || tries == 2)
             static int once; if (!once++) LOG("[nvn] command memory: the game's callback did not add enough (cb=%p, need %u bytes), using a host-lent segment", (void *)o->cb, size + keep);
-            size_t sz = hostseg_size(o, 0, size + keep); cmd_new_segment(o, hostseg_take(o, sz), sz); break;
+            size_t sz = hostseg_size(o, 0, size + keep); cmd_new_segment(o, hostseg_take(o, sz), sz);
+            // Lichii: the callback runs once this call returns, and the memory it adds takes the next records. A game that adds command memory only from it (Orbitals) otherwise never
+            // gave memory out again, so no lent segment was ever reclaimed (hostseg_release) and they reached HOSTSEG_CAP within half a minute
+            if (o->cb) nvn_direct_guest_call_owe((uint64_t)(uintptr_t)o->cb, nvn_direct_guest_of((uint64_t)(uintptr_t)o), NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, size + keep,
+                                                 nvn_direct_guest_of((uint64_t)(uintptr_t)o->cb_data));
+            break;
         }
         if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.cbs++; pthread_mutex_unlock(&g_cs_mu); }
         { static int cblog = -1; if (cblog < 0) cblog = getenv("DM_NVN_CBLOG") != NULL; static uint64_t ncb;

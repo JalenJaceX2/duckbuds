@@ -45,6 +45,10 @@ const void* nvn_direct_readable(uint64_t host);
 /// The front end writes [mem, mem + size) of a pool in place from now on (command memory): its
 /// pages are never write-tracked (a host write to a tracked page would fault outside the JIT).
 void nvn_direct_host_written(const void* mem, size_t size);
+/// The NVN call this thread runs owes the game a call of its guest function with x0-x3, which the
+/// console's driver would have made inside the call (a callback the game gave it): the hook runs
+/// it once the call returns (nvn_direct_guest_call_take). At most one per call: the first stays.
+void nvn_direct_guest_call_owe(uint64_t function, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3);
 /// The presenting queue's last fence, for the present this thread makes next (nvn_window.c).
 extern _Thread_local uint64_t nvn_direct_present_queue_fence;
 /// The ticket of the present this thread just made (nvn_window.c: mtl_present) and its window's

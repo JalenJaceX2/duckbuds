@@ -238,6 +238,18 @@ int nvn_direct_call_blocks(int slot, const uint64_t x[8]) {
         return mtl_tex_gpu_owned(((const tex_t*)host_ptr(x[0]))->serial) && !mtl_wait_acq(mtl_last_fence(), 0);
     return 0;
 }
+static _Thread_local struct { int owed; nvn_direct_guest_call call; } g_guest_call;
+void nvn_direct_guest_call_owe(uint64_t function, uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3) {
+    if (g_guest_call.owed) return;
+    g_guest_call.owed = 1;
+    g_guest_call.call = (nvn_direct_guest_call){function, {x0, x1, x2, x3}};
+}
+int nvn_direct_guest_call_take(nvn_direct_guest_call* call) {
+    if (!g_guest_call.owed) return 0;
+    g_guest_call.owed = 0;
+    *call = g_guest_call.call;
+    return 1;
+}
 uint64_t nvn_direct_call(int slot, const uint64_t x[8], const uint64_t v[8], uint64_t sp, uint64_t lr, uint64_t* v0) {
     nvn_direct_guest_lr = lr;
     return g_slot[slot].d->d(g_slot[slot].fn, x, v, (const uint64_t*)host_ptr(sp), v0);

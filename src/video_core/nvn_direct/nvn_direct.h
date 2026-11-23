@@ -289,6 +289,19 @@ int nvn_direct_float_args(int slot);
 uint64_t nvn_direct_call(int slot, const uint64_t x[8], const uint64_t v[8], uint64_t sp, uint64_t lr,
                          uint64_t* v0);
 
+/// A guest function the game gave NVN that the calling thread's last NVN call would have called on
+/// the console (the command memory callback), with its x0-x3. A host call made from the JIT cannot
+/// run guest code, so the hook runs it on the same guest thread once the call returns, before the
+/// call's caller goes on.
+typedef struct nvn_direct_guest_call {
+    uint64_t function;
+    uint64_t x[4];
+} nvn_direct_guest_call;
+
+/// 1 and *call when the calling thread's last NVN call owes the game one (it is owed no longer),
+/// else 0.
+int nvn_direct_guest_call_take(nvn_direct_guest_call* call);
+
 /// A presented image as Lichii's presenter shows it. The image stays in
 /// VK_IMAGE_LAYOUT_GENERAL; it is drawn on the replay's queues and finished at fence.
 typedef struct nvn_direct_frame {

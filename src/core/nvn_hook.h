@@ -15,7 +15,9 @@
 // lacks get a stub that answers 0. Calls that may block halt the JIT and run from the kernel
 // (RunHaltedCall). Every 600 presents a line counts the halted calls and the stubs called.
 // nn::vi::ListFrameHistory and GetLatestFrameNumber, which read what the replaced driver's
-// presents would have recorded, are answered the same way, from the direct presents.
+// presents would have recorded, are answered the same way, from the direct presents. A guest
+// function a call would have called on the console (the game's command memory callback) runs once
+// the call returns, on the same guest thread (CallGuest).
 
 #pragma once
 
