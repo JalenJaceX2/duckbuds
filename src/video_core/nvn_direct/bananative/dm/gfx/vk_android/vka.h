@@ -103,6 +103,7 @@ typedef struct {
     int mesh, task; uint32_t mesh_inv, task_inv, mesh_out_v, mesh_out_p, task_payload, task_groups[3], mesh_groups[3];
     int gpl;                                        // graphics pipeline libraries with fast linking (VK_EXT_graphics_pipeline_library): a pipeline the cache lacks is linked from stage libraries at once, the optimized one made in the background (vka_pso.c)
     int cache_ctl;                                  // pipelineCreationCacheControl, enabled on Lichii's device (nvn_direct_device.pipeline_creation_cache_control): a pipeline may be asked for with FAIL_ON_PIPELINE_COMPILE_REQUIRED (vka_pso.c cache_probe)
+    int sampler_minmax;                             // samplerFilterMinmax (Vulkan 1.2) enabled on Lichii's device, which creates it with the whole of the supported VkPhysicalDeviceVulkan12Features chain (vulkan_device.cpp: features_1_2 -> features2 -> vkCreateDevice), unless it dropped VK_EXT_sampler_filter_minmax (AMD GCN4): samplers may reduce with min / max (vka_tex.c sampler_of)
     uint32_t max_push, max_vin_bindings, subgroup_size, subgroup_min, subgroup_max, subgroup_stages;   // subgroup_stages: VkShaderStageFlags with subgroup operations
     uint32_t subgroup_req_stages;                   // VkShaderStageFlags a pipeline may pin the subgroup size in (requiredSubgroupSizeStages; 0 without subgroupSizeControl)
     // The driver (VkPhysicalDeviceDriverProperties.driverID: VK_DRIVER_ID_QUALCOMM_PROPRIETARY, VK_DRIVER_ID_MESA_TURNIP, ...). A per-driver default keys on this and on

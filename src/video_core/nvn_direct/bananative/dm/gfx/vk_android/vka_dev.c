@@ -149,6 +149,7 @@ static int init_once(void) {
     V.multi_vp = f2.features.multiViewport; V.a2c = 1; V.mesh = x_mesh && fmesh.meshShader; V.task = V.mesh && fmesh.taskShader;
     if (!f12.timelineSemaphore || !f13.dynamicRendering) { VRED("the device lacks timeline semaphores (%d) or dynamic rendering (%d)", f12.timelineSemaphore, f13.dynamicRendering); return 0; }
     V.bda = f12.bufferDeviceAddress; V.uab = f12.descriptorBindingSampledImageUpdateAfterBind && f12.descriptorBindingPartiallyBound && f12.runtimeDescriptorArray;
+    V.sampler_minmax = f12.samplerFilterMinmax && vka_dev_ext(VK_EXT_SAMPLER_FILTER_MINMAX_EXTENSION_NAME);   // (Lichii's device enables every Vulkan 1.2 feature the device has; it removes the extension from its list where the driver's min / max is broken)
     V.placed = placed && fmp.memoryMapPlaced; V.placed_range = placed && fmp.memoryMapRangePlaced; V.unmap_reserve = placed && fmp.memoryUnmapReserve;
     float prio = 1.f;
     // One Vulkan queue per NVN queue. Lichii: every queue of the family Lichii made, up to NVN_DIRECT_MAX_QUEUES (Ocarina of Time keeps six NVN queues)
