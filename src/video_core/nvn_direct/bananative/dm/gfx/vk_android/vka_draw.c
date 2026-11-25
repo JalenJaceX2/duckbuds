@@ -709,7 +709,7 @@ static int rd_cb(void *ctx, uint64_t addr, void *out, size_t n) { (void)ctx; ret
 //     their submission is done): marked per 64 KiB of the buffer the GPU addresses (vka_addr_run: a virtual pool's range and its physical pool are the same bytes there)
 //     with the writer's fence. A range under a write not yet done reads guest RAM (the upload batch could run before the write); once it is done, the range is copied again;
 //   - a range refreshed or under GPU writes again and again (4 times, each within 3 frames of the last) reads guest RAM for 300 frames, unprotected;
-//   - budget: one device-local arena (DM_VK_VB_CACHE_MB, default 1024, at most a quarter of the free device budget), first fit; when it is full, the copies bound least
+//   - budget: one device-local arena (DM_VK_VB_CACHE_MB, default 3072, at most a quarter of the free device budget), first fit; when it is full, the copies bound least
 //     recently are dropped (their places reused once their submissions are done);
 //   - ranges of more than 64 MiB (VC_MAXR: a bound size is the whole pool behind the mesh, not what the draw reads; DM_VK_VB_BIG=1, vc_prefix, caches only the first bytes the draw
 //     reads: the key is that prefix, so everything below is the ordinary range above), not in one placed segment, or in a virtual pool not backed by one run of physical pages read guest RAM.
@@ -732,6 +732,7 @@ typedef struct {
     uint32_t last, rframe, cool;           // frame last bound, frame of the last refresh, end of a cooldown
     uint8_t live, kind, why, churn, mok;   // kind: 1 tracked directly, 2 through a virtual pool, 0 untracked (why); mok, why: the memo's answer
     uint64_t hash;                         // of the first 256 bytes as the CPU saw them at the copy (vc_watch)
+    uint64_t sha, shs; uint32_t shi;       // DM_VK_VB_SHARE: the key of the containing copy this range is served from, and its table index + 1 (0: none; this entry then holds no copy)
 } vc_ent;
 static vc_ent *g_vc; static VkBuffer g_vc_buf; static VkDeviceMemory g_vc_mem; static VkDeviceSize g_vc_size, g_vc_used; static int g_vc_failed;
 static uint64_t g_vc_ep = 1, g_vc_gwgen = 1;
@@ -753,7 +754,7 @@ static uint64_t g_vc_sub = 1;   // submissions committed (vka_vc_gpu_commit): th
 static int vc_init(void) {
     if (g_vc_buf || g_vc_failed) return g_vc_buf != VK_NULL_HANDLE;
     g_vc_failed = 1;
-    VkDeviceSize want = (VkDeviceSize)VKA_ENV("DM_VK_VB_CACHE_MB", 1024) << 20; uint64_t use, bud;
+    VkDeviceSize want = (VkDeviceSize)VKA_ENV("DM_VK_VB_CACHE_MB", 3072) << 20; uint64_t use, bud;
     if (vka_mem_budget(&use, &bud) && bud > use && want > (bud - use) / 4) want = (bud - use) / 4 & ~(VkDeviceSize)0xFFFFF;
     if (want < (16u << 20)) { VRED("VRAM vertex cache: %llu MiB is too small: vertex streams read guest RAM", (unsigned long long)(want >> 20)); return 0; }
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = want, .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -949,7 +950,35 @@ static int vc_dyn_ok(uint32_t f, uint64_t bytes) {
     if (used + bytes > ((uint64_t)VKA_ENV("DM_VK_VB_DYN_MB", 8) << 20)) return 0;
     used += bytes; g_vc_dyn++; g_vc_dyn_bytes += bytes; return 1;
 }
+// DM_VK_VB_SHARE (live, default 0): a range not copied yet (or copied on its own) is served from a copy that contains it. The copies are indexed by the 4 MiB blocks they cover
+// (8 ways a block, the largest kept; entries are checked when read, so a stale way costs nothing). Only the first bind of a range in a submission looks (a hit is kept as a link).
+// The shared copy is a range like any other, so it is checked for CPU writes and GPU writes over all its bytes and refreshed or put in cooldown as a whole; if it refuses, the range
+// falls back to its own copy. The offset into it is a multiple of 16 (the vertex alignment the guest's own address had).
+enum { VC_X = 4096, VC_XW = 8, VC_XS = 22 };
+static uint32_t g_vcx[VC_X][VC_XW]; static uint64_t g_vc_shared;   // streams served by a shared copy
+static void vc_ix_add(const vc_ent *e) {
+    uint32_t idx = (uint32_t)(e - g_vc) + 1;
+    for (uint64_t k = e->addr >> VC_XS, k1 = (e->addr + e->size - 1) >> VC_XS; k <= k1; k++) {
+        uint32_t *w = g_vcx[k & (VC_X - 1)]; int vi = 0; uint64_t vs = ~0ull;
+        for (int i = 0; i < VC_XW; i++) {
+            if (w[i] == idx) { vi = -1; break; }
+            const vc_ent *x = w[i] ? &g_vc[w[i] - 1] : NULL; uint64_t s = x && x->live && x->off != VC_NONE ? x->size : 0;
+            if (s < vs) { vs = s; vi = i; }
+        }
+        if (vi >= 0 && vs <= e->size) w[vi] = idx;
+    }
+}
+static vc_ent *vc_find(const vc_ent *e, uint32_t f) {   // the smallest copy that contains e's range and is in use (not in cooldown)
+    const uint32_t *w = g_vcx[(e->addr >> VC_XS) & (VC_X - 1)]; vc_ent *best = NULL;
+    for (int i = 0; i < VC_XW; i++) if (w[i]) {
+        vc_ent *c = &g_vc[w[i] - 1];
+        if (c != e && c->live && c->off != VC_NONE && c->kind && (int32_t)(c->cool - f) <= 0 && c->addr <= e->addr && e->addr + e->size <= c->addr + c->size
+            && !((e->addr - c->addr) & 15) && (!best || c->size < best->size)) best = c;
+    }
+    return best;
+}
 // The copy of [addr, addr + size) for this draw: 1 = *b / *o are it, 0 = read guest RAM
+static int vc_serve(vc_ent *e, uint32_t f, VkBuffer *b, VkDeviceSize *o, int quiet);
 static int vc_bind(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
     #define VC_NO(w) do { g_vc_miss++; g_vc_why[w]++; return 0; } while (0)
     static int was_on;
@@ -973,6 +1002,22 @@ static int vc_bind(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
         e = old; memset(e, 0, sizeof *e); e->live = 1; e->addr = addr; e->size = size; e->off = VC_NONE; e->rframe = f - 100; e->cool = f;
         vc_resolve(e); g_vc_trk[e->kind]++;
     }
+    #undef VC_NO
+    e->last = f;
+    if (VKA_ENV("DM_VK_VB_SHARE", 0)) {   // served by a copy that contains the range (found at the first bind in a submission, kept while it holds)
+        vc_ent *c = e->shi ? &g_vc[e->shi - 1] : NULL;
+        if (c && !(c->live && c->off != VC_NONE && c->addr == e->sha && c->size == e->shs)) c = NULL;
+        if (!c && !(e->msub == g_vc_sub && e->mgw == g_vc_gwgen && e->mep == g_vc_ep)) c = vc_find(e, f);
+        if (c && vc_serve(c, f, b, o, 1)) {   // (the container is validated like any range: its CPU writes, GPU writes, churn and last bind all cover these bytes)
+            e->shi = (uint32_t)(c - g_vc) + 1; e->sha = c->addr; e->shs = c->size; vc_drop(e);
+            *o += e->addr - c->addr; g_vc_shared++; return 1; }
+        e->shi = 0;
+    }
+    return vc_serve(e, f, b, o, 0);
+}
+// e's copy validated and made (quiet: a refusal is not counted: the caller reads another way)
+static int vc_serve(vc_ent *e, uint32_t f, VkBuffer *b, VkDeviceSize *o, int quiet) {
+    #define VC_NO(w) do { if (!quiet) { g_vc_miss++; g_vc_why[w]++; } return 0; } while (0)
     e->last = f;
     if (e->msub == g_vc_sub && e->mgw == g_vc_gwgen && e->mep == g_vc_ep) {   // validated in this submission, nothing changed since
         if (!e->mok) VC_NO(e->why);
@@ -994,7 +1039,7 @@ static int vc_bind(uint64_t addr, uint64_t size, VkBuffer *b, VkDeviceSize *o) {
         const int fresh = e->off == VC_NONE;
         if (!fresh && !vc_dyn_ok(f, full ? e->size : hi - lo) && vc_churn(e, f)) { e->why = VW_CHURN; VC_NO(VW_CHURN); }
         int why; if (!vc_copy(e, full, lo, hi, f, &why)) { e->msub = 0; e->why = (uint8_t)why; VC_NO(why); }   // (not memoized: the next bind tries again)
-        if (fresh) g_vc_new++; else if (gw == 1) g_vc_rgpu++; else if (full) g_vc_rep++; else g_vc_rcpu++;
+        if (fresh) { g_vc_new++; if (VKA_ENV("DM_VK_VB_SHARE", 0)) vc_ix_add(e); } else if (gw == 1) g_vc_rgpu++; else if (full) g_vc_rep++; else g_vc_rcpu++;
     }
     #undef VC_NO
     e->gwchk = g_vc_gwgen; e->mok = 1;
@@ -1015,8 +1060,8 @@ void vka_vc_stats(char *b, size_t n, double frames) {
                                      (g_vc_bytes_v - y0[1]) / frames / 1048576.0, (g_vc_evict - ev0) / frames, (faults - fl0) / frames, g_vc_used / 1048576.0, g_vc_size / 1048576.0, g_nvlate,
                                      (unsigned long long)g_vc_trk[1], (unsigned long long)g_vc_trk[2], (unsigned long long)g_vc_trk[0], (unsigned long long)g_vc_wn,
                                      (unsigned long long)g_vc_wseen, (unsigned long long)g_vc_wbad);
-    { static uint64_t d0, db0, g0, im0; if (k < n) snprintf(b + k, n - k, "; DM_VK_VB_DYN %.2f refreshes a frame (%.3f MiB), DM_VK_VB_BIG %.1f streams of ranges over 64 MiB from VRAM (%.1f index scans saved by the memo)", (g_vc_dyn - d0) / frames, (g_vc_dyn_bytes - db0) / frames / 1048576.0, (g_vc_big - g0) / frames, (g_vc_imemo - im0) / frames);
-      d0 = g_vc_dyn; db0 = g_vc_dyn_bytes; g0 = g_vc_big; im0 = g_vc_imemo; }
+    { static uint64_t d0, db0, g0, im0, sh0; if (k < n) snprintf(b + k, n - k, "; DM_VK_VB_DYN %.2f refreshes a frame (%.3f MiB), DM_VK_VB_BIG %.1f streams of ranges over 64 MiB from VRAM (%.1f index scans saved by the memo); DM_VK_VB_SHARE %.1f streams from a shared (containing) copy", (g_vc_dyn - d0) / frames, (g_vc_dyn_bytes - db0) / frames / 1048576.0, (g_vc_big - g0) / frames, (g_vc_imemo - im0) / frames, (g_vc_shared - sh0) / frames);
+      d0 = g_vc_dyn; db0 = g_vc_dyn_bytes; g0 = g_vc_big; im0 = g_vc_imemo; sh0 = g_vc_shared; }
     h0 = g_vc_hit; m0 = g_vc_miss; memcpy(w0, g_vc_why, sizeof w0); memcpy(c0, c, sizeof c0); y0[0] = g_vc_bytes_g; y0[1] = g_vc_bytes_v; ev0 = g_vc_evict; fl0 = faults;
 }
 // A uniform buffer: bound in place when Vulkan's offset alignment allows, else a copy of what the CPU sees now (a GPU write earlier in this submission is missed: logged)
@@ -1889,6 +1934,17 @@ void vka_draw(vka_dstate *d, const p_set_rt *rt, int has_rt, const p_scissor *sc
     if (!mesh) vin_build(d, sh[0], &k);
     PT(4);
     VkPipeline p = vka_gfx_pipeline(sh, &lay, &k, !R.again);
+    if (!mesh && topo == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST && VKA_ENV("DM_VK_PATCHLOG", 0)) {   // Lichii: each new tessellated draw setup once (the lobby particle bug)
+        static uint64_t seen[1024]; static int ns;
+        uint64_t h = 1469598103934665603ull; for (int st = 0; st < 5; st++) h = (h ^ (sh[st] ? sh[st]->key : 0)) * 1099511628211ull;
+        h = (h ^ (uint64_t)d->patch << 8 ^ (uint64_t)(p != VK_NULL_HANDLE) << 16 ^ (uint64_t)d->poly.cull << 20) * 1099511628211ull;
+        int i = 0; while (i < ns && seen[i] != h) i++;
+        if (i == ns && ns < 1024) { seen[ns++] = h;
+            VLOG("patch draw: frame %llu vs %016llx tcs %016llx tes %016llx fs %016llx patch %d levels outer %g %g %g %g inner %g %g, %s count %d instances %d, cull %d discard %d, %u vertex bindings, pipeline %s",
+                 (unsigned long long)vka_frame(), sh[0] ? (unsigned long long)sh[0]->key : 0ull, sh[3] ? (unsigned long long)sh[3]->key : 0ull, sh[4] ? (unsigned long long)sh[4]->key : 0ull,
+                 sh[1] ? (unsigned long long)sh[1]->key : 0ull, d->patch, d->tess_outer[0], d->tess_outer[1], d->tess_outer[2], d->tess_outer[3], d->tess_inner[0], d->tess_inner[1],
+                 di ? "indexed" : "arrays", di ? di->count : dw->count, di ? di->instances : dw->instances, (int)d->poly.cull, (int)d->rast_discard, (unsigned)VI.nb, p ? "ready" : "not ready (draw skipped)"); }
+    }
     if (!p) { g_skipped++, vka_skip_line[__LINE__ & 2047]++; return; }
     if (!DY.valid || !g_dyn_filter || DY.pipe != p) { vk.vkCmdBindPipeline(g_cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); DY.pipe = p; VB.vin_stale = 1; }
     if (vka_nan_on()) vka_nan_draw(mesh ? sh[7]->key : sh[0]->key, fs ? fs->key : 0);
