@@ -523,8 +523,26 @@ NVN(nvnTextureBuilderGetStorageSize, size_t, const NVNtextureBuilder *b) {
     log_layout((const tex_builder_t *)b, &L);
     return L.size;
 }
+// The NVN2 driver's storage class (nnSdk+0x5ed260 in The Duskbloods' SDK): 0x100 | the page kind the GPU maps the storage with, 0x100 alone for the generic kind.
+// Only COMPRESSIBLE non-linear, non-buffer storage gets a kind of its own; the values below are the driver's answers (gdbbc12_normal: every colour format 0x108,
+// depth by format). The Duskbloods keeps a GPU heap per class (main+0x41567d4) and puts a texture of the generic class 0x100 on its shared heap; with 0 for
+// everything, the render targets and depth buffers filled that heap during the bot match's map load and the views made after it failed (error 9 at main+0x4920e24)
+static int storage_class(const nvn_texdesc *d) {
+    if (d->target == NVN_TEXTURE_TARGET_BUFFER || (d->flags & 0x50) || !(d->flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE)) return 0x100;
+    switch (d->format) {
+    case NVN_FORMAT_DEPTH16: return 0x10b;
+    case NVN_FORMAT_DEPTH32F: return 0x109;
+    case NVN_FORMAT_DEPTH24_STENCIL8: return 0x10c;
+    case NVN_FORMAT_DEPTH32F_STENCIL8: return 0x10d;
+    case NVN_FORMAT_STENCIL8: case NVN_FORMAT_DEPTH24: return 0x100;   // shortcut: not seen from the driver, generic until a game shows its class
+    }
+    int bw = 1; nvn_fmt_bpb(d->format, &bw, NULL);
+    return bw == 1 ? 0x108 : 0x100;                                        // block-compressed formats are not compressible storage
+}
 NVN(nvnTextureBuilderGetStorageAlignment, size_t, const NVNtextureBuilder *b) {
-    nvn_texlayout L; nvn_tex_layout(&((const tex_builder_t *)b)->d, &L); return L.align;
+    nvn_texlayout L; nvn_tex_layout(&((const tex_builder_t *)b)->d, &L);
+    // the driver aligns storage of a compressible kind to 4 KiB (gdbbc12_normal: all 1523 such allocations 0x1000, the rest 0x200)
+    return storage_class(&((const tex_builder_t *)b)->d) != 0x100 && L.align < 0x1000 ? 0x1000 : L.align;
 }
 // The tiled levels of a sparse texture and its tile size (nvn_tex_sparse_tiles). OCTOPATH TRAVELER (Unreal Engine 4 on SDK 3.5.1) sizes a sparse texture's mip tail as storage(all
 // levels) − storage(numTiledLevels levels) and allocates it from its heap at boot (main+0x1f1a688); unimplemented, the count was stack garbage and it asked for the whole 1.75 GB texture twice
@@ -660,6 +678,8 @@ int nvn_flushed(const void *p, uint64_t n) {   // whether the CPU flushed any of
     pthread_mutex_unlock(&g_fl_mu);
     return r;
 }
+// DM_NVN_MEMLOG=<MiB> logs texture and buffer init/finalize at or above that size, 20000 lines in all (one counter for all sites)
+static int memlog_on(uint64_t size) { static int mb = -1; static uint64_t n; if (mb < 0) { const char *e = getenv("DM_NVN_MEMLOG"); mb = e ? atoi(e) : 0; } if (mb <= 0 || size < (uint64_t)mb * 1048576u || n >= 20000) return 0; n++; return 1; }
 NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b) {
     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
     // Re-initializing a texture object that is still live (without a Finalize first): release the host texture of the old serial first. SMBW re-initializes its transient render targets on the same object every frame and never Finalizes them;
@@ -674,12 +694,14 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     if (o->mem) pc_use(o->pool, 't', o->off, o->L.size);
     if (o->mem && o->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) mtl_pool_need(o->mem, o->L.size, "a linear texture");   // its GPU content is copied back into the storage (vka_tex_writeback)
     {   // DM_NVN_TEXINFO=WxH also logs every texture of that size as it is initialized (render targets included): which ones share storage, and how their descriptions differ
-        static int ti = -1; static uint32_t tw, th;
-        if (ti < 0) { const char *e = getenv("DM_NVN_TEXINFO"); ti = e && sscanf(e, "%ux%u", &tw, &th) == 2; }
-        if (ti && o->d.width == tw && o->d.height == th) { static uint64_t n; if (n++ < 200) LOG("[nvn] TEXINFO init ser=%llu mem=%p pool=%p(mem %p size %#llx flags %#x) off=%#llx target=%d format=%#x flags=%#x samples=%d %ux%ux%u levels=%u stride=%u size=%#llx",
+        static int ti = -1, rt; static uint32_t tw, th;   // DM_NVN_TEXINFO=WxHr: single-level textures only (render targets), up to 4000 lines
+        if (ti < 0) { const char *e = getenv("DM_NVN_TEXINFO"); ti = e && sscanf(e, "%ux%u", &tw, &th) == 2; rt = ti && strchr(e, 'r'); }
+        if (ti && o->d.width == tw && o->d.height == th && (!rt || o->d.levels <= 1)) { static uint64_t n; if (n++ < (rt ? 4000u : 200u)) LOG("[nvn] TEXINFO init ser=%llu mem=%p pool=%p(mem %p size %#llx flags %#x) off=%#llx target=%d format=%#x flags=%#x samples=%d %ux%ux%u levels=%u stride=%u size=%#llx",
             (unsigned long long)o->serial, (void *)o->mem, (void *)o->pool, o->pool ? (void *)o->pool->mem : NULL, o->pool ? (unsigned long long)o->pool->size : 0ull, o->pool ? o->pool->flags : 0,
             (unsigned long long)o->off, o->d.target, o->d.format, o->d.flags, o->d.samples, o->d.width, o->d.height, o->d.depth, o->d.levels, o->d.stride, (unsigned long long)o->L.size); }
     }
+    if (memlog_on(o->L.size)) LOG("[nvn] MEMLOG tex init ser=%llu pool=%p pool_size=%#llx off=%#llx size=%#llx %ux%ux%u levels=%u format=%#x flags=%#x",
+        (unsigned long long)o->serial, (void *)o->pool, o->pool ? (unsigned long long)o->pool->size : 0ull, (unsigned long long)o->off, (unsigned long long)o->L.size, o->d.width, o->d.height, o->d.depth, o->d.levels, o->d.format, o->d.flags);
     // See SetPackagedTextureData. Linear textures are not re-uploaded as packaged: they are created on the pool buffer (tex_linear), whatever the pool's CPU access, and read what was copied in
     if (s->pkg_data && o->mem) {
         memcpy(o->mem, s->pkg_data, o->L.size);
@@ -690,7 +712,7 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     ft_add(o);
     return 1;
 }
-NVN(nvnTextureFinalize, void, NVNtexture *t) { ft_del(TX(t)->serial); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
+NVN(nvnTextureFinalize, void, NVNtexture *t) { if (memlog_on(TX(t)->L.size)) LOG("[nvn] MEMLOG tex fini ser=%llu off=%#llx size=%#llx", (unsigned long long)TX(t)->serial, (unsigned long long)TX(t)->off, (unsigned long long)TX(t)->L.size); ft_del(TX(t)->serial); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
 NVN(nvnTextureGetFlags, NVNtextureFlags, const NVNtexture *t) { return (NVNtextureFlags)CTX(t)->d.flags; }
 NVN(nvnTextureGetWidth, int, const NVNtexture *t) { return (int)CTX(t)->d.width; }
 NVN(nvnTextureGetHeight, int, const NVNtexture *t) { return (int)CTX(t)->d.height; }
@@ -1013,7 +1035,9 @@ uint64_t dm_nvn_frame_count(void);
 static int cs_on(void) { if (g_cs.on < 0) g_cs.on = getenv("DM_NVN_CMDSTAT") != NULL; return g_cs.on; }
 static void cs_op(uint32_t op, uint32_t size) { if (!cs_on() || op >= 64) return; pthread_mutex_lock(&g_cs_mu); g_cs.op_n[op]++; g_cs.op_b[op] += size; pthread_mutex_unlock(&g_cs_mu); }
 static void cs_dump(void) {   // Called once per frame (at present)
-    if (!cs_on()) return; uint64_t f = dm_nvn_frame_count(); if (f - g_cs.frame0 < 300) return;
+    if (!cs_on()) return; uint64_t f = dm_nvn_frame_count();
+    static int every = -1; if (every < 0) { const char *e = getenv("DM_VK_STATS_EVERY"); every = e && atoi(e) > 0 ? atoi(e) : 300; }   // as for the replay stats (vka_exec.c)
+    if (f - g_cs.frame0 < (uint64_t)every) return;
     pthread_mutex_lock(&g_cs_mu); double n = (double)(f - g_cs.frame0); char top[700]; int k = 0; uint8_t used[64] = {0};
     for (int r = 0; r < 8; r++) { int bi = -1; for (int i = 0; i < 64; i++) if (!used[i] && g_cs.op_b[i] && (bi < 0 || g_cs.op_b[i] > g_cs.op_b[bi])) bi = i; if (bi < 0) break; used[bi] = 1;
         k += snprintf(top + k, sizeof top - k, " op %d: %.0f × %.0f bytes = %.1f KB;", bi, g_cs.op_n[bi] / n, (double)g_cs.op_b[bi] / (double)g_cs.op_n[bi], g_cs.op_b[bi] / n / 1024.0); }
@@ -1595,9 +1619,10 @@ NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buf, const NVNbufferBuilder *b) 
     *(buf_t *)buf = (buf_t){.magic = MAGIC('B', 'U', 'F', 0), .pool = bb->pool, .off = bb->off, .size = bb->size};
     pc_use(bb->pool, 'b', bb->off, bb->size); mtl_pool_need(bb->pool->mem + bb->off, bb->size, "a buffer");   // the GPU reaches a buffer by its address
     OLOG("BufferInitialize %p pool=%p off=%#llx size=%#llx", (void *)buf, (const void *)bb->pool, (unsigned long long)bb->off, (unsigned long long)bb->size);
+    if (memlog_on(bb->size)) LOG("[nvn] MEMLOG buf init pool=%p off=%#llx size=%#llx", (const void *)bb->pool, (unsigned long long)bb->off, (unsigned long long)bb->size);
     return 1;
 }
-NVN(nvnBufferFinalize, void, NVNbuffer *buf) { ((buf_t *)buf)->magic = 0; }
+NVN(nvnBufferFinalize, void, NVNbuffer *buf) { buf_t *b = (buf_t *)buf; if (memlog_on(b->size)) LOG("[nvn] MEMLOG buf fini pool=%p off=%#llx size=%#llx", (const void *)b->pool, (unsigned long long)b->off, (unsigned long long)b->size); b->magic = 0; }
 NVN(nvnBufferSetDebugLabel, void, NVNbuffer *buf, const char *s) { (void)buf; (void)s; }
 NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { mtl_pool_need(BF(buf)->pool->mem + BF(buf)->off, BF(buf)->size, "a buffer's address"); return (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off); }
 // A buffer or pool the CPU has no access to (NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) maps to NULL, as in NVN, though the host's storage is CPU memory: EA SPORTS FC 27's Frostbite
@@ -1819,13 +1844,17 @@ NVN(nvnTextureBuilderSetSwizzle, void, NVNtextureBuilder *b, NVNtextureSwizzle r
 // on the depth buffer's storage, built in stencil mode (DRAGON QUEST VII Reimagined's character occlusion mask, edbfc7a088be545e, tests stencil bits 0x1 and 0x84 of two of them; read as depth, the
 // bits followed the depth values and the hero was drawn as a dithered silhouette inside a dithered square)
 NVN(nvnTextureBuilderSetDepthStencilMode, void, NVNtextureBuilder *b, NVNtextureDepthStencilMode m) { TB(b)->stencil = m == NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL; }
-NVN(nvnTextureBuilderGetStorageClass, NVNstorageClass, const NVNtextureBuilder *b) { (void)b; return 0; }
-// Used by Bowser's Fury: the texture's channel swizzle (set by TextureBuilderSetSwizzle at build time, identity R G B A when unset) and storage class (the host has none, 0 as for the builder)
+NVN(nvnTextureBuilderGetStorageClass, NVNstorageClass, const NVNtextureBuilder *b) {
+    int c = storage_class(&((const tex_builder_t *)b)->d);
+    static int n; if (n < 64) { n++; LOG("[nvn] TextureBuilderGetStorageClass format %#x flags %#x target %d -> %#x", TB(b)->d.format, TB(b)->d.flags, TB(b)->d.target, c); }
+    return (NVNstorageClass)c;
+}
+// Used by Bowser's Fury: the texture's channel swizzle (set by TextureBuilderSetSwizzle at build time, identity R G B A when unset) and storage class (storage_class, as for the builder)
 NVN(nvnTextureGetSwizzle, void, const NVNtexture *t, NVNtextureSwizzle *r, NVNtextureSwizzle *g, NVNtextureSwizzle *b, NVNtextureSwizzle *a) {
     unsigned w = tex_swz(CTX(t));
     if (r) *r = (NVNtextureSwizzle)(w & 7); if (g) *g = (NVNtextureSwizzle)(w >> 3 & 7); if (b) *b = (NVNtextureSwizzle)(w >> 6 & 7); if (a) *a = (NVNtextureSwizzle)(w >> 9 & 7);
 }
-NVN(nvnTextureGetStorageClass, NVNstorageClass, const NVNtexture *t) { (void)t; return 0; }
+NVN(nvnTextureGetStorageClass, NVNstorageClass, const NVNtexture *t) { return (NVNstorageClass)storage_class(&CTX(t)->d); }   // as for its builder
 NVN(nvnTextureBuilderGetZCullStorageSize, size_t, const NVNtextureBuilder *b) { return zcull_size(&TB(b)->d); }   // as for the texture (zcull_size)
 // Packaged texture data in CPU memory (not written into the pool by the game): NVN copies it into the texture storage at TextureInitialize (the CPU cannot write a compressible pool; the driver copies). 13 Sentinels creates all its textures this way
 NVN(nvnTextureBuilderSetPackagedTextureData, void, NVNtextureBuilder *b, const void *data) { TB(b)->pkg_data = data; }

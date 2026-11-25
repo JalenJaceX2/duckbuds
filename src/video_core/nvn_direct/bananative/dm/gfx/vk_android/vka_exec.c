@@ -88,7 +88,8 @@ void mtl_set_frame(uint64_t f) {
     { if (atomic_load_explicit(&vka_synclog_n, memory_order_relaxed) > 0) VLOG("sync frame %llu begins at %.2f ms", (unsigned long long)f, (now_ns() % 1000000000000ull) / 1e6); }
     static uint64_t f0, d0, rp0, b0, ub0, s0, r0, o0, pc0, ch0;
     int on = VKA_ENV("DM_VK_STATS", 1) != 0;
-    if (on && f - f0 >= 300) {
+    int every = VKA_ENV("DM_VK_STATS_EVERY", 300); if (every < 1) every = 300;   // frames between stat lines (fewer when a game runs slowly)
+    if (on && f - f0 >= (uint64_t)every) {
         double n = (double)(f - f0);
         if (f0) VLOG("replay up to frame %llu: per frame %.0f draws, %.0f render passes, %.0f clears / copies (%.0f in a pass), %.0f full barriers, %.0f inline uniform updates, %.1f submissions (%.1f parts); recording %.2f ms a frame (%.2f us a draw)",
                      (unsigned long long)f, (g_stat_draws - d0) / n, (vka_n_rp - rp0) / n, (g_stat_ops - o0) / n, (g_n_pclear - pc0) / n, (vka_n_bar - b0) / n, (g_n_ub - ub0) / n, (g_n_sub - s0) / n, (g_n_sub - s0 + g_n_chunks - ch0) / n, (g_rec_ns - r0) / n / 1e6,

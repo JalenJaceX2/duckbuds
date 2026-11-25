@@ -4584,6 +4584,22 @@ std::optional<DAddr> TextureCache<P>::ImageCpuAddress(GPUVAddr gpu_addr, size_t 
 template <class P>
 ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
                                      RelaxedOptions options) {
+    static const int texlog_mib = [] {
+        const char* env = std::getenv("NX2_TEXLOG");
+        return env ? std::atoi(env) : 0;
+    }();
+    static std::atomic<int> texlog_count{0};
+    if (texlog_mib > 0 &&
+        CalculateGuestSizeInBytes(info) >= static_cast<u64>(texlog_mib) * 1048576ULL &&
+        texlog_count.fetch_add(1) < 20000) {
+        LOG_INFO(HW_GPU,
+                 "TEXLOG insert gpu={:#x} size={:#x} {}x{}x{} levels={} layers={} block={},{},{} "
+                 "fmt={} type={} layer_stride={:#x}",
+                 gpu_addr, CalculateGuestSizeInBytes(info), info.size.width, info.size.height,
+                 info.size.depth, info.resources.levels, info.resources.layers, info.block.width,
+                 info.block.height, info.block.depth, static_cast<int>(info.format),
+                 static_cast<int>(info.type), info.layer_stride);
+    }
     const StutterTrace::SiteScope site{StutterTrace::Site::ImageCreate};
     std::optional<DAddr> cpu_addr = ImageCpuAddress(gpu_addr, CalculateGuestSizeInBytes(info));
     if (!cpu_addr) {

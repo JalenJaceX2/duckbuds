@@ -808,11 +808,16 @@ static VkDeviceSize vc_take(VkDeviceSize len) {
 static VkDeviceSize vc_alloc(VkDeviceSize len, uint32_t f) {
     VkDeviceSize off = vc_take(len); if (off != VC_NONE) return off;
     vc_reclaim(); if ((off = vc_take(len)) != VC_NONE) return off;
+    // Lichii: a sweep that found no room is not run again in the same frame (binds only make entries younger): with the arena full of copies bound in the last 2 frames,
+    // each failed bind swept the 64K table 5 times (~0.4 ms; ~1000 binds a frame in the match: 1 fps)
+    static uint32_t full_f = ~0u;
+    if (full_f == f) return VC_NONE;
     static const uint32_t ages[] = {600, 120, 30, 8, 2};
     for (size_t a = 0; a < sizeof ages / sizeof *ages; a++) {
         for (uint32_t i = 0; i < VC_N; i++) { vc_ent *e = &g_vc[i]; if (e->live && e->off != VC_NONE && f - e->last > ages[a]) { vc_drop(e); g_vc_evict++; } }
         vc_reclaim(); if ((off = vc_take(len)) != VC_NONE) return off;
     }
+    full_f = f;
     return VC_NONE;
 }
 

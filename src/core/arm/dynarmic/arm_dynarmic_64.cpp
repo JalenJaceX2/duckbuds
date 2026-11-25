@@ -327,6 +327,7 @@ bool DynarmicCallbacks64::CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWat
         return true;
     }
 
+    addr &= 0x00ff'ffff'ffff'ffffULL; // the game uses tagged pointers (top byte ignored on hardware)
     if (!m_memory.IsValidVirtualAddressRange(addr, size)) {
         LOG_CRITICAL(Core_ARM, "Stopping execution due to unmapped memory access at {:#x}",
                         addr);

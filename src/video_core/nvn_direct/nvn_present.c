@@ -178,7 +178,9 @@ static VkImageView frame_view(const vka_img* im, VkFormat format) {
 // frame runs while the worker records this one (with 0, the present waits until the worker has recorded the whole frame, and the game's CPU work and the recording take
 // turns: Duskbloods' lobby ~11 + ~15 ms, run readtexels2). One frame more latency. The window's acquire still waits for Lichii's composite of an image before the game
 // draws into it again (nvn_direct_present_composite_pending). Switching it drops the present held, or shows nothing for one present
-static _Thread_local uint64_t t_lagged;
+// Global, not per thread: in Duskbloods the take alternates between two host threads (the per-thread skip counter read ~1 per present), so a per-thread lag handed over
+// the frame two back, and when one thread took twice in a row the next frame shown was older than the one before it (frames out of order)
+static _Atomic uint64_t g_lagged, g_last_tk;
 // Lichii: tickets the take skipped (a present's frame never handed over: its ticket jumped past last_tk+1), for DM_VK_PRESENT_STATS (core/nvn_hook.cpp)
 static _Atomic uint64_t g_take_gaps;
 uint64_t nvn_direct_present_gaps(void) { return atomic_load(&g_take_gaps); }
@@ -189,9 +191,9 @@ int nvn_direct_present_take(nvn_direct_frame* out) {
     if (!now_tk) return 0;
     t_ticket = 0;
     uint64_t tk = now_tk;
-    if (VKA_ENV("DM_VK_PRESENT_LAG", 1)) { tk = t_lagged; t_lagged = now_tk; if (!tk) return 0; }
-    else t_lagged = 0;
-    { static _Thread_local uint64_t last_tk; if (last_tk && tk > last_tk + 1) atomic_fetch_add(&g_take_gaps, tk - last_tk - 1); last_tk = tk; }
+    if (VKA_ENV("DM_VK_PRESENT_LAG", 1)) { tk = atomic_exchange(&g_lagged, now_tk); if (!tk) return 0; }
+    else atomic_store(&g_lagged, 0);
+    { const uint64_t last_tk = atomic_exchange(&g_last_tk, tk); if (last_tk && tk > last_tk + 1) atomic_fetch_add(&g_take_gaps, tk - last_tk - 1); }
     pthread_mutex_lock(&g_mu);
     while (g_filled < tk && !vka_stopping()) pthread_cond_wait(&g_cv, &g_mu);
     const pres_t p = g_pres[tk % NPRES];
