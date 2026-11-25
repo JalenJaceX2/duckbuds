@@ -73,7 +73,7 @@ void vka_dlss_eval(VkCommandBuffer cb, const p_dlss *c) {
              (unsigned long long)d->serial, c->output->d.format, c->jitter[0], c->jitter[1], c->reset ? ", history reset" : "");
     }
     vka_tex_own(d, cb);
-    const int32_t sw = (int32_t)(s->w >> sl ? s->w >> sl : 1), sh = (int32_t)(s->h >> sl ? s->h >> sl : 1), dw = (int32_t)(d->w >> dl ? d->w >> dl : 1), dh = (int32_t)(d->h >> dl ? d->h >> dl : 1);
+    int32_t sw = (int32_t)(s->w >> sl ? s->w >> sl : 1), sh = (int32_t)(s->h >> sl ? s->h >> sl : 1); const int32_t dw = (int32_t)(d->w >> dl ? d->w >> dl : 1), dh = (int32_t)(d->h >> dl ? d->h >> dl : 1);
     int32_t ix0 = SC(s, c->in_base[0]), iy0 = SC(s, c->in_base[1]), ix1 = SC(s, c->in_base[0] + c->in_size[0]), iy1 = SC(s, c->in_base[1] + c->in_size[1]);
     const int32_t ox0 = SC(d, c->out_base[0]), oy0 = SC(d, c->out_base[1]), ox1 = SC(d, c->out_base[0] + c->out_size[0]), oy1 = SC(d, c->out_base[1] + c->out_size[1]);
     if (ix0 < 0) ix0 = 0; if (iy0 < 0) iy0 = 0; if (ix1 > sw) ix1 = sw; if (iy1 > sh) iy1 = sh;
@@ -82,7 +82,27 @@ void vka_dlss_eval(VkCommandBuffer cb, const p_dlss *c) {
     const float js = s->scaled ? (float)vka_scale_up / (float)(1u << vka_scale_shift) : 1.0f;   // the jitter in the image's pixels
     VkImageView sv = vka_view(s, sf.view, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, sl, 1, sz, 1, NULL);
     VkImageView dv = (d->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ? vka_view(d, df.view, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, dl, 1, dz, 1, NULL) : VK_NULL_HANDLE;
-    VkPipeline p = sv && dv && (s->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && ready() ? pipeline(df.view) : VK_NULL_HANDLE;
+    float jit[2] = {c->jitter[0] * js, c->jitter[1] * js};
+    int sampled = (s->usage & VK_IMAGE_USAGE_SAMPLED_BIT) != 0, fsr = 0;
+    // Lichii: FSR 3.1 (vka_fsr3.c) with the evaluation's motion vectors and depth, when the input starts at 0,0; its output (the output rectangle's size) is then
+    // what the draw below resamples, 1:1 and without the jitter
+    if (sv && dv && sampled && c->motion && c->depth && !ix0 && !iy0 && !c->mv_base[0] && !c->mv_base[1] && !c->depth_base[0] && !c->depth_base[1]) {
+        vka_img *m = vka_tex_get(c->motion, cb), *z = vka_tex_get(c->depth, cb); uint32_t ml, mz, zl, zz; vka_fmt mf, zf;
+        const uint32_t rw = (uint32_t)(ix1 - ix0), rh = (uint32_t)(iy1 - iy0), uw = (uint32_t)(ox1 - ox0), uh = (uint32_t)(oy1 - oy0);
+        VkImageView mv = VK_NULL_HANDLE, zv = VK_NULL_HANDLE;
+        if (m && z && view_of(m, c->motion, &c->mv, c->has_mv, &ml, &mz, &mf) && view_of(z, c->depth, &c->dv, c->has_dv, &zl, &zz, &zf) && !mf.kind && (zf.kind == 3 || zf.kind == 5) &&
+            (m->usage & z->usage & VK_IMAGE_USAGE_SAMPLED_BIT) && m->samples == 1 && z->samples == 1 && (m->w >> ml) >= rw && (m->h >> ml) >= rh && (z->w >> zl) >= rw && (z->h >> zl) >= rh) {
+            mv = vka_view(m, mf.view, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT, ml, 1, mz, 1, NULL);
+            zv = vka_view(z, zf.view, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, zl, 1, zz, 1, NULL);
+        } else VRED_ONCE("DLSS evaluation: motion vectors (%#x) or depth (%#x) not usable by FSR 3: the spatial upscale stands in", c->motion->d.format, c->depth->d.format);
+        const float ms[2] = {c->mv_scale[0] * (m && m->scaled ? js : 1.0f), c->mv_scale[1] * (m && m->scaled ? js : 1.0f)};
+        VkImageView fv = mv && zv ? vka_fsr3_eval(cb, sv, zv, mv, rw, rh, uw, uh, jit, ms, c->reset) : VK_NULL_HANDLE;
+        if (fv) { sv = fv; fsr = 1; sw = (int32_t)uw; sh = (int32_t)uh; ix0 = iy0 = 0; ix1 = (int32_t)uw; iy1 = (int32_t)uh; jit[0] = jit[1] = 0; }
+    }
+    else if (!fsr) VRED_ONCE("DLSS evaluation without FSR 3: input view %d, output view %d, sampled %d, motion %d, depth %d, input base %d,%d, motion base %d,%d, depth base %d,%d",
+                             sv != VK_NULL_HANDLE, dv != VK_NULL_HANDLE, sampled, c->motion != NULL, c->depth != NULL, ix0, iy0, c->mv_base[0], c->mv_base[1], c->depth_base[0], c->depth_base[1]);
+    VkPipeline p = sv && dv && sampled && ready() ? pipeline(df.view) : VK_NULL_HANDLE;
+    if (fsr && !p) { VRED_ONCE("DLSS evaluation: FSR 3 ran but its output could not be drawn into the output: not evaluated"); return; }
     if (p) {
         VkRenderingAttachmentInfo a = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dv, .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
         const VkRect2D rc = {{cx0, cy0}, {(uint32_t)(cx1 - cx0), (uint32_t)(cy1 - cy0)}};
@@ -90,7 +110,7 @@ void vka_dlss_eval(VkCommandBuffer cb, const p_dlss *c) {
         VkDescriptorImageInfo ii = {g_samp, sv, VK_IMAGE_LAYOUT_GENERAL};
         VkWriteDescriptorSet wr = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
         // The vertex shader's texture coordinate at viewport position q (0-1): m q + t, the output's span over the input's, offset by the jitter
-        const float vpc[6] = {(float)(ix1 - ix0) / sw, 0, 0, (float)(iy1 - iy0) / sh, (ix0 + c->jitter[0] * js) / sw, (iy0 + c->jitter[1] * js) / sh};
+        const float vpc[6] = {(float)(ix1 - ix0) / sw, 0, 0, (float)(iy1 - iy0) / sh, (ix0 + jit[0]) / sw, (iy0 + jit[1]) / sh};
         const float fpc[4] = {(ix0 + 0.5f) / sw, (iy0 + 0.5f) / sh, (ix1 - 0.5f) / sw, (iy1 - 0.5f) / sh};
         const VkViewport v = {(float)ox0, (float)oy0, (float)(ox1 - ox0), (float)(oy1 - oy0), 0, 1};
         vk.vkCmdBeginRendering(cb, &ri);

@@ -500,7 +500,9 @@ void vka_rp_end(void);
 int vka_rp_split_ok(const p_set_rt *rt, int has_rt);
 void vka_draw_cb_switch(VkCommandBuffer cb);
 void vka_dyn_invalidate(void);                       // the draws' dynamic state is set again in full at the next draw (another pipeline was bound)
-void vka_dlss_eval(VkCommandBuffer cb, const p_dlss *c);   // Lichii: OP_DLSS, a spatial upscale in place of NVIDIA's network (vka_dlss.c)
+void vka_dlss_eval(VkCommandBuffer cb, const p_dlss *c);
+VkImageView vka_fsr3_eval(VkCommandBuffer cb, VkImageView color, VkImageView depth, VkImageView motion, uint32_t rw, uint32_t rh, uint32_t uw, uint32_t uh,
+                          const float jitter[2], const float mv_scale[2], int reset);   // Lichii: FSR 3.1 for OP_DLSS (vka_fsr3.c); NULL: not evaluated   // Lichii: OP_DLSS, a spatial upscale in place of NVIDIA's network (vka_dlss.c)
 int vka_pass_keep(void);                             // DM_VK_PASS_KEEP=0: a SET_RT ends the pass, as before
 int vka_rp_open_for(const p_set_rt *rt, int has_rt);   // a pass is open over these targets
 int vka_rp_game_barrier(uint32_t bits);                // a game barrier (OP_BARRIER): 1 = taken inside the open pass (DM_VK_BAR_KEEP), 0 = the caller ends the pass and records a full barrier

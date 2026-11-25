@@ -40,6 +40,7 @@ add_library(nvn_direct STATIC
     ${BN}/gfx/vk_android/vka_enc.c
     ${BN}/gfx/vk_android/vka_exec.c
     ${BN}/gfx/vk_android/vka_fps.c
+    ${BN}/gfx/vk_android/vka_fsr3.c
     ${BN}/gfx/vk_android/vka_gprof.c
     ${BN}/gfx/vk_android/vka_imgmem.c
     ${BN}/gfx/vk_android/vka_mem.c

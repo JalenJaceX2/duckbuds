@@ -2955,9 +2955,13 @@ NVN_NOPROTO(nvnDlssParametersSetOverlayJitterDebug, void, void *p, uint32_t v) {
 NVN_NOPROTO(nvnCommandBufferEvaluateDlss, void, NVNcommandBuffer *c, void *n, const void *p) {
     dlss_net_t *net = n; const dlss_params_t *o = p;
     if (!o || !o->color || !o->output) { ONCE_LOG("[RED] EvaluateDlss without an input or output colour texture: nothing evaluated"); return; }
-    p_dlss *r = REC_SNAP(c, OP_DLSS, p_dlss, 2);
+    p_dlss *r = REC_SNAP(c, OP_DLSS, p_dlss, 4);
     r->color = tex_snap(r, SNAP_OFF(p_dlss), 0, o->color, nvn_caller()); copy_view(&r->cv, &r->has_cv, o->color_view);
     r->output = tex_snap(r, SNAP_OFF(p_dlss), 1, o->output, nvn_caller()); copy_view(&r->ov, &r->has_ov, o->output_view);
+    // Lichii: the motion vectors and depth, which FSR 3 takes in place of NVIDIA's network (vka_fsr3.c)
+    r->motion = o->motion ? tex_snap(r, SNAP_OFF(p_dlss), 2, o->motion, nvn_caller()) : NULL; copy_view(&r->mv, &r->has_mv, o->motion_view);
+    r->depth = o->depth ? tex_snap(r, SNAP_OFF(p_dlss), 3, o->depth, nvn_caller()) : NULL; copy_view(&r->dv, &r->has_dv, o->depth_view);
+    memcpy(r->mv_base, o->mv_base, sizeof r->mv_base); memcpy(r->depth_base, o->depth_base, sizeof r->depth_base); memcpy(r->mv_scale, o->mv_scale, sizeof r->mv_scale);
     const int no_size = !o->in_size[0] && !o->in_size[1];
     r->in_size[0] = no_size ? (int32_t)((const tex_t *)o->color)->d.width : o->in_size[0];
     r->in_size[1] = no_size ? (int32_t)((const tex_t *)o->color)->d.height : o->in_size[1];

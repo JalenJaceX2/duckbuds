@@ -532,6 +532,32 @@ void NvnDirectShaders::TranslateStage(const nvn_direct_shader_source& source,
     if (stage == Shader::Stage::Fragment) {
         runtime_info.per_primitive_generics = source.per_primitive_inputs;
     }
+    // Lichii: the tessellation mode is in NVN2's control section as GL enums (shape +0x58, spacing
+    // +0x5c, winding +0x64); left at the defaults, every evaluation shader was isolines
+    if (stage == Shader::Stage::TessellationEval && source.control) {
+        u32 version, shape, spacing, winding;
+        std::memcpy(&version, source.control + 4, 4);
+        std::memcpy(&shape, source.control + 0x58, 4);
+        std::memcpy(&spacing, source.control + 0x5c, 4);
+        std::memcpy(&winding, source.control + 0x64, 4);
+        if (version == 0xc9) {
+            runtime_info.tess_primitive = shape == 0x0004   ? Shader::TessPrimitive::Triangles
+                                          : shape == 0x8E7A ? Shader::TessPrimitive::Isolines
+                                                            : Shader::TessPrimitive::Quads;
+            runtime_info.tess_spacing = spacing == 0x8E7B   ? Shader::TessSpacing::FractionalOdd
+                                        : spacing == 0x8E7C ? Shader::TessSpacing::FractionalEven
+                                                            : Shader::TessSpacing::Equal;
+            // GL_CCW (0x901) is Cw: the normal renderer gives these same shaders VertexOrderCw
+            runtime_info.tess_clockwise = winding != 0x0900;
+            if ((shape != 0x0004 && shape != 0x0007 && shape != 0x8E7A) ||
+                (spacing != 0x0202 && spacing != 0x8E7B && spacing != 0x8E7C) ||
+                (winding != 0x0900 && winding != 0x0901)) {
+                LOG_WARNING(Render_Vulkan,
+                            "NVN direct: tess evaluation shape {:#x} spacing {:#x} winding {:#x} not known: quads, equal, cw",
+                            shape, spacing, winding);
+            }
+        }
+    }
     if (stage == Shader::Stage::VertexB || stage == Shader::Stage::TessellationEval ||
         stage == Shader::Stage::Geometry || stage == Shader::Stage::Mesh) {
         runtime_info.convert_depth_mode = source.convert_depth != 0;

@@ -820,13 +820,13 @@ void vka_up_stats(uint64_t *batches, uint64_t *waits, double *wait_ms) { if (bat
 // back images and pool memory. Each file destroys its own (the images before their memory blocks, the pipelines before their layouts and modules)
 void vka_tex_destroy(void); void vka_imem_destroy(void); void vks_destroy(void); void vka_pso_destroy(void); void vka_shader_destroy(void); void vka_rc_destroy(void);
 void vka_exec_destroy(void); void vka_draw_destroy(void); void vka_enc_destroy(void); void vka_mem_destroy(void); void vka_capture_destroy(void); void vka_ctl_destroy(void);
-void vka_dlss_destroy(void); void vka_nan_destroy(void); void vka_gprof_destroy(void); void nvn_present_destroy(void); void vka_census_line(void);
+void vka_dlss_destroy(void); void vka_fsr3_destroy(void); void vka_nan_destroy(void); void vka_gprof_destroy(void); void nvn_present_destroy(void); void vka_census_line(void);
 void vka_destroy(void) {
     atomic_store(&g_hung, 0);   // (the GPU is idle: what a hang or the stop kept from being freed goes now, and what is deferred from now on runs at once)
     pthread_mutex_lock(&g_fmu); after_rec *run = g_after; g_after = NULL; __atomic_store_n(&g_done, g_fence, __ATOMIC_RELEASE); pthread_mutex_unlock(&g_fmu);
     while (run) { after_rec *a = run; run = a->next; a->fn(a->arg); free(a); }
     nvn_present_destroy();
-    vka_capture_destroy(); vka_ctl_destroy(); vka_dlss_destroy(); vka_nan_destroy(); vka_gprof_destroy();
+    vka_capture_destroy(); vka_ctl_destroy(); vka_dlss_destroy(); vka_fsr3_destroy(); vka_nan_destroy(); vka_gprof_destroy();
     vka_exec_destroy(); vka_draw_destroy(); vka_enc_destroy();
     vka_pso_destroy(); vka_rc_destroy(); vka_shader_destroy();
     vka_tex_destroy(); vka_imem_destroy(); vks_destroy();

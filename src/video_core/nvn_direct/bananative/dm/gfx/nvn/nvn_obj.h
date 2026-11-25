@@ -226,7 +226,8 @@ typedef struct { int32_t what, pad; uint64_t ctl; } p_tf_state;          // what
 typedef struct { int32_t on; } p_rast_discard;
 // Lichii: nvnCommandBufferEvaluateDlss as the replay runs it (vka_dlss.c): the input colour's subrectangle resampled into the output's, sampled jitter pixels away (a spatial
 // upscale; the snapshots of color and output follow the record)
-typedef struct { const tex_t *color, *output; view_t cv, ov; uint8_t has_cv, has_ov, reset, _pad; int32_t in_base[2], in_size[2], out_base[2], out_size[2]; float jitter[2]; uint64_t net; } p_dlss;
+typedef struct { const tex_t *color, *output; view_t cv, ov; uint8_t has_cv, has_ov, reset, _pad; int32_t in_base[2], in_size[2], out_base[2], out_size[2]; float jitter[2]; uint64_t net;
+                 const tex_t *motion, *depth; view_t mv, dv; uint8_t has_mv, has_dv, _pad2[2]; int32_t mv_base[2], depth_base[2]; float mv_scale[2]; } p_dlss;   // Lichii: motion and depth for FSR 3 (vka_fsr3.c)
 // Lichii: a cooperative-vector matrix layout (NVN2's, from its driver: hle_nvn.c "DLSS, dirty tile maps and cooperative-vector matrices"), and nvnCommandBufferConvertCooperativeVectorMatrix's record
 typedef struct { uint64_t stride; uint32_t type, layout; } coopvec_desc;
 typedef struct { uint64_t src, dst; coopvec_desc sd, dd; int32_t rows, cols; } p_coopvec_convert;
