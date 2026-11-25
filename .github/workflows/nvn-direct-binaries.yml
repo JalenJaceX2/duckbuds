@@ -1,0 +1,251 @@
+name: nvn-direct-binaries
+
+# Test binaries for the direct NVN branch: a Windows build (as release-binaries.yml's windows-x86_64,
+# without ThinLTO) and a Linux build to show the direct renderer still compiles there. Artifacts
+# only: no release. A push builds only when its newest commit's message contains [build]; other
+# pushes skip both jobs, which takes no runner time. (Not tags: a tag can't restore the branch's cache.)
+on:
+  push:
+    branches: [duskbloods-nvn-direct]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    concurrency:
+      group: nvn-direct-windows-${{ github.ref }}
+      cancel-in-progress: true
+    name: Windows x86_64 binary
+    runs-on: windows-2022
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      actions: write
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3000M
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install LLVM
+        shell: pwsh
+        run: ./tools/windows/install-llvm.ps1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts qtimageformats
+          cache: true
+
+      - name: Install ccache
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'ccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/ccache/ccache/releases/download/v4.14.2/ccache-4.14.2-windows-x86_64.zip
+          if ((Get-FileHash -Algorithm SHA256 $zip).Hash -ne '6993ce645e53192cec592ee23186200b574ac4c59097ecde8d9cfd681b47ae84') {
+              throw 'ccache checksum mismatch'
+          }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          Join-Path $env:RUNNER_TEMP 'ccache-4.14.2-windows-x86_64' | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Restore dependencies and compiler objects
+        id: cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: nvn-direct-windows-${{ github.sha }}
+          restore-keys: |
+            nvn-direct-windows-
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build/release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=OFF
+          -DLICHII_TESTS=OFF
+          -DLICHII_CMD=ON
+          -DLICHII_ROOM=OFF
+          -DLICHII_ROOM_STANDALONE=OFF
+          -DLICHII_USE_BUNDLED_QT=OFF
+          -DENABLE_FLYHIGH=ON
+          -DENABLE_QT_TRANSLATION=ON
+          -DLICHII_USE_BUNDLED_SDL3=ON
+          -DENABLE_UPDATE_CHECKER=OFF
+          -DLICHII_BUILD_PLATFORM=windows-x86_64
+          -DUSE_DISCORD_PRESENCE=OFF
+          -DUSE_CCACHE=ON
+          "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe"
+          "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe"
+          "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe"
+          "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe"
+          -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+          "-DCMAKE_EXE_LINKER_FLAGS=/DEBUG:FULL /OPT:REF /OPT:ICF"
+          "-DCMAKE_C_FLAGS=-DWIN32 -D_WINDOWS -DNOMINMAX"
+          "-DCMAKE_CXX_FLAGS=-EHsc -DWIN32 -D_WINDOWS -DNOMINMAX"
+
+      - name: Build
+        env:
+          CCACHE_COMPILERCHECK: string:${{ hashFiles('tools/windows/install-llvm.ps1') }}
+        run: |
+          ccache --zero-stats
+          cmake --build build/release --target lichii lichii-cmd --parallel
+          ccache --show-stats
+
+      - name: Save dependencies and compiler objects
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          foreach ($file in 'lichii.exe', 'eden-cli.exe') {
+            if (-not (Test-Path "build/release/bin/$file" -PathType Leaf)) { throw "build/release/bin/$file was not produced" }
+          }
+          New-Item -ItemType Directory -Force build/release/symbols | Out-Null
+          Move-Item build/release/bin/*.pdb build/release/symbols/
+          windeployqt --release --no-translations build/release/bin/lichii.exe
+          $excluded = 'flyhighfg.bin', 'flyhighfg.json', 'graph.json', 'models.json', 'WEIGHTS_LICENSE.md'
+          Get-ChildItem -Recurse -File build/release/bin | Where-Object { $_.Name -in $excluded } | Remove-Item
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichii-nvn-direct-windows-x86_64-${{ github.sha }}
+          path: build/release/bin/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload symbols
+        uses: actions/upload-artifact@v7
+        with:
+          name: symbols-nvn-direct-windows-x86_64-${{ github.sha }}
+          path: build/release/symbols/
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[build]')
+    concurrency:
+      group: nvn-direct-linux-${{ github.ref }}
+      cancel-in-progress: true
+    name: Linux x86_64 binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: write
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2000M
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf cmake g++ gcc git glslang-tools libglu1-mesa-dev \
+            libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
+            mesa-common-dev nasm ninja-build qt6-base-private-dev \
+            qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
+            libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+            spirv-tools spirv-headers libusb-1.0-0-dev \
+            libboost-dev libboost-fiber-dev libboost-context-dev \
+            libopus-dev libasound2-dev ccache
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtcharts qtimageformats
+          cache: true
+
+      - name: Restore dependencies and compiler objects
+        id: cache
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: nvn-direct-linux-${{ github.sha }}
+          restore-keys: |
+            nvn-direct-linux-
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DLICHII_TESTS=OFF \
+            -DLICHII_CMD=ON \
+            -DLICHII_ROOM=OFF \
+            -DLICHII_ROOM_STANDALONE=OFF \
+            -DLICHII_USE_BUNDLED_QT=OFF \
+            -DENABLE_QT_TRANSLATION=ON \
+            "-DCMAKE_PREFIX_PATH=$QT_ROOT_DIR" \
+            -DLICHII_USE_BUNDLED_SDL3=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DLICHII_BUILD_PLATFORM=linux-x86_64 \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON
+
+      - name: Build
+        run: |
+          ccache --zero-stats
+          cmake --build build/release --target lichii lichii-cmd --parallel "$(nproc)"
+          ccache --show-stats
+
+      - name: Save dependencies and compiler objects
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            .cache/cpm
+            .ccache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      # shortcut: a plain tarball that needs Qt 6.8 on the machine; use release-binaries.yml's
+      # AppImage packaging if Linux testers need a self-contained build.
+      - name: Package
+        run: tar -czf lichii-nvn-direct-linux-x86_64.tar.gz -C build/release/bin .
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichii-nvn-direct-linux-x86_64-${{ github.sha }}
+          path: lichii-nvn-direct-linux-x86_64.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
