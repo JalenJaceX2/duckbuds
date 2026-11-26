@@ -20,7 +20,6 @@
 #include "common/vector_math.h"
 #include "video_core/host_shaders/astc_decoder_comp_spv.h"
 #include "video_core/host_shaders/bc_encoder_comp_spv.h"
-#include "video_core/host_shaders/nx2_list_grid_arguments_comp_spv.h"
 #include "video_core/host_shaders/queries_prefix_scan_sum_comp_spv.h"
 #include "video_core/host_shaders/queries_prefix_scan_sum_nosubgroups_comp_spv.h"
 #include "video_core/host_shaders/resolve_conditional_render_comp_spv.h"
@@ -183,16 +182,6 @@ constexpr std::array<VkDescriptorUpdateTemplateEntry, ASTC_NUM_BINDINGS>
         },
     }};
 
-struct AstcPushConstants {
-    std::array<u32, 2> blocks_dims;
-    u32 layer_stride;
-    u32 block_size;
-    u32 x_shift;
-    u32 block_height;
-    u32 block_height_mask;
-    u32 native_tiling;
-};
-
 constexpr std::array<VkDescriptorSetLayoutBinding, 2> BC_ENCODER_DESCRIPTOR_SET_BINDINGS{{
     {
         .binding = 0,
@@ -228,15 +217,6 @@ constexpr std::array<VkDescriptorUpdateTemplateEntry, 2> BC_ENCODER_DESCRIPTOR_U
         .stride = sizeof(DescriptorUpdateEntry),
     },
 }};
-
-struct BcEncoderPushConstants {
-    u32 blocks_x;
-    u32 blocks_y;
-    u32 width;
-    u32 height;
-    u32 bc3;
-    u32 out_offset; // in 8-byte units
-};
 
 struct QueriesPrefixScanPushConstants {
     u32 min_accumulation_base;
@@ -422,51 +402,6 @@ std::pair<VkBuffer, VkDeviceSize> Uint8Pass::Assemble(u32 num_vertices, VkBuffer
                                VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, WRITE_BARRIER);
     });
     return {staging.buffer, staging.offset};
-}
-
-ListGridArgumentsPass::ListGridArgumentsPass(
-    const Device& device_, Scheduler& scheduler_, DescriptorPool& descriptor_pool_,
-    ComputePassDescriptorQueue& compute_pass_descriptor_queue_)
-    : ComputePass(device_, scheduler_, descriptor_pool_, INPUT_OUTPUT_DESCRIPTOR_SET_BINDINGS,
-                  INPUT_OUTPUT_DESCRIPTOR_UPDATE_TEMPLATE, INPUT_OUTPUT_BANK_INFO,
-                  COMPUTE_PUSH_CONSTANT_RANGE<sizeof(u32) * 2>,
-                  NX2_LIST_GRID_ARGUMENTS_COMP_SPV),
-      scheduler{scheduler_}, compute_pass_descriptor_queue{compute_pass_descriptor_queue_} {}
-
-void ListGridArgumentsPass::Convert(VkBuffer buffer, VkDeviceSize size, u32 words,
-                                    u32 arguments) {
-    compute_pass_descriptor_queue.Acquire(scheduler, 2);
-    compute_pass_descriptor_queue.AddBuffer(buffer, 0, size);
-    compute_pass_descriptor_queue.AddBuffer(buffer, 0, size);
-    const void* const descriptor_data{compute_pass_descriptor_queue.UpdateData()};
-    scheduler.RequestOutsideRenderPassOperationContext();
-    scheduler.Record([this, descriptor_data, words, arguments](vk::CommandBuffer cmdbuf) {
-        static constexpr VkMemoryBarrier READ_BARRIER{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-        };
-        static constexpr VkMemoryBarrier WRITE_BARRIER{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT,
-        };
-        const std::array<u32, 2> indices{words, arguments};
-        const VkDescriptorSet set = descriptor_allocator.Commit();
-        device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
-        // After the copy of the words, and after earlier dispatches read the old arguments.
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, READ_BARRIER);
-        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
-        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
-        cmdbuf.PushConstants(*layout, VK_SHADER_STAGE_COMPUTE_BIT, indices);
-        cmdbuf.Dispatch(1, 1, 1);
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                               VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0,
-                               WRITE_BARRIER);
-    });
 }
 
 QuadIndexedPass::QuadIndexedPass(const Device& device_, Scheduler& scheduler_,
@@ -924,6 +859,55 @@ void BcEncoderPass::Encode(VkImageView source, u32 width, u32 height, u32 layers
         cmdbuf.Dispatch(Common::DivCeil(uniforms.blocks_x, 8U), Common::DivCeil(uniforms.blocks_y, 8U),
                         layers);
     });
+}
+
+void TranscodeAstcBatches(ASTCDecoderPass& decoder, BcEncoderPass& encoder,
+                          const VideoCommon::ImageInfo& info, size_t guest_size_bytes,
+                          const StagingBufferRef& map,
+                          std::span<const VideoCommon::SwizzleParameters> swizzles, VkImage decode,
+                          std::span<const vk::ImageView> level_views, u32 batch, bool bc3,
+                          VkBuffer output, VkDeviceSize output_offset, VkDeviceSize output_size,
+                          std::span<const u64> level_offsets, std::span<const u64> layer_bytes) {
+    const u32 levels = static_cast<u32>(level_views.size());
+    const u32 layers = static_cast<u32>(info.resources.layers);
+    const u64 layer_stride = info.layer_stride;
+    for (u32 base = 0; base < layers; base += batch) {
+        const u32 count = (std::min)(batch, layers - base);
+        // The swizzles describe one layer's levels and the decoder steps layer_stride per layer
+        // from the start of its input, so a batch is the same info with fewer layers, read from
+        // its first layer on. The swizzle math does not depend on the layer count.
+        VideoCommon::ImageInfo batch_info = info;
+        batch_info.resources.layers = static_cast<s32>(count);
+        StagingBufferRef batch_map = map;
+        batch_map.offset += u64{base} * layer_stride;
+        const size_t guest_offset = static_cast<size_t>(u64{base} * layer_stride);
+        const size_t batch_size =
+            batch == layers
+                ? guest_size_bytes
+                : (std::min)(static_cast<size_t>(u64{count} * layer_stride),
+                             guest_size_bytes - (std::min)(guest_size_bytes, guest_offset));
+        decoder.AssembleInto(
+            batch_info, 0, batch_size,
+            ASTCDecoderPass::Target{
+                .image = decode,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                // A later batch overwrites what the previous batch's encode read: its barrier
+                // waits for that (initialized).
+                .initialized = base != 0,
+                .level_view = [level_views](s32 level) { return *level_views[level]; },
+                // Only the last batch submits. `map` carries this tick: a later batch reading it
+                // after a submit could find it freed, or refilled with the next upload.
+                .wait = base + count >= layers,
+                .levels = levels,
+            },
+            batch_map, swizzles);
+        for (u32 level = 0; level < levels; ++level) {
+            encoder.Encode(*level_views[level], (std::max)(info.size.width >> level, 1U),
+                           (std::max)(info.size.height >> level, 1U), count, bc3, output,
+                           output_offset, output_size,
+                           level_offsets[level] + layer_bytes[level] * base);
+        }
+    }
 }
 
 constexpr u32 BL3D_BINDING_INPUT_BUFFER  = 0;

@@ -13,6 +13,7 @@
 #include <random>
 #include <set>
 #include <span>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -30,6 +31,8 @@
 
 #include "common/cityhash.h"
 #include "common/fs/file_lock.h"
+#include "common/scope_exit.h"
+#include "common/settings.h"
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
 #include "shader_recompiler/program_header.h"
 #include "video_core/native_lowering.h"
@@ -181,6 +184,11 @@ public:
         }
     }
 
+    void SetTextureInfo(u32 handle, Shader::TextureType type, Shader::TexturePixelFormat format) {
+        texture_types.emplace(handle, type);
+        texture_pixel_formats.emplace(handle, format);
+    }
+
     u32 ReadCbufValue(u32, u32) override {
         return 0;
     }
@@ -280,6 +288,66 @@ constexpr std::array<Instruction, 3> ProgramCounterProgram{{
 }};
 
 } // Anonymous namespace
+
+TEST_CASE("Carried native records rebuild ambiguous header-offset classifications once",
+          "[shader_cache_v2][texture_header_records]") {
+    const u64 saved_program_id = Settings::GetCurrentProgramID();
+    SCOPE_EXIT { Settings::SetCurrentProgramID(saved_program_id); };
+    const auto program = LowerTestProgram(std::array{EXIT}, false, 0);
+    const std::array<u64, 2> legacy_code{0x123456789abcdef0, 0xfedcba9876543210};
+    constexpr u64 marker_key = (u64{~u32{0}} << 32) | 2;
+    constexpr u32 marker_value = 1;
+    std::string marker(sizeof(marker_key) + sizeof(marker_value), '\0');
+    std::memcpy(marker.data(), &marker_key, sizeof(marker_key));
+    std::memcpy(marker.data() + sizeof(marker_key), &marker_value, sizeof(marker_value));
+    for (const u64 program_id : {0x0400486024DEC000ULL, 0x04008E001F098000ULL}) {
+        Settings::SetCurrentProgramID(program_id);
+        for (const bool native : {false, true}) {
+            for (const bool current : {false, true}) {
+                CAPTURE(program_id, native, current);
+                NativeTestEnvironment source{
+                    Shader::Stage::Fragment,
+                    native ? std::span<const u64>{program.lowered_code}
+                           : std::span<const u64>{legacy_code}, 2};
+                source.SetTextureInfo(0xbe000, Shader::TextureType::Color3D,
+                                      Shader::TexturePixelFormat::R16_FLOAT);
+                source.SetTextureInfo(3, Shader::TextureType::Color2D,
+                                      Shader::TexturePixelFormat::R16_FLOAT);
+                std::ostringstream serialized(std::ios::binary);
+                source.Serialize(serialized, ReadProperties);
+                std::string bytes = serialized.str();
+                if (!current) {
+                    if (const size_t at = bytes.find(marker); at != std::string::npos) {
+                        bytes.erase(at, marker.size());
+                        u64 count{};
+                        std::memcpy(&count, bytes.data() + 3 * sizeof(u64), sizeof(count));
+                        --count;
+                        std::memcpy(bytes.data() + 3 * sizeof(u64), &count, sizeof(count));
+                    }
+                }
+                std::istringstream file(bytes, std::ios::binary);
+                VideoCommon::FileEnvironment env;
+                env.Deserialize(file, std::streampos{static_cast<std::streamoff>(bytes.size())});
+                REQUIRE(env.ReadTextureType(3) == Shader::TextureType::Color2D);
+                REQUIRE(env.ReadTexturePixelFormat(3) == Shader::TexturePixelFormat::R16_FLOAT);
+                REQUIRE_FALSE(env.LacksRecordedValue(ReadProperties));
+                if (!current && native && program_id != 0x04008E001F098000ULL) {
+                    REQUIRE_THROWS_AS(env.ReadTextureType(5), Shader::LogicError);
+                    REQUIRE_FALSE(env.LacksRecordedValue(ReadProperties ^ 1));
+                    REQUIRE_THROWS_AS(env.ReadTextureType(0xbe000), Shader::LogicError);
+                    REQUIRE_THROWS_AS(env.ReadTexturePixelFormat(0xbe000), Shader::LogicError);
+                    REQUIRE(env.LacksRecordedValue(ReadProperties));
+                    REQUIRE(env.LacksRecordedValue(ReadProperties ^ 1));
+                } else {
+                    REQUIRE(env.ReadTextureType(0xbe000) == Shader::TextureType::Color3D);
+                    REQUIRE(env.ReadTexturePixelFormat(0xbe000) ==
+                            Shader::TexturePixelFormat::R16_FLOAT);
+                    REQUIRE_FALSE(env.LacksRecordedValue(ReadProperties));
+                }
+            }
+        }
+    }
+}
 
 TEST_CASE("Shader cache v2: every kind of record reads back as written", "[video_core][shader_cache_v2]") {
     TestEnvironment fragment{Shader::Stage::Fragment};
@@ -526,6 +594,38 @@ TEST_CASE("Shader cache v2: compaction keeps the live records and only them",
     REQUIRE(compacted.parsed.live.size() == expected.size());
 }
 
+TEST_CASE("Shader cache v2: a record reads again at its offset until a compaction moves it",
+          "[video_core][shader_cache_v2]") {
+    TempDir temp;
+    const auto file = temp.path / "cache.bin";
+    {
+        V2::CacheWriter writer{file};
+        for (u64 i = 0; i < 20; ++i) {
+            writer.Append(RecordKind::Graphics, i, TestPayload(i));
+        }
+        writer.Append(RecordKind::Tombstone, 3, V2::TombstonePayload(RecordKind::Graphics));
+        REQUIRE(writer.Drain(5s));
+    }
+    const V2::LogFile log = V2::ReadLogFile(file);
+    REQUIRE(log.parsed.live.size() == 19);
+    for (const V2::LogRecord& record : log.parsed.live) {
+        const auto payload = V2::ReadRecordPayload(file, record.kind, record.key, record.offset,
+                                                   record.payload.size());
+        REQUIRE(payload);
+        REQUIRE(std::ranges::equal(*payload, record.payload));
+    }
+    const V2::LogRecord& last = log.parsed.live.back();
+    const u64 size = last.payload.size();
+    REQUIRE_FALSE(V2::ReadRecordPayload(file, RecordKind::Compute, last.key, last.offset, size));
+    REQUIRE_FALSE(V2::ReadRecordPayload(file, last.kind, last.key + 1, last.offset, size));
+    REQUIRE_FALSE(V2::ReadRecordPayload(file, last.kind, last.key, last.offset, size - 1));
+    REQUIRE_FALSE(V2::ReadRecordPayload(file, last.kind, last.key, last.offset + 8, size));
+    REQUIRE_FALSE(V2::ReadRecordPayload(file, last.kind, last.key, log.bytes.size(), size));
+
+    REQUIRE(V2::CompactLog(file) == V2::WriteResult::Written);
+    REQUIRE_FALSE(V2::ReadRecordPayload(file, last.kind, last.key, last.offset, size));
+}
+
 TEST_CASE("Shader cache v2: two writers on one file lose no record",
           "[video_core][shader_cache_v2]") {
     TempDir temp;
@@ -610,6 +710,56 @@ TEST_CASE("Shader cache v2: appends follow a record cut off by a crash",
     WriteAll(other_file, other);
     REQUIRE(V2::AppendToLog(other_file, records) == V2::WriteResult::OtherVersion);
     REQUIRE(ReadAll(other_file) == std::vector<u8>(other.begin(), other.end()));
+}
+
+TEST_CASE("Shader cache v2: a log is built record by record", "[video_core][shader_cache_v2]") {
+    TempDir temp;
+    const auto file = temp.path / "cache.bin";
+    const std::array written{Written{RecordKind::Graphics, 0x11, TestPayload(1)},
+                             Written{RecordKind::Used, 0x22, TestPayload(2)}};
+
+    V2::LogBuilder builder;
+    REQUIRE(builder.Start(file) == V2::WriteResult::Written);
+    for (const Written& record : written) {
+        REQUIRE(builder.Append(record.kind, record.key, record.payload));
+    }
+    // Nothing is there before the commit: a reader never sees half a log
+    REQUIRE_FALSE(std::filesystem::exists(file));
+    REQUIRE(builder.Commit() == V2::WriteResult::Written);
+    REQUIRE(Live(V2::ReadLogFile(file).parsed) ==
+            std::vector<Written>(written.begin(), written.end()));
+    REQUIRE_FALSE(std::filesystem::exists(temp.path / "cache.bin.migrating"));
+
+    // A log that is there is never written over
+    const auto bytes = ReadAll(file);
+    V2::LogBuilder second;
+    REQUIRE(second.Start(file) == V2::WriteResult::Exists);
+    REQUIRE(ReadAll(file) == bytes);
+
+    // One that is given up on leaves the log as it was
+    const auto other = temp.path / "other.bin";
+    V2::LogBuilder discarded;
+    REQUIRE(discarded.Start(other) == V2::WriteResult::Written);
+    REQUIRE(discarded.Append(RecordKind::Used, 0x33, TestPayload(3)));
+    discarded.Discard();
+    REQUIRE_FALSE(std::filesystem::exists(other));
+    REQUIRE_FALSE(std::filesystem::exists(temp.path / "other.bin.migrating"));
+
+    // Enough records that the buffer is written out more than once: the whole point of the
+    // builder, since a source of this size used to be held in memory before it was written
+    const auto large_file = temp.path / "large.bin";
+    V2::LogBuilder large;
+    REQUIRE(large.Start(large_file) == V2::WriteResult::Written);
+    std::vector<Written> many;
+    for (u64 i = 0; i < 40; ++i) {
+        std::vector<u8> payload(256 * 1024, static_cast<u8>(i));
+        REQUIRE(large.Append(RecordKind::Used, 0x100 + i, payload));
+        many.push_back({RecordKind::Used, 0x100 + i, std::move(payload)});
+    }
+    REQUIRE(large.Commit() == V2::WriteResult::Written);
+    const V2::LogFile large_log = V2::ReadLogFile(large_file);
+    REQUIRE(Live(large_log.parsed) == many);
+    REQUIRE(large_log.parsed.stats.dead_bytes == 0);
 }
 
 #ifndef _WIN32

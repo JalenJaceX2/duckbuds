@@ -124,6 +124,12 @@ public:
     /// Returns the current CNTPCT tick value.
     u64 GetClockTicks() const;
 
+#if defined(ARCHITECTURE_x86_64)
+    void ConfigureInlineCntpct(bool supported);
+    void RefreshInlineCntpct();
+    const std::atomic<u32>* InlineCntpctMode() const;
+#endif
+
     /// Returns the current GPU tick value.
     u64 GetGPUTicks() const;
 
@@ -146,8 +152,17 @@ public:
 
     void Reset();
 
-    /// Waits on `event` until next_time, sleeping in the OS for most of it.
-    void WaitForEvent(s64 next_time);
+    struct NextEvents {
+        std::optional<s64> next;
+        /// The first event that does not loop. Looping events keep their own schedule however late
+        /// they run; a one-shot event's lateness shifts what the guest schedules after it.
+        std::optional<s64> one_shot;
+    };
+    NextEvents AdvanceEvents();
+
+    /// Waits on `event` until next_time: sleeps in the OS, except within the host wait margin of
+    /// a one-shot event, where it waits in hardware.
+    void WaitForEvent(s64 next_time, std::optional<s64> one_shot_time);
 
     using heap_t = boost::heap::fibonacci_heap<CoreTiming::Event, boost::heap::compare<std::greater<>>>;
     heap_t event_queue;
@@ -171,6 +186,12 @@ public:
     std::atomic<bool> wait_set{};
     std::atomic<bool> has_started{};
     bool is_multicore{};
+#if defined(ARCHITECTURE_x86_64)
+    // One applied setting for both GetClockTicks and already compiled JIT blocks.
+    // Zero is Normal without speed sync; all other values require the callback.
+    static constexpr u32 InlineCntpctDisabled = ~u32{0};
+    std::atomic<u32> inline_cntpct_mode{InlineCntpctDisabled};
+#endif
     /// Logs the timer thread's waits once a second (EDEN_NX2_HOSTTIMING_STATS=1, or the debug
     /// server's host_timing).
     std::atomic<bool> host_wait_stats{};

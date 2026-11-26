@@ -7,6 +7,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -30,6 +31,7 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/submission_package.h"
 #include "core/loader/loader.h"
+#include "core/loader/nca.h"
 #include "core/loader/nx.h"
 
 #include "qt_common/config/uisettings.h"
@@ -40,6 +42,7 @@
 #include "qt_common/game_list/model.h"
 #include "qt_common/game_list/discovery.h"
 #include "qt_common/game_list/worker.h"
+#include "qt_common/util/game.h"
 
 namespace {
 
@@ -54,37 +57,6 @@ struct PendingRow {
         return std::exchange(items, {});
     }
 };
-
-QString GetGameListCachedObject(const std::string& filename, const std::string& ext,
-                                const std::function<QString()>& generator) {
-    if (!UISettings::values.cache_game_list || filename == "0000000000000000") {
-        return generator();
-    }
-
-    const auto path =
-        Common::FS::PathToUTF8String(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
-                                     "game_list" / fmt::format("{}.{}", filename, ext));
-
-    void(Common::FS::CreateParentDirs(path));
-
-    if (!Common::FS::Exists(path)) {
-        const auto str = generator();
-
-        QFile file{QString::fromStdString(path)};
-        if (file.open(QFile::WriteOnly)) {
-            file.write(str.toUtf8());
-        }
-
-        return str;
-    }
-
-    QFile file{QString::fromStdString(path)};
-    if (file.open(QFile::ReadOnly)) {
-        return QString::fromUtf8(file.readAll());
-    }
-
-    return generator();
-}
 
 std::pair<std::vector<u8>, std::string> GetGameListCachedObject(
     const std::string& filename, const std::string& ext,
@@ -170,6 +142,58 @@ bool HasSupportedFileExtension(const std::string& file_name) {
 
 bool IsExtractedNCAMain(const std::string& file_name) {
     return QFileInfo(QString::fromStdString(file_name)).fileName() == QStringLiteral("main");
+}
+
+// The folder a loose dump's row stands for: the one that holds its exefs (the game folder, or
+// base/ or updates/<id> when the game keeps several). A `main` outside an exefs folder stands for
+// its own folder.
+std::filesystem::path LooseDumpContentDir(const std::string& physical_name) {
+    const auto main_dir = std::filesystem::path(Common::FS::ToU8String(physical_name)).parent_path();
+    const QString dir_name =
+        QString::fromStdString(Common::FS::PathToUTF8String(main_dir.filename()));
+    if (dir_name.compare(QStringLiteral("exefs"), Qt::CaseInsensitive) == 0) {
+        return main_dir.parent_path();
+    }
+    return main_dir;
+}
+
+// Total size of the files in a loose dump's folder. Update folders directly inside it are left
+// out: they have rows of their own. Returns nothing when cancelled or when the folder can't be
+// read.
+std::optional<u64> LooseDumpFolderSize(const std::string& physical_name,
+                                       const std::atomic_bool& stop_requested) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::recursive_directory_iterator it(LooseDumpContentDir(physical_name),
+                                        fs::directory_options::skip_permission_denied, ec);
+    u64 total = 0;
+    for (; !ec && it != fs::recursive_directory_iterator{}; it.increment(ec)) {
+        if (stop_requested) {
+            return std::nullopt;
+        }
+        std::error_code entry_ec;
+        if (it->is_directory(entry_ec)) {
+            if (it.depth() == 0) {
+                const QString name =
+                    QString::fromStdString(Common::FS::PathToUTF8String(it->path().filename()));
+                if (name.compare(QStringLiteral("update"), Qt::CaseInsensitive) == 0 ||
+                    name.compare(QStringLiteral("updates"), Qt::CaseInsensitive) == 0) {
+                    it.disable_recursion_pending();
+                }
+            }
+            continue;
+        }
+        if (it->is_regular_file(entry_ec)) {
+            const auto size = it->file_size(entry_ec);
+            if (!entry_ec) {
+                total += size;
+            }
+        }
+    }
+    if (ec) {
+        return std::nullopt;
+    }
+    return total;
 }
 
 QString FormatGameName(const std::string& physical_name) {
@@ -263,33 +287,35 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
                                         const std::size_t size, const std::vector<u8>& icon,
                                         Loader::AppLoader& loader, u64 program_id,
                                         const PlayTime::PlayTimeManager& play_time_manager,
-                                        const FileSys::PatchManager& patch) {
+                                        const FileSys::PatchManager& patch,
+                                        GameListPatchCache& patch_cache) {
     auto const file_type = loader.GetFileType();
     auto const file_type_string = QString::fromStdString(Loader::GetFileTypeString(file_type));
 
-    QString patch_versions = GetGameListCachedObject(
-        fmt::format("{:016X}", patch.GetTitleID()), "pv.txt", [&patch, &loader] {
+    QString patch_versions = patch_cache.Get(
+        patch.GetTitleID(), UISettings::values.cache_game_list.GetValue(), [&patch, &loader] {
             return FormatPatchNameVersions(patch, loader, loader.IsRomFSUpdatable());
         });
 
-    FileSys::NACP nacp{};
+    std::string version;
     // An NX tree snapshot, like a NUP, is already the updated game: no patch manager update.
     if ((file_type == Loader::FileType::NUP ||
          (file_type == Loader::FileType::NX && !loader.IsRomFSUpdatable())) &&
-        loader.ReadControlData(nacp) == Loader::ResultStatus::Success) {
-        const std::string version_string = nacp.GetVersionString();
-        if (!version_string.empty()) {
-            if (!patch_versions.isEmpty()) {
-                patch_versions += QLatin1Char('\n');
-            }
-            patch_versions += QStringLiteral("Update (%1)").arg(
-                QString::fromStdString(version_string));
+        loader.ReadDisplayVersion(version) == Loader::ResultStatus::Success && !version.empty()) {
+        if (!patch_versions.isEmpty()) {
+            patch_versions += QLatin1Char('\n');
         }
+        patch_versions += QStringLiteral("Update (%1)").arg(QString::fromStdString(version));
     }
 
     u64 play_time = play_time_manager.GetPlayTime(program_id);
+    // Artwork the user picked replaces the icon from the game file.
+    const std::vector<u8> custom_artwork = QtCommon::Game::ReadCustomArtwork(program_id);
+    // So does the name the user gave the game in Properties.
+    const std::string custom_title = QtCommon::Game::ReadCustomTitle(program_id);
     return QList<QStandardItem*>{
-        new GameListItemPath(FormatGameName(path), icon, QString::fromStdString(name),
+        new GameListItemPath(FormatGameName(path), custom_artwork.empty() ? icon : custom_artwork,
+                             QString::fromStdString(custom_title.empty() ? name : custom_title),
                              file_type_string, program_id, play_time, patch_versions),
         new GameListItem(file_type_string),
         new GameListItemSize(size),
@@ -407,7 +433,7 @@ void GameListWorker::AddTitlesToGameList(GameListDir* parent_dir, GameListItemTy
         }
 
         auto entry = MakeGameListEntry(file->GetFullPath(), name, file->GetSize(), icon, *loader,
-                                       program_id, play_time_manager, patch);
+                                       program_id, play_time_manager, patch, patch_cache);
         auto pending = std::make_shared<PendingRow>(std::move(entry));
         RecordEvent([=](GameListModel* model) { model->AddEntry(pending->Release(), parent_dir); });
     }
@@ -498,7 +524,14 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
             std::vector<u64> program_ids;
             loader->ReadProgramIds(program_ids);
 
-            const auto addEntry = [this, physical_name,
+            const bool title_container =
+                file_type == Loader::FileType::XCI || file_type == Loader::FileType::XCZ ||
+                file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ;
+            const bool can_forward =
+                (!title_container || !program_ids.empty()) &&
+                (file_type != Loader::FileType::NCA ||
+                 Loader::AppLoader_NCA::IdentifyType(file) == Loader::FileType::NCA);
+            const auto addEntry = [this, physical_name, can_forward,
                                    parent_dir](std::unique_ptr<Loader::AppLoader>& app_loader,
                                                const u64 id) {
                 std::vector<u8> icon;
@@ -528,30 +561,34 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                 const u64 size = loose_dump ? 0 : Common::FS::GetSize(physical_name);
 
                 auto entry = MakeGameListEntry(physical_name, name, size, icon, *app_loader, id,
-                                               play_time_manager, patch);
+                                               play_time_manager, patch, patch_cache);
 
                 if (loose_dump) {
-                    entry[GameListModel::COLUMN_SIZE]->setText(tr("Not scanned"));
+                    entry[GameListModel::COLUMN_SIZE]->setText(tr("Calculating..."));
                     entry[GameListModel::COLUMN_SIZE]->setToolTip(
-                        tr("Folder size is not calculated during game discovery."));
+                        tr("The folder size is calculated after the game list is shown."));
+                    if (std::find(loose_dumps.begin(), loose_dumps.end(), physical_name) ==
+                        loose_dumps.end()) {
+                        loose_dumps.push_back(physical_name);
+                    }
                 }
                 auto pending = std::make_shared<PendingRow>(std::move(entry));
                 RecordEvent([=](GameListModel* model) {
                     model->AddEntry(pending->Release(), parent_dir);
                 });
+                if (can_forward && id != 0) {
+                    application_paths.try_emplace(id, physical_name);
+                }
             };
 
-            if (res2 == Loader::ResultStatus::Success && program_ids.size() > 1 &&
-                (file_type == Loader::FileType::XCI || file_type == Loader::FileType::XCZ ||
-                 file_type == Loader::FileType::NSP || file_type == Loader::FileType::NSZ)) {
+            if (title_container && !program_ids.empty() &&
+                (program_ids.size() > 1 || res2 != Loader::ResultStatus::Success ||
+                 program_ids.front() != program_id)) {
                 for (const auto id : program_ids) {
-                    // dravee suggested this, only viable way to
-                    // not show sub-games in qlaunch for now.
-                    if ((id & 0xFFF) != 0) {
-                        continue;
-                    }
                     loader = Loader::GetLoader(system, file, id);
-                    if (!loader) {
+                    u64 resolved{};
+                    if (!loader || loader->ReadProgramId(resolved) != Loader::ResultStatus::Success ||
+                        resolved != id) {
                         continue;
                     }
 
@@ -579,7 +616,9 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
 void GameListWorker::run() {
     const auto started = std::chrono::steady_clock::now();
     watch_list.clear();
+    loose_dumps.clear();
     provider->ClearAllEntries();
+    patch_cache.Clear();
 
     const auto DirEntryReady = [&](GameListDir* game_list_dir) {
         auto pending = std::make_shared<std::unique_ptr<GameListDir>>(game_list_dir);
@@ -628,6 +667,7 @@ void GameListWorker::run() {
                      discovery.files.size(), discovery.directories.size(), discovery.skipped_romfs,
                      discovery.errors, stop_requested.load());
             ScanFileSystem(ScanTarget::FillManualContentProvider, discovery.files, game_list_dir);
+            patch_cache.Clear();
             ScanFileSystem(ScanTarget::PopulateGameList, discovery.files, game_list_dir);
         } else {
             AddTitlesToGameList(game_list_dir, parent_type);
@@ -639,6 +679,39 @@ void GameListWorker::run() {
              std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::steady_clock::now() - started).count(),
              watch_list.size(), stop_requested.load());
-    RecordEvent([this](GameListModel* model) { model->DonePopulating(watch_list); });
+    if (!stop_requested) {
+        RecordEvent([this, paths = std::move(application_paths)](GameListModel* model) mutable {
+            if (!stop_requested) {
+                provider->ReplaceApplicationPaths(std::move(paths));
+                model->DonePopulating(watch_list);
+            }
+        });
+    }
+
+    // Loose dump folders are sized once the list is shown: walking their RomFS during discovery
+    // made the list slow to appear. A reload stops this through stop_requested.
+    const auto sizing_started = std::chrono::steady_clock::now();
+    std::size_t sized = 0;
+    for (const auto& physical_name : loose_dumps) {
+        if (stop_requested) {
+            break;
+        }
+        const auto size = LooseDumpFolderSize(physical_name, stop_requested);
+        if (!size) {
+            continue;
+        }
+        ++sized;
+        const QString game_path = FormatGameName(physical_name);
+        RecordEvent([game_path, bytes = *size](GameListModel* model) {
+            model->SetFolderSize(game_path, bytes);
+        });
+    }
+    if (!loose_dumps.empty()) {
+        LOG_INFO(Frontend, "Loose dump sizes: sized={} of {} elapsed_ms={} cancelled={}", sized,
+                 loose_dumps.size(),
+                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - sizing_started).count(),
+                 stop_requested.load());
+    }
     processing_completed.Set();
 }

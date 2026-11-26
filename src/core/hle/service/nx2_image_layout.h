@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <span>
 
 #include "common/alignment.h"
@@ -17,6 +18,10 @@ enum class Nx2NativeImageFormat : u32 {
     Rgb10A2 = 4,
     Rgba16Float = 5,
 };
+
+// The last nx2:vi2 HDR status answer was HDR. Both presenters (nx2:vi2 and NVN2 direct mode's
+// nvnQueuePresentTexture) label the game's RGB10A2 images by it. Per boot: the shutdown clears it.
+inline std::atomic<bool> g_nx2_told_hdr{};
 
 // The colour space of a presented native image. FP16 is linear scRGB by its format. RGB10A2 holds
 // PQ BT.2020 only while the game was told the display is HDR: Fire Emblem: Fortune's Weave
@@ -67,11 +72,13 @@ inline Nx2ImageLayout Nx2CalculateNativeImageRequirements(std::span<const u32, 1
                                                          u32 count) {
     auto layout = Nx2CalculateImageLayout(preference.data());
     if (count != 1 || preference[0] != 0 || preference[1] != 2 || preference[3] != 0 ||
-        preference[4] < 3 || preference[4] > 8 || preference[6] != 1 || preference[7] != 1 ||
+        preference[4] < 3 || preference[4] > 8 || preference[6] != 1 ||
+        (preference[7] != 1 && preference[7] != 2) ||
         layout.pitch != u64{preference[5]} * 64 ||
         std::any_of(preference.begin() + 8, preference.end(), [](u32 value) { return value != 0; })) {
         return layout;
     }
+    // Both observed block-format variants allow page-aligned image base offsets.
     layout.alignment = 0x1000;
     return layout;
 }

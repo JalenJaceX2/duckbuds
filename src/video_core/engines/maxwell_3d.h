@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <type_traits>
@@ -26,7 +27,6 @@
 #include "video_core/gpu.h"
 #include "video_core/macro.h"
 #include "video_core/nx2_fast_draw.h"
-#include "video_core/nx2_list_grid.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/textures/texture.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -35,12 +35,21 @@ namespace Core {
 class System;
 }
 
+namespace VideoCommon::GpuTrace {
+struct StateAccess;
+}
+
 namespace Tegra {
 class MemoryManager;
 }
 
 namespace VideoCommon {
 class GpuSplit;
+}
+
+namespace VideoCommon::Nx2RenderView {
+class Writes;
+void NoteWrite(Writes& writes, u32 index) noexcept;
 }
 
 namespace VideoCore {
@@ -62,6 +71,8 @@ namespace Tegra::Engines {
 #define MAXWELL3D_REG_INDEX(field_name) (offsetof(Maxwell3D::Regs, field_name) / sizeof(u32))
 
 class Maxwell3D final : public EngineInterface {
+    friend struct ::VideoCommon::GpuTrace::StateAccess;
+
 public:
     explicit Maxwell3D(MemoryManager& memory_manager);
     ~Maxwell3D();
@@ -3187,7 +3198,8 @@ public:
 
     /// Root tables: eight 256-byte tables written inline (method 0x504 selects a table, bits 0-2,
     /// and a byte offset, bits 8-15; each 0x508 writes the next word) that shaders read as constant
-    /// banks 24-31. NVN2 keeps push constants in bank 24, which the Ampere lowering reads as bank 17.
+    /// banks 24-31. NVN2 keeps push constants in bank 24. The Ampere lowering reads them all from
+    /// bank 17, table n at byte n * 256.
     struct RootTables {
         static constexpr u32 SelectMethod = 0x504 / 4;
         static constexpr u32 LoadMethod = 0x508 / 4;
@@ -3226,9 +3238,6 @@ public:
                          u32 argument, bool is_last_call);
     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
                               const u32* base_start, u32 amount, u32 methods_pending);
-    /// List-fed grid macros (nx2_list_grid.h): the markers of the data RAM, which the compute
-    /// engine shares and stores them in (KeplerCompute::FrontTakeListGrid).
-    Nx2ListGrid::GridMarker grid_marker;
 
     bool ShouldExecute() const {
         return execute_on;
@@ -3250,6 +3259,9 @@ public:
         Flags flags;
         Tables tables{};
     } dirty;
+
+    /// EDEN_NX2_RENDER_VIEW_VERIFY: the words and bindings the next draw sends GPURender's view.
+    std::unique_ptr<VideoCommon::Nx2RenderView::Writes> render_view_writes;
 
     DrawManager draw_manager;
 
@@ -3295,6 +3307,8 @@ public:
     static bool IsFastDrawVertexBuffer(u32 method);
     /// A vertex attribute format, when vertex input is dynamic state.
     static bool IsFastDrawVertexFormat(u32 method);
+    /// Counter resets and the render enable mode: query state every draw applies itself.
+    static bool IsFastDrawQueryMethod(u32 method);
     void NoteFastDrawConstantData(GPUVAddr begin, GPUVAddr end);
     /// Writes constant buffer data at `offset` (`bytes` within the buffer) through the buffer
     /// CB_ADDRESS and CB_SIZE select, translated once per selection and memory map. False, having
@@ -3344,6 +3358,9 @@ private:
         regs.reg_array[method] = argument;
         for (const auto& table : dirty.tables) {
             dirty.flags[table[method]] = true;
+        }
+        if (render_view_writes) [[unlikely]] {
+            VideoCommon::Nx2RenderView::NoteWrite(*render_view_writes, method);
         }
     }
 
@@ -3504,6 +3521,7 @@ private:
     void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    void FrontCaptureMmeWrite(const FrontState& state, u32 method, u32 value, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                         const MacroEngine& engine, u32 start);

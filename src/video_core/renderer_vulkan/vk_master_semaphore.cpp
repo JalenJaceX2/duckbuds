@@ -3,6 +3,9 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <charconv>
+#include <cstdlib>
+#include <string_view>
 #include <thread>
 
 #include <ranges>
@@ -17,7 +20,36 @@ namespace Vulkan {
 
 constexpr u64 FENCE_RESERVE_SIZE = 8;
 
-MasterSemaphore::MasterSemaphore(const Device& device_) : device(device_) {
+// Timeline waits wake this often to read the counter again and check the watchdog.
+constexpr u64 WAIT_SLICE_NS = 250'000'000;
+
+namespace {
+
+s64 SteadyNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// EDEN_NX2_GPU_WATCHDOG=<seconds>, at least 30; any other value means 45.
+std::chrono::seconds WatchdogFromEnvironment() {
+    const char* const value = std::getenv("EDEN_NX2_GPU_WATCHDOG");
+    if (value == nullptr) {
+        return {};
+    }
+    const std::string_view text{value};
+    u32 seconds = 45;
+    if (const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), seconds);
+        error != std::errc{} || end != text.data() + text.size()) {
+        seconds = 45;
+    }
+    return std::chrono::seconds{(std::max)(seconds, 30u)};
+}
+
+} // Anonymous namespace
+
+MasterSemaphore::MasterSemaphore(const Device& device_)
+    : device(device_), watchdog{WatchdogFromEnvironment()} {
     if (!device.HasTimelineSemaphore()) {
         static constexpr VkFenceCreateInfo fence_ci{
             .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = nullptr, .flags = 0};
@@ -40,6 +72,10 @@ MasterSemaphore::MasterSemaphore(const Device& device_) : device(device_) {
         .flags = 0,
     };
     semaphore = device.GetLogical().CreateSemaphore(semaphore_ci);
+    if (watchdog.count() != 0) {
+        LOG_INFO(Render_Vulkan, "EDEN_NX2_GPU_WATCHDOG: closing after {} s without GPU progress",
+                 watchdog.count());
+    }
 
     if (!Settings::values.renderer_debug) {
         return;
@@ -69,7 +105,14 @@ void MasterSemaphore::Refresh() {
     u64 counter{};
     do {
         this_tick = gpu_tick.load(std::memory_order_acquire);
-        counter = semaphore.GetCounter();
+        try {
+            counter = semaphore.GetCounter();
+        } catch (const vk::Exception& exception) {
+            if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                device.ReportLoss();
+            }
+            throw;
+        }
         // Unchanged: no store, which would take the cache line from the threads reading it.
         if (counter <= this_tick) {
             return;
@@ -109,13 +152,34 @@ void MasterSemaphore::Wait(u64 tick) {
         return;
     }
 
-    // If none of the above is hit, fallback to a regular wait
+    // Wait in slices: a driver that kills the channel may neither signal the timeline nor
+    // return VK_ERROR_DEVICE_LOST from the wait (NVIDIA 580 after Xid 69 on Pascal, #2396).
     const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::GpuWait};
     try {
-        while (!semaphore.Wait(tick)) {
+        u64 last_known = KnownGpuTick();
+        auto last_progress = std::chrono::steady_clock::now();
+        while (!semaphore.Wait(tick, WAIT_SLICE_NS)) {
+            Refresh();
+            if (IsFree(tick)) {
+                break;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const u64 known = KnownGpuTick();
+            // Only accepted work counts: a tick still waiting to be submitted is not a GPU stall.
+            if (known != last_known || tick > accepted_tick.load(std::memory_order_acquire)) {
+                last_known = known;
+                last_progress = now;
+                continue;
+            }
+            if (watchdog.count() != 0 && now - last_progress >= watchdog) {
+                ReportUnresponsive(tick, now - last_progress);
+            }
         }
     } catch (const vk::Exception& exception) {
-        // The throw ends the process; say why first (a device loss reached nothing else here).
+        if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+            device.ReportLoss();
+        }
+        // The throw ends the process; say why first.
         LOG_CRITICAL(Render_Vulkan, "Waiting for GPU tick {} failed: {}", tick, exception.what());
         throw;
     }
@@ -125,14 +189,24 @@ void MasterSemaphore::Wait(u64 tick) {
 
 VkResult MasterSemaphore::SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                       VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
-                                      u64 host_tick) {
+                                      VkSemaphore wait_timeline, u64 wait_value, u64 host_tick) {
     const VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::QueueSubmit};
-    if (semaphore) {
-        return SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
-                                   host_tick);
-    } else {
-        return SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, host_tick);
+    const VkResult result =
+        semaphore ? SubmitQueueTimeline(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
+                                        wait_timeline, wait_value, host_tick)
+                  : SubmitQueueFence(cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore,
+                                     host_tick);
+    if (result == VK_SUCCESS && watchdog.count() != 0) {
+        const s64 now = SteadyNs();
+        accepted_ns.store(now, std::memory_order_relaxed);
+        accepted_tick.store(host_tick, std::memory_order_release);
+        if (signal_semaphore) {
+            present_ns.store(now, std::memory_order_relaxed);
+            present_tick.store(host_tick, std::memory_order_relaxed);
+            present_submits.fetch_add(1, std::memory_order_relaxed);
+        }
     }
+    return result;
 }
 
 static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
@@ -141,8 +215,23 @@ static constexpr VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_VERTEX
 VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
                                               vk::CommandBuffer& upload_cmdbuf,
                                               VkSemaphore signal_semaphore,
-                                              VkSemaphore wait_semaphore, u64 host_tick) {
+                                              VkSemaphore wait_semaphore, VkSemaphore wait_timeline,
+                                              u64 wait_value, u64 host_tick) {
     const VkSemaphore timeline_semaphore = *semaphore;
+    // The binary wait_semaphore (value ignored), then wait_timeline at wait_value
+    std::array<VkSemaphore, 2> wait_semaphores{};
+    std::array<u64, 2> wait_values{};
+    std::array<VkPipelineStageFlags, 2> wait_masks{};
+    u32 num_wait_semaphores = 0;
+    if (wait_semaphore) {
+        wait_semaphores[num_wait_semaphores] = wait_semaphore;
+        wait_masks[num_wait_semaphores++] = wait_stage_mask;
+    }
+    if (wait_timeline) {
+        wait_semaphores[num_wait_semaphores] = wait_timeline;
+        wait_values[num_wait_semaphores] = wait_value;
+        wait_masks[num_wait_semaphores++] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    }
 
     if (device.HasSynchronization2()) {
         const std::array<VkCommandBufferSubmitInfo, 2> cmdbuffer_infos{{
@@ -184,22 +273,24 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
             num_signal_semaphores = 2;
         }
 
-        const u32 num_wait_semaphores = wait_semaphore ? 1 : 0;
-        const VkSemaphoreSubmitInfo wait_info{
-            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-            .pNext = nullptr,
-            .semaphore = wait_semaphore,
-            .value = 0,
-            .stageMask = static_cast<VkPipelineStageFlags2>(wait_stage_mask),
-            .deviceIndex = 0,
-        };
+        std::array<VkSemaphoreSubmitInfo, 2> wait_infos{};
+        for (u32 i = 0; i < num_wait_semaphores; ++i) {
+            wait_infos[i] = VkSemaphoreSubmitInfo{
+                .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+                .pNext = nullptr,
+                .semaphore = wait_semaphores[i],
+                .value = wait_values[i],
+                .stageMask = static_cast<VkPipelineStageFlags2>(wait_masks[i]),
+                .deviceIndex = 0,
+            };
+        }
 
         const VkSubmitInfo2 submit_info2{
             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
             .pNext = nullptr,
             .flags = 0,
             .waitSemaphoreInfoCount = num_wait_semaphores,
-            .pWaitSemaphoreInfos = num_wait_semaphores ? &wait_info : nullptr,
+            .pWaitSemaphoreInfos = num_wait_semaphores ? wait_infos.data() : nullptr,
             .commandBufferInfoCount = static_cast<u32>(cmdbuffer_infos.size()),
             .pCommandBufferInfos = cmdbuffer_infos.data(),
             .signalSemaphoreInfoCount = num_signal_semaphores,
@@ -214,20 +305,18 @@ VkResult MasterSemaphore::SubmitQueueTimeline(vk::CommandBuffer& cmdbuf,
 
     const std::array cmdbuffers{*upload_cmdbuf, *cmdbuf};
 
-    const u32 num_wait_semaphores = wait_semaphore ? 1 : 0;
     // Pointers must be null when the count is zero (best-practices)
     const VkSemaphore* p_wait_sems =
-        (num_wait_semaphores > 0) ? &wait_semaphore : nullptr;
+        (num_wait_semaphores > 0) ? wait_semaphores.data() : nullptr;
     const VkPipelineStageFlags* p_wait_masks =
-        (num_wait_semaphores > 0) ? &wait_stage_mask : nullptr;
+        (num_wait_semaphores > 0) ? wait_masks.data() : nullptr;
     const VkSemaphore* p_signal_sems =
         (num_signal_semaphores > 0) ? signal_semaphores.data() : nullptr;
-    const u64 wait_zero = 0; // dummy for binary wait
     const VkTimelineSemaphoreSubmitInfo timeline_si{
         .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
         .pNext = nullptr,
         .waitSemaphoreValueCount = num_wait_semaphores,
-        .pWaitSemaphoreValues    = num_wait_semaphores ? &wait_zero : nullptr,
+        .pWaitSemaphoreValues    = num_wait_semaphores ? wait_values.data() : nullptr,
         .signalSemaphoreValueCount = num_signal_semaphores,
         .pSignalSemaphoreValues = signal_values.data(),
     };
@@ -370,6 +459,24 @@ void MasterSemaphore::WaitThread(std::stop_token token) {
         gpu_tick.notify_one();
         Tegra::Nx2PendingWake::Get().OnGpuTick(host_tick);
     }
+}
+
+void MasterSemaphore::ReportUnresponsive(u64 tick,
+                                         std::chrono::steady_clock::duration stalled) const {
+    const s64 now = SteadyNs();
+    const auto ago_ms = [now](const std::atomic<s64>& ns) {
+        const s64 value = ns.load(std::memory_order_acquire);
+        return value == 0 ? s64{-1} : (now - value) / 1'000'000;
+    };
+    LOG_CRITICAL(Render_Vulkan,
+                 "GPU unresponsive: tick {} not reached after {} s without progress; GPU at tick "
+                 "{}, last accepted submit tick {} ({} ms ago), last present submit tick {} ({} "
+                 "ms ago, {} present submits)",
+                 tick, std::chrono::duration_cast<std::chrono::seconds>(stalled).count(),
+                 KnownGpuTick(), accepted_tick.load(std::memory_order_acquire), ago_ms(accepted_ns),
+                 present_tick.load(std::memory_order_acquire), ago_ms(present_ns),
+                 present_submits.load(std::memory_order_acquire));
+    device.ReportUnresponsive();
 }
 
 vk::Fence MasterSemaphore::GetFreeFence() {

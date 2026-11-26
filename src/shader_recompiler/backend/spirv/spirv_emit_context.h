@@ -8,6 +8,8 @@
 #include <array>
 #include <bit>
 #include <optional>
+#include <unordered_map>
+#include <vector>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_map.h"
@@ -43,6 +45,9 @@ struct TextureDefinition {
     u32 count;
     bool is_multisample;
     bool is_integer;
+    /// Read from the pools: id is the texture pool's array of image_type, pointer_type points to
+    /// one of its elements (EmitContext::pool_samplers holds the samplers)
+    bool is_pool{};
 };
 
 struct TextureBufferDefinition {
@@ -64,6 +69,9 @@ struct ImageDefinition {
     Id pointer_type;
     u32 count;
     bool is_integer;
+    /// Read from the image pool: id is the pool's array of image_type, pointer_type points to one
+    /// of its elements
+    bool is_pool{};
 };
 
 struct UniformDefinitions {
@@ -173,10 +181,27 @@ struct CooperativeHmmaTypes {
 class EmitContext final : public Sirit::Module {
 public:
     explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info,
-                         IR::Program& program, Bindings& binding);
+                         IR::Program& program, Bindings& binding, bool vulkan_memory_model);
     ~EmitContext();
 
     [[nodiscard]] Id Def(const IR::Value& value);
+
+    /// Workgroup memory loads and stores. GLSL450 keeps workgroup memory coherent within the
+    /// workgroup. Under the Vulkan memory model a plain access is private, so each one is
+    /// non-private and makes itself visible or available to the workgroup, as glslang does for
+    /// GLSL's shared variables.
+    [[nodiscard]] Id LoadShared(Id result_type, Id pointer);
+    void StoreShared(Id pointer, Id object);
+    /// The memory operands LoadShared and StoreShared use under the Vulkan memory model.
+    [[nodiscard]] std::array<Sirit::MemoryAccessLiteral, 2> SharedMemoryAccess(
+        spv::MemoryAccessMask availability);
+    /// Barrier semantics. Under the Vulkan memory model a barrier also makes the writes before it
+    /// available and the writes it orders visible.
+    [[nodiscard]] Id BarrierSemantics(spv::MemorySemanticsMask semantics);
+    /// Workgroup memory semantics of a guest barrier.
+    [[nodiscard]] Id GuestBarrierSemantics();
+    /// The shared word ConditionalBarrierPass counts branch conditions in.
+    [[nodiscard]] Id BarrierVoteWord(Id offset);
 
     [[nodiscard]] Id BitOffset8(const IR::Value& offset);
     [[nodiscard]] Id BitOffset16(const IR::Value& offset);
@@ -230,6 +255,8 @@ public:
     const RuntimeInfo& runtime_info;
     const bool requires_coherent_global_memory;
     const bool requires_coherent_image_memory;
+    /// Set when HMMA lowers to cooperative matrices, which need the Vulkan memory model.
+    const bool vulkan_memory_model;
     Stage stage{};
 
     Id void_id{};
@@ -278,6 +305,9 @@ public:
     std::vector<ImageBufferDefinition> image_buffers;
     std::vector<TextureDefinition> textures;
     std::vector<ImageDefinition> images;
+    /// The sampler pool's array and a pointer to one of its elements (pool textures only)
+    Id pool_samplers{};
+    Id pool_sampler_pointer{};
 
     Id workgroup_id{};
     Id local_invocation_id{};
@@ -325,6 +355,7 @@ public:
 
     Id render_area_push_constant{};
     u32 render_are_member_index{};
+    u32 render_area_offset{};
 
     Id local_memory{};
 
@@ -341,6 +372,8 @@ public:
     Id shared_store_u8_func{};
     Id shared_store_u16_func{};
     Id increment_cas_shared{};
+    Id barrier_vote_func{};
+    Id voted_barrier_func{};
     Id increment_cas_ssbo{};
     Id decrement_cas_shared{};
     Id decrement_cas_ssbo{};
@@ -354,18 +387,26 @@ public:
 
     Id write_storage_cas_loop_func{};
 
-    Id load_global_func_u32{};
-    Id load_global_func_u32x2{};
-    Id load_global_func_u32x4{};
-    Id write_global_func_u32{};
-    Id write_global_func_u32x2{};
-    Id write_global_func_u32x4{};
     // 32-bit global atomics on untracked addresses, routed to the storage buffer holding them.
     enum class GlobalAtomic : size_t {
         IAdd, SMin, UMin, SMax, UMax, Inc, Dec, And, Or, Xor, Exchange, AddF32, Count,
     };
-    std::array<Id, static_cast<size_t>(GlobalAtomic::Count)> global_atomic_funcs{};
-    Id atomic_cas_global_func_u32{};
+    /// The functions that route global memory accesses among some of the bound storage buffers
+    struct GlobalMemoryFunctions {
+        Id load_u32{};
+        Id load_u32x2{};
+        Id load_u32x4{};
+        Id write_u32{};
+        Id write_u32x2{};
+        Id write_u32x4{};
+        std::array<Id, static_cast<size_t>(GlobalAtomic::Count)> atomics{};
+        Id compare_exchange_u32{};
+    };
+    /// The first routes among every bound storage buffer, the others among
+    /// IR::Program::global_memory_routes
+    std::vector<GlobalMemoryFunctions> global_memory_functions;
+    std::unordered_map<const IR::Inst*, u32> global_memory_route;
+    [[nodiscard]] const GlobalMemoryFunctions& GlobalMemoryFunctionsOf(const IR::Inst& inst) const;
 
     bool need_input_position_indirect{};
     Id input_position{};
@@ -391,6 +432,9 @@ public:
     /// memory from this word (A, B and C/D tiles of 16x16 fp16, 128 words each).
     std::optional<u32> tensor_scratch_word;
     Id tensor_subgroup_id{};
+    /// The software matrix functions round to fp16 with a native conversion, which needs the
+    /// entry point's fp16 round-to-nearest-even and denorm preserve modes.
+    bool native_half_rounding{};
     std::vector<Id> interfaces;
     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
 
@@ -423,6 +467,9 @@ public:
     /// Mesh emulation (RuntimeInfo::mesh_as_compute): the output storage buffer and the
     /// pointer type to one of its words.
     Id mesh_output_buffer{};
+    Id loop_guard_buffer{}; ///< RuntimeInfo::loop_guard_binding's buffer
+    Id loop_guard_word_pointer{};
+    Id loop_guard_flag{}; ///< private u32: a loop's safety check ended a loop in this invocation
     Id mesh_output_u32{};
     // With a task program: its payload, offset and argument buffers (RuntimeInfo), and the mesh
     // workgroup's index within its task (what the mesh program reads at input address 0).
@@ -430,6 +477,8 @@ public:
     Id mesh_task_offsets_buffer{};
     Id mesh_task_args_buffer{};
     Id mesh_group_index{};
+    /// NumWorkgroups of a native mesh program (Profile::has_broken_mesh_user_sgprs only).
+    Id mesh_num_workgroups{};
 
     Id load_const_func_u8{};
     Id load_const_func_u16{};
@@ -468,18 +517,21 @@ private:
     void DefineLocalMemory(const IR::Program& program);
     void DefineSharedMemory(const IR::Program& program);
     void DefineSharedMemoryFunctions(const IR::Program& program);
+    void DefineBarrierVoteFunctions(const IR::Program& program);
     void DefineConstantBuffers(const Info& info, u32& binding);
     void DefineConstantBufferIndirectFunctions(const Info& info);
     void DefineStorageBuffers(const Info& info, u32& binding);
     void DefineTextureBuffers(const Info& info, u32& binding);
     void DefineImageBuffers(const Info& info, u32& binding);
-    void DefineTextures(const Info& info, u32& binding, u32& scaling_index);
-    void DefineImages(const Info& info, u32& binding, u32& scaling_index);
+    void DefineTextures(const Info& info, u32& binding, u32& scaling_index,
+                        const Bindings& bindings);
+    void DefineImages(const Info& info, u32& binding, u32& scaling_index,
+                      const Bindings& bindings);
     void DefineAttributeMemAccess(const Info& info);
     void DefineWriteStorageCasLoopFunction(const Info& info);
     void DefineGlobalMemoryFunctions(const IR::Program& program);
     void DefineRescalingInput(const Info& info);
-    void DefineRescalingInputPushConstant();
+    void DefineRescalingInputPushConstant(const Info& info);
     void DefineRescalingInputUniformConstant();
     void DefineRenderArea(const Info& info);
 
@@ -487,6 +539,7 @@ private:
     void DefineOutputs(const IR::Program& program);
     void DefineMesh(const IR::Program& program);
     void DefineMeshEmulationOutput();
+    void DefineLoopGuard(const IR::Program& program);
 };
 
 } // namespace Shader::Backend::SPIRV

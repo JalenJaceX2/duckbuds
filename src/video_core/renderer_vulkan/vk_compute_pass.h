@@ -88,22 +88,6 @@ private:
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
 };
 
-/// The dispatch arguments of a kept command list's grid words (nx2_list_grid.h).
-class ListGridArgumentsPass final : public ComputePass {
-public:
-    explicit ListGridArgumentsPass(const Device& device_, Scheduler& scheduler_,
-                                   DescriptorPool& descriptor_pool_,
-                                   ComputePassDescriptorQueue& compute_pass_descriptor_queue_);
-
-    /// Writes the arguments of the three words at word `words` of `buffer` (`size` bytes) to
-    /// word `arguments`, after the transfer that wrote the words (verify mode reads them back).
-    void Convert(VkBuffer buffer, VkDeviceSize size, u32 words, u32 arguments);
-
-private:
-    Scheduler& scheduler;
-    ComputePassDescriptorQueue& compute_pass_descriptor_queue;
-};
-
 class QuadIndexedPass final : public ComputePass {
 public:
     explicit QuadIndexedPass(const Device& device_, Scheduler& scheduler_,
@@ -147,6 +131,27 @@ public:
 private:
     Scheduler& scheduler;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
+};
+
+/// astc_decoder.comp's push constants.
+struct AstcPushConstants {
+    std::array<u32, 2> blocks_dims;
+    u32 layer_stride;
+    u32 block_size;
+    u32 x_shift;
+    u32 block_height;
+    u32 block_height_mask;
+    u32 native_tiling;
+};
+
+/// bc_encoder.comp's push constants.
+struct BcEncoderPushConstants {
+    u32 blocks_x;
+    u32 blocks_y;
+    u32 width;
+    u32 height;
+    u32 bc3;
+    u32 out_offset; // in 8-byte units
 };
 
 class ASTCDecoderPass final : public ComputePass {
@@ -210,6 +215,17 @@ private:
     Scheduler& scheduler;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
 };
+
+/// Decodes the ASTC array `info` in `map` into `decode` (RGBA8 with `batch` layers, one storage
+/// view per level) and encodes it into `output`, `batch` layers at a time. Each level's blocks
+/// start at `level_offsets` and take `layer_bytes` a layer. The last batch's decode submits.
+void TranscodeAstcBatches(ASTCDecoderPass& decoder, BcEncoderPass& encoder,
+                          const VideoCommon::ImageInfo& info, size_t guest_size_bytes,
+                          const StagingBufferRef& map,
+                          std::span<const VideoCommon::SwizzleParameters> swizzles, VkImage decode,
+                          std::span<const vk::ImageView> level_views, u32 batch, bool bc3,
+                          VkBuffer output, VkDeviceSize output_offset, VkDeviceSize output_size,
+                          std::span<const u64> level_offsets, std::span<const u64> layer_bytes);
 
 class BlockLinearUnswizzle3DPass final : public ComputePass {
 public:

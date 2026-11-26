@@ -25,6 +25,7 @@
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/nx2_fast_draw.h"
@@ -54,6 +55,10 @@ class FenceManager {
     static constexpr bool can_async_check = Traits::HAS_ASYNC_CHECK;
 
 public:
+    /// EDEN_NX2_RENDER_POST_FENCE: GPURender plays a fence the back posted, whose buffer half the
+    /// back found empty: the commit leaves the back's buffer cache alone.
+    bool skip_buffer_half{};
+
     /// Notify the fence manager about a new frame
     void TickFrame() {
         std::unique_lock lock(ring_guard);
@@ -80,6 +85,7 @@ public:
         // and the fencing thread crashed walking it. Its own lock, held for no callbacks.
         std::scoped_lock lock{uncommitted_guard};
         uncommitted_operations.emplace_back(std::move(func));
+        HoldUncommitted();
     }
 
     void SignalFence(std::function<void()>&& func) {
@@ -117,8 +123,10 @@ public:
             std::scoped_lock lock{uncommitted_guard};
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
+                HoldUncommitted();
             }
             pending_operations.emplace_back(std::move(uncommitted_operations));
+            pending_holds.emplace_back(std::move(uncommitted_hold));
             if (!spare_operations.empty()) {
                 uncommitted_operations = std::move(spare_operations.back());
                 spare_operations.pop_back();
@@ -246,9 +254,12 @@ private:
             pending_flushes.pop_front();
             auto operations = std::move(pending_operations.front());
             pending_operations.pop_front();
+            auto hold = std::move(pending_holds.front());
+            pending_holds.pop_front();
             for (auto& operation : operations) {
                 operation();
             }
+            hold.Release();
             {
                 std::unique_lock lock(ring_guard);
                 delayed_destruction_ring.Push(std::move(current_fence));
@@ -274,15 +285,17 @@ private:
         struct Released {
             TFence fence;
             OperationList operations;
+            VideoCommon::GpuSplit::FencedHold hold;
             u8 flushes;
         };
         std::vector<Released> batch;
         batch.reserve(MaxBatch);
         const auto take_front = [&] {
             batch.push_back({std::move(fences.front()), std::move(pending_operations.front()),
-                             pending_flushes.front()});
+                             std::move(pending_holds.front()), pending_flushes.front()});
             fences.pop();
             pending_operations.pop_front();
+            pending_holds.pop_front();
             pending_flushes.pop_front();
         };
         while (!stop_token.stop_requested()) {
@@ -335,6 +348,7 @@ private:
                 for (auto& operation : released.operations) {
                     operation();
                 }
+                released.hold.Release();
                 released.operations.clear();
             }
             if (!batch.empty()) {
@@ -363,6 +377,14 @@ private:
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
         return texture_cache.ShouldWaitAsyncFlushes() || buffer_cache.ShouldWaitAsyncFlushes() ||
                query_cache.ShouldWaitAsyncFlushes();
+    }
+
+    /// With uncommitted_guard held, after an operation was queued: the first one the back queues
+    /// holds its entry until the list ran. The ones after it are of the same or later entries.
+    void HoldUncommitted() {
+        if (!uncommitted_hold) {
+            uncommitted_hold = VideoCommon::GpuSplit::Get().TrackFencedWrite();
+        }
     }
 
     static constexpr u8 TextureFlushes = 1;
@@ -403,7 +425,7 @@ private:
                 flushes.committed |= TextureFlushes;
             }
         }
-        {
+        if (!skip_buffer_half) {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.HasUncommittedFlushes()) {
                 buffer_cache.CommitAsyncFlushes();
@@ -482,6 +504,11 @@ private:
     using OperationList = std::vector<std::function<void()>>;
     OperationList uncommitted_operations;
     std::deque<OperationList> pending_operations;
+    /// The split back's hold on the entries whose operations uncommitted_operations queued (with
+    /// uncommitted_guard), and the same for each list of pending_operations: the front counts
+    /// their semaphore writes in memory once the list ran (GpuSplit::TrackFencedWrite).
+    VideoCommon::GpuSplit::FencedHold uncommitted_hold;
+    std::deque<VideoCommon::GpuSplit::FencedHold> pending_holds;
     /// Lists the fencing thread ran, kept with their capacity for the next fences (a list grew
     /// from 64 operations at most fences: ~30 a fence at Ocarina of Time's water, in bursts).
     std::vector<OperationList> spare_operations; ///< Guarded by uncommitted_guard

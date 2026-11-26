@@ -6,6 +6,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -53,14 +54,17 @@ public:
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 
-    /// Submits the device graphics queue, updating the tick as necessary
+    /// Submits the device graphics queue, updating the tick as necessary. wait_timeline: a
+    /// timeline semaphore the submission also waits for at wait_value (with timeline semaphores
+    /// only: NVN direct, which needs them, is the one user).
     VkResult SubmitQueue(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
-                         VkSemaphore signal_semaphore, VkSemaphore wait_semaphore, u64 host_tick);
+                         VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
+                         VkSemaphore wait_timeline, u64 wait_value, u64 host_tick);
 
 private:
     VkResult SubmitQueueTimeline(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                                  VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
-                                 u64 host_tick);
+                                 VkSemaphore wait_timeline, u64 wait_value, u64 host_tick);
     VkResult SubmitQueueFence(vk::CommandBuffer& cmdbuf, vk::CommandBuffer& upload_cmdbuf,
                               VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
                               u64 host_tick);
@@ -68,6 +72,9 @@ private:
     void WaitThread(std::stop_token token);
 
     vk::Fence GetFreeFence();
+
+    /// Logs the stall and ends the process (EDEN_NX2_GPU_WATCHDOG).
+    [[noreturn]] void ReportUnresponsive(u64 tick, std::chrono::steady_clock::duration stalled) const;
 
 private:
     const Device& device;             ///< Device.
@@ -83,6 +90,14 @@ private:
     std::deque<vk::Fence> free_queue; ///< Holds available fences for submission.
     std::jthread debug_thread;        ///< Debug thread to workaround validation layer bugs.
     std::jthread wait_thread;         ///< Helper thread that waits for submitted fences.
+    /// EDEN_NX2_GPU_WATCHDOG: how long a timeline wait may see no progress on submitted work
+    /// before the process ends; zero leaves it off.
+    std::chrono::seconds watchdog{};
+    std::atomic<u64> accepted_tick{0}; ///< Latest tick the driver accepted a submission for.
+    std::atomic<s64> accepted_ns{0};
+    std::atomic<u64> present_tick{0}; ///< Latest accepted submission that signals for a present.
+    std::atomic<s64> present_ns{0};
+    std::atomic<u64> present_submits{0};
 };
 
 } // namespace Vulkan

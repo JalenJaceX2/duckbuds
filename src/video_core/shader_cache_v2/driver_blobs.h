@@ -71,6 +71,9 @@ struct DriverBlobOptions {
     /// No blob is stored in a session once the file would take more than this, dead records
     /// included (Full); closing then brings it back under max_bytes
     u64 ceiling_bytes{1ULL << 30};
+    /// When above max_bytes, closing keeps every blob the session used or wrote up to this many
+    /// bytes, past max_bytes and target_bytes if they need it: the limit follows what the game uses
+    u64 session_cap_bytes{0};
     WriterOptions writer{};
 };
 
@@ -78,7 +81,7 @@ struct DriverBlobOptions {
 struct DriverBlobCounts {
     u64 loaded{};       ///< Blobs the file held when it was opened
     u64 loaded_bytes{}; ///< Its size then
-    u64 used{};         ///< Pipelines built from stored blobs
+    u64 used{};         ///< Pipelines built from stored blobs, this session's included
     u64 rejected{};     ///< Stored blobs not taken: damaged, stale, or refused by the driver
     u64 written{};      ///< Blobs queued for the file
     u64 written_bytes{};
@@ -113,7 +116,8 @@ public:
     }
 
     /// The stored payload of this pipeline, read from the file. Empty when there is none, or it is
-    /// damaged (which counts as rejected).
+    /// damaged (which counts as rejected). A payload stored in this session is found once the
+    /// writer has put it in the file.
     [[nodiscard]] std::optional<std::vector<u8>> Find(RecordKind kind, u64 key);
 
     /// A pipeline was built from the payload Find gave
@@ -123,7 +127,7 @@ public:
     void Reject(RecordKind kind, u64 key);
 
     /// Queues the payload of a pipeline for the file, replacing a stored one. A pipeline stored in
-    /// this session isn't stored again.
+    /// this session isn't stored again unless its payload was rejected.
     void Store(RecordKind kind, u64 key, std::span<const u8> payload);
 
     /// The file has reached ceiling_bytes: nothing more is stored this session.
@@ -145,9 +149,15 @@ private:
     struct Entry {
         u64 offset{};
         u32 payload_size{};
+        u32 queued{}; ///< Its records the writer hasn't put in the file yet
         State state{};
-        bool used{}; ///< Used or written in this session
+        bool used{};    ///< Used or written in this session
+        bool written{}; ///< Stored in this session
     };
+
+    /// The writer put these records in the file: the last queued payload of each pipeline is
+    /// found from now on
+    void OnWritten(std::span<const WrittenRecord> records);
 
     struct EntryKey {
         RecordKind kind;

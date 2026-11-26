@@ -9,8 +9,11 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "common/common_funcs.h"
 #include "common/common_types.h"
@@ -30,6 +33,12 @@ struct RendererDeviceInfo {
     std::string model;
     std::string driver;
     std::string api;
+    /// Vulkan only, for bug reports: the API version, device-local memory, the device's
+    /// extensions and the features Lichii checks.
+    std::string api_version;
+    u64 device_local_memory{};
+    std::vector<std::string> extensions;
+    std::vector<std::pair<std::string, bool>> features;
 };
 
 enum class FrameGenState : u8 {
@@ -41,6 +50,7 @@ enum class FrameGenState : u8 {
     UnsupportedSurface,
     MissingLosslessDll,
     NvidiaFrameGen,
+    MissingFlyHigh,
 };
 
 struct FrameGenStatus {
@@ -147,8 +157,9 @@ public:
     /// Returns true if a screenshot is being processed
     bool IsScreenshotPending() const;
 
-    /// Request a screenshot of the next frame.
-    void RequestScreenshot(void* data, std::function<void(bool)> callback,
+    /// Request a screenshot of the next frame. Returns false, and never calls `callback`, when
+    /// another screenshot is already requested.
+    bool RequestScreenshot(void* data, std::function<void(bool)> callback,
                            const Layout::FramebufferLayout& layout,
                            Service::Nvnflinger::LayerStackId layer_stack =
                                Service::Nvnflinger::LayerStackId::Default);
@@ -163,6 +174,10 @@ protected:
     RendererDeviceInfo device_info;
 
 private:
+    /// Serializes requesters (the frontend, the debug server, the frame capture) so that only one
+    /// of them claims a free screenshot slot.
+    std::mutex screenshot_request_mutex;
+
     /// Updates the framebuffer layout of the contained render window handle.
     void UpdateCurrentFramebufferLayout();
 };

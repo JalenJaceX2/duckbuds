@@ -29,6 +29,7 @@
 #include "core/file_sys/vfs/vfs.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/loader/loader.h"
+#include "video_core/shader_warm/emission_stamp.h"
 #include "video_core/shader_warm/shader_archives.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #include "video_core/shader_warm/warm_records.h"
@@ -42,9 +43,9 @@ constexpr std::string_view StageReading = "Reading game files";
 constexpr std::string_view StageExtracting = "Extracting shaders";
 constexpr std::string_view StageConverting = "Converting";
 constexpr std::string_view StageWriting = "Writing";
+constexpr std::string_view StagePacks = "Reading asset packs (MiB)";
 /// Conversions in flight (each holds a copy of its program).
 constexpr size_t MaxPendingJobs = 2048;
-constexpr u32 PrecachedPipelinesMagic = 0x31504750; // "PGP1"
 
 fs::path TitleDir(u64 title_id) {
     return Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
@@ -320,27 +321,55 @@ u64 ReadWarmCount(const fs::path& warm_file) {
     return !ec && actual == size ? entries : 0;
 }
 
+u64 EmissionStamp() {
+    return GeneratedEmissionStamp;
+}
+
 std::optional<WarmStamp> CurrentWarmStamp(const fs::path& warm_file, u64 entries, u32 driver,
-                                          u32 device_id, u32 cache_version) {
+                                          u32 device_id, u32 cache_version, u64 variant) {
     std::error_code ec;
     const auto size = fs::file_size(warm_file, ec);
     if (ec) {
         return std::nullopt;
     }
-    const auto time = fs::last_write_time(warm_file, ec);
-    if (ec) {
+    // Hashed in chunks (the file is ~70 MB): tens of milliseconds at boot.
+    std::ifstream in(warm_file, std::ios::binary);
+    if (!in) {
         return std::nullopt;
     }
-    return WarmStamp{size,      static_cast<s64>(time.time_since_epoch().count()),
-                     entries,   driver,
-                     device_id, cache_version};
+    std::vector<char> chunk(8u << 20);
+    u64 hash = size;
+    u64 read_total = 0;
+    while (in) {
+        in.read(chunk.data(), static_cast<std::streamsize>(chunk.size()));
+        const auto got = static_cast<size_t>(in.gcount());
+        if (got == 0) {
+            break;
+        }
+        hash = Common::CityHash64WithSeed(chunk.data(), got, hash);
+        read_total += got;
+    }
+    if (read_total != size) {
+        return std::nullopt;
+    }
+    return WarmStamp{.size = size,
+                     .content_hash = hash,
+                     .entries = entries,
+                     .driver = driver,
+                     .device_id = device_id,
+                     .cache_version = cache_version,
+                     .variant = variant};
 }
 
 std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
     std::ifstream in(WarmMarkerPath(warm_file));
     WarmStamp stamp;
-    if (!(in >> stamp.size >> stamp.write_time >> stamp.entries >> stamp.driver >>
-          stamp.device_id >> stamp.cache_version)) {
+    // A marker of the older format (last-write time, no variant) fails here: the compute
+    // programs not in the cache are built once more.
+    std::string format;
+    if (!(in >> format) || format != "v2" ||
+        !(in >> stamp.size >> stamp.content_hash >> stamp.entries >> stamp.driver >>
+          stamp.device_id >> stamp.cache_version >> stamp.variant)) {
         return std::nullopt;
     }
     return stamp;
@@ -348,9 +377,82 @@ std::optional<WarmStamp> ReadWarmMarker(const fs::path& warm_file) {
 
 bool WriteWarmMarker(const fs::path& warm_file, const WarmStamp& stamp) {
     std::ofstream out(WarmMarkerPath(warm_file), std::ios::trunc);
-    out << stamp.size << ' ' << stamp.write_time << ' ' << stamp.entries << ' ' << stamp.driver
-        << ' ' << stamp.device_id << ' ' << stamp.cache_version << '\n';
+    out << "v2 " << stamp.size << ' ' << stamp.content_hash << ' ' << stamp.entries << ' '
+        << stamp.driver << ' ' << stamp.device_id << ' ' << stamp.cache_version << ' '
+        << stamp.variant << '\n';
     out.close();
+    return static_cast<bool>(out);
+}
+
+void DropStaleWarmMarker(const fs::path& warm_file, const fs::path& new_file) {
+    if (const auto marker = ReadWarmMarker(warm_file)) {
+        const auto incoming = CurrentWarmStamp(new_file, 0, 0, 0, 0);
+        if (incoming && incoming->size == marker->size &&
+            incoming->content_hash == marker->content_hash) {
+            return;
+        }
+    }
+    std::error_code ignored;
+    fs::remove(WarmMarkerPath(warm_file), ignored);
+}
+
+fs::path WarmProgressPath(const fs::path& warm_file) {
+    fs::path progress = warm_file;
+    progress.replace_extension(".progress");
+    return progress;
+}
+
+std::unordered_set<u64> ReadWarmProgress(const fs::path& warm_file, const WarmStamp& current) {
+    std::ifstream in(WarmProgressPath(warm_file));
+    WarmStamp stamp;
+    std::string format;
+    if (!(in >> format) || format != "v1" ||
+        !(in >> stamp.size >> stamp.content_hash >> stamp.entries >> stamp.driver >>
+          stamp.device_id >> stamp.cache_version >> stamp.variant) ||
+        !stamp.Matches(current)) {
+        return {};
+    }
+    std::unordered_set<u64> built;
+    u64 key{};
+    while (in >> std::hex >> key) {
+        built.insert(key);
+    }
+    return built;
+}
+
+bool WriteWarmProgress(const fs::path& warm_file, const WarmStamp& stamp,
+                       const std::unordered_set<u64>& built) {
+    std::ofstream out(WarmProgressPath(warm_file), std::ios::trunc);
+    out << "v1 " << stamp.size << ' ' << stamp.content_hash << ' ' << stamp.entries << ' '
+        << stamp.driver << ' ' << stamp.device_id << ' ' << stamp.cache_version << ' '
+        << stamp.variant << '\n'
+        << std::hex;
+    for (const u64 key : built) {
+        out << key << '\n';
+    }
+    out.close();
+    return static_cast<bool>(out);
+}
+
+fs::path WarmRequestPath(const fs::path& warm_file) {
+    fs::path request = warm_file;
+    request.replace_extension(".requested");
+    return request;
+}
+
+bool WarmRequested(const fs::path& warm_file) {
+    std::error_code ec;
+    return fs::exists(WarmRequestPath(warm_file), ec);
+}
+
+bool SetWarmRequested(const fs::path& warm_file, bool requested) {
+    std::error_code ec;
+    if (!requested) {
+        fs::remove(WarmRequestPath(warm_file), ec);
+        return !ec;
+    }
+    fs::create_directories(warm_file.parent_path(), ec);
+    std::ofstream out(WarmRequestPath(warm_file), std::ios::trunc);
     return static_cast<bool>(out);
 }
 
@@ -377,56 +479,15 @@ bool TakeSkipWarm() {
     return skip_warm.exchange(false, std::memory_order_relaxed);
 }
 
-fs::path PrecachedPipelinesPath(u64 title_id) {
-    return TitleDir(title_id) / "precache-graphics.bin";
-}
-
-std::unordered_set<u64> ReadPrecachedPipelines(const fs::path& file, const DriverStamp& stamp) {
-    std::unordered_set<u64> hashes;
-    std::ifstream in(file, std::ios::binary);
-    u32 magic{};
-    DriverStamp saved;
-    u64 count{};
-    if (!in.read(reinterpret_cast<char*>(&magic), sizeof(magic)) ||
-        magic != PrecachedPipelinesMagic ||
-        !in.read(reinterpret_cast<char*>(&saved.driver), sizeof(saved.driver)) ||
-        !in.read(reinterpret_cast<char*>(&saved.device_id), sizeof(saved.device_id)) ||
-        !in.read(reinterpret_cast<char*>(&saved.cache_version), sizeof(saved.cache_version)) ||
-        !in.read(reinterpret_cast<char*>(&count), sizeof(count)) || saved != stamp) {
-        return hashes;
-    }
-    for (u64 i = 0; i < count; ++i) {
-        u64 hash{};
-        if (!in.read(reinterpret_cast<char*>(&hash), sizeof(hash))) {
-            break;
-        }
-        hashes.insert(hash);
-    }
-    return hashes;
-}
-
-bool WritePrecachedPipelines(const fs::path& file, const DriverStamp& stamp,
-                             const std::unordered_set<u64>& hashes) {
-    std::ofstream out(file, std::ios::binary | std::ios::trunc);
-    Write(out, PrecachedPipelinesMagic);
-    Write(out, stamp.driver);
-    Write(out, stamp.device_id);
-    Write(out, stamp.cache_version);
-    Write(out, static_cast<u64>(hashes.size()));
-    for (const u64 hash : hashes) {
-        Write(out, hash);
-    }
-    out.close();
-    return static_cast<bool>(out);
-}
-
 bool DeleteWarmFiles(u64 title_id, std::string* error) {
+    LOG_INFO(Render_Vulkan, "Shader precache: deleting the precache files of {:016x}", title_id);
     const auto warm = ComputeWarmPath(title_id);
     fs::path tmp = warm;
     tmp += ".tmp";
     bool ok = true;
     for (const auto& path :
-         {warm, WarmMarkerPath(warm), WarmCountPath(warm), tmp, PrecachedPipelinesPath(title_id)}) {
+         {warm, WarmMarkerPath(warm), WarmCountPath(warm), WarmProgressPath(warm),
+          WarmRequestPath(warm), tmp, TitleDir(title_id) / "precache-graphics.bin"}) {
         std::error_code ec;
         fs::remove(path, ec);
         if (ec) {
@@ -517,6 +578,7 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     // each package's effects, sorted by path inside a package (see ClassifyGameFile).
     std::vector<ArchiveFile> archives;
     std::vector<ArchiveFile> effects;
+    std::vector<ArchiveFile> packs;
     ZstdDictionaries dictionaries;
     FileSys::VirtualFile dictionary_pack;
     for (const auto& romfs : game.romfs) {
@@ -537,6 +599,9 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
                 dictionary_pack = file.file; // the newest package wins
                 break;
             case GameFileKind::Other:
+                if (IsFramePack(file.file->ReadBytes(4, 0), file.path, file.file->GetSize())) {
+                    packs.push_back(file);
+                }
                 break;
             }
         }
@@ -553,8 +618,10 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     // Without archives the file is written empty: the precache then has only the pipeline cache
     // of earlier sessions to build.
     result.archives = archives.size();
-    LOG_INFO(Render_Vulkan, "Shader precache build: {} archives, {} zstd dictionaries",
-             archives.size(), dictionaries.Count());
+    result.packs = packs.size();
+    LOG_INFO(Render_Vulkan,
+             "Shader precache build: {} archives, {} asset packs, {} zstd dictionaries",
+             archives.size(), packs.size(), dictionaries.Count());
 
     compute_out.open(compute_tmp, std::ios::binary | std::ios::trunc);
     if (!compute_out) {
@@ -569,9 +636,8 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     size_t seq = 0;
 
     const size_t threads =
-        options.threads != 0
-            ? options.threads
-            : std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 2, 6);
+        options.threads != 0 ? options.threads
+                             : std::max<size_t>(std::thread::hardware_concurrency(), 1);
     auto converter = std::make_unique<Converter>(threads, stop);
 
     // Consumes finished conversions in submission order (first program wins on equal keys).
@@ -596,6 +662,32 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         }
     };
 
+    // Every program the readers find, from archives and asset packs alike
+    const auto on_record = [&](const ShaderRecord& record) {
+        if (record.stage != ProgramStage::Compute) {
+            return;
+        }
+        if (!compute_identities.insert(PairHash{Hash128(record.code), Hash128(record.control)})
+                 .second) {
+            return;
+        }
+        const auto values = ReadComputeControl(record.control);
+        if (!values || !values->workgroup[0] || !values->workgroup[1] || !values->workgroup[2]) {
+            ++result.skipped;
+            return;
+        }
+        Job job;
+        job.control = *values;
+        job.seq = seq++;
+        job.program.assign(record.code.begin(), record.code.end());
+        converter->Push(std::move(job));
+        while (converter->Pending() > MaxPendingJobs && !stop.stop_requested()) {
+            if (auto r = converter->Next(true)) {
+                consume(std::move(*r));
+            }
+        }
+    };
+
     for (size_t archive_index = 0; archive_index < archives.size(); ++archive_index) {
         if (stop.stop_requested()) {
             converter.reset();
@@ -605,31 +697,6 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         const auto& archive = archives[archive_index];
         const auto data = archive.file->ReadAllBytes();
         const auto name = archive.path.substr(archive.path.rfind('/') + 1);
-        const auto on_record = [&](const ShaderRecord& record) {
-            if (record.stage != ProgramStage::Compute) {
-                return;
-            }
-            if (!compute_identities.insert(PairHash{Hash128(record.code), Hash128(record.control)})
-                     .second) {
-                return;
-            }
-            const auto values = ReadComputeControl(record.control);
-            if (!values || !values->workgroup[0] || !values->workgroup[1] ||
-                !values->workgroup[2]) {
-                ++result.skipped;
-                return;
-            }
-            Job job;
-            job.control = *values;
-            job.seq = seq++;
-            job.program.assign(record.code.begin(), record.code.end());
-            converter->Push(std::move(job));
-            while (converter->Pending() > MaxPendingJobs && !stop.stop_requested()) {
-                if (auto r = converter->Next(true)) {
-                    consume(std::move(*r));
-                }
-            }
-        };
         const auto on_member_error = [&](const std::string& error) {
             ++member_errors;
             LOG_DEBUG(Render_Vulkan, "Shader precache: {}: {}", archive.path, error);
@@ -643,6 +710,44 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
         drain();
     }
     report(StageExtracting, archives.size(), archives.size());
+
+    // Asset packs, read a window at a time: Kirby Air Riders' is 16.6 GB.
+    u64 pack_bytes = 0;
+    for (const auto& pack : packs) {
+        pack_bytes += pack.file->GetSize();
+    }
+    u64 packs_done = 0;
+    FrameScanResult frames;
+    for (const auto& pack : packs) {
+        const u64 size = pack.file->GetSize();
+        const auto read = [&](u64 offset, size_t length) {
+            report(StagePacks, static_cast<size_t>((packs_done + offset) >> 20),
+                   static_cast<size_t>(pack_bytes >> 20));
+            auto bytes = pack.file->ReadBytes(length, static_cast<size_t>(offset));
+            drain();
+            return bytes;
+        };
+        const size_t compute_before = seq;
+        const auto scanned = ScanFrames(size, read, &dictionaries, on_record, stop);
+        frames.frames += scanned.frames;
+        frames.failed += scanned.failed;
+        frames.oversized += scanned.oversized;
+        frames.bytes_read += scanned.bytes_read;
+        packs_done += size;
+        LOG_INFO(Render_Vulkan,
+                 "Shader precache: {}: {} zstd frames, {} failed, {} too large, {} new compute "
+                 "programs",
+                 pack.path, scanned.frames, scanned.failed, scanned.oversized,
+                 seq - compute_before);
+        if (scanned.stopped) {
+            converter.reset();
+            return fail("Stopped");
+        }
+        if (scanned.read_failed) {
+            converter.reset();
+            return fail(fmt::format("Reading {} failed", pack.path));
+        }
+    }
 
     const size_t total_jobs = seq;
     while (consumed < total_jobs) {
@@ -663,9 +768,10 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     if (!compute_out) {
         return fail("Writing the precache file failed");
     }
-    // A new file: the marker and count of the old one no longer apply.
+    // A new file: the count of the old one no longer applies, and its marker only when the
+    // contents changed (the marker also carries the driver and variant, checked at boot).
+    DropStaleWarmMarker(compute_path, compute_tmp);
     std::error_code ignored;
-    fs::remove(WarmMarkerPath(compute_path), ignored);
     fs::remove(WarmCountPath(compute_path), ignored);
     fs::rename(compute_tmp, compute_path, ec);
     if (ec) {
@@ -676,8 +782,9 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     result.ok = true;
     LOG_INFO(Render_Vulkan,
              "Shader precache build for {:016x}: {} compute entries, {} programs skipped, {} "
-             "archive and {} member errors, {:.1f} s",
+             "archive and {} member errors, {} pack frames ({} failed, {} too large), {:.1f} s",
              title_id, result.compute_programs, result.skipped, archive_errors, member_errors,
+             frames.frames, frames.failed, frames.oversized,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
     return result;
 }

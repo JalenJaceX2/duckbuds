@@ -244,6 +244,10 @@ struct TextureDescriptor {
     /// Whether the constant buffer word above reaches the handle only as the address of a load:
     /// a pointer, never a texture handle, which binds no texture (see HandleIsStoragePointer)
     bool handle_is_pointer_word{};
+    /// Whether the texture is read from the texture and sampler pools by the handle the shader
+    /// computes (HostTranslateInfo::support_pool_textures): no constant buffer word, the
+    /// instruction's index operand is the handle
+    bool is_pool{};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
@@ -263,6 +267,10 @@ struct ImageDescriptor {
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
     /// storage buffer), ~0 when it is the constant buffer word.
     u32 handle_program{~0U};
+    /// Whether the image is read from the image pool by the handle the shader computes
+    /// (HostTranslateInfo::support_pool_textures): no constant buffer word, the instruction's
+    /// index operand is the handle
+    bool is_pool{};
 
     auto operator<=>(const ImageDescriptor&) const = default;
 };
@@ -325,6 +333,9 @@ struct Info {
     bool stores_tess_level_inner{};
 
     bool stores_indexed_attributes{};
+    /// The vertex shader stores one value to position z and w, putting every vertex on viewport
+    /// 0's far plane (z / w = 1), the usual way to draw a sky
+    bool position_on_far_plane{};
 
     bool stores_global_memory{};
     bool uses_local_memory{};
@@ -343,8 +354,11 @@ struct Info {
     bool uses_sparse_residency{};
     bool uses_demote_to_helper_invocation{};
     bool uses_subgroup_vote{};
-    /// Set when a barrier in conditional control flow was dropped, see ConditionalBarrierPass.
-    bool removed_conditional_barrier{};
+    /// Set when a barrier in divergent control flow lost its execution barrier, see
+    /// ConditionalBarrierPass.
+    bool demoted_conditional_barrier{};
+    /// Set when ConditionalBarrierPass made barriers wait only while the workgroup's branches agree
+    bool uses_barrier_vote{};
     bool uses_subgroup_mask{};
     bool uses_fswzadd{};
     bool uses_derivatives{};

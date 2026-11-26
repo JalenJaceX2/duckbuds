@@ -23,6 +23,7 @@
 #include <QGuiApplication>
 #include <QStringLiteral>
 #include "core/frontend/emu_window.h"
+#include "qt_common/util/game.h"
 #include "qt_common/util/meta.h"
 
 #include <QFile>
@@ -218,7 +219,7 @@ void Init(QWidget* root) {
 
     system = std::make_unique<Core::System>();
     vfs = std::make_unique<FileSys::RealVfsFilesystem>();
-    provider = std::make_unique<FileSys::ManualContentProvider>();
+    provider = std::make_unique<FileSys::ManualContentProvider>(Game::ReadHomeMenuArtwork);
 
     // initialization stuff
     Common::FS::CreateEdenPaths();
@@ -271,6 +272,13 @@ void Init(QWidget* root) {
 #endif
     LOG_INFO(Frontend, "Host CPU Threads: {}", processor_count);
     LOG_INFO(Frontend, "Host OS: {}", PrettyProductName().toStdString());
+#ifdef __unix__
+    LOG_INFO(Frontend, "Qt platform: {} | Session type: {}",
+             QGuiApplication::platformName().toStdString(),
+             qEnvironmentVariable("XDG_SESSION_TYPE", QStringLiteral("unknown")).toStdString());
+#else
+    LOG_INFO(Frontend, "Qt platform: {}", QGuiApplication::platformName().toStdString());
+#endif
     LOG_INFO(Frontend, "Host RAM: {:.2f} GiB",
              Common::GetMemInfo().TotalPhysicalMemory / f64{1_GiB});
     LOG_INFO(Frontend, "Host Swap: {:.2f} GiB", Common::GetMemInfo().TotalSwapMemory / f64{1_GiB});

@@ -2,8 +2,10 @@
 
 #pragma once
 
+#include <array>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <vector>
 #include "common/common_types.h"
@@ -36,6 +38,7 @@ public:
     u64 GetProgramTitleID() const;
     u64 GetExtractedTitleID() const;
     std::vector<u64> GetProgramTitleIDs() const;
+    std::vector<u64> GetApplicationProgramTitleIDs() const;
 
     bool IsExtractedType() const;
 
@@ -52,6 +55,8 @@ public:
                                 TitleType title_type = TitleType::Application) const;
     VirtualFile GetNCAFile(u64 title_id, ContentRecordType type,
                            TitleType title_type = TitleType::Application) const;
+    VirtualFile GetPackedUpdateFile(u64 program_id) const;
+    VirtualFile GetNCAFileById(const std::array<u8, 16>& id) const;
 
     std::vector<VirtualFile> GetFiles() const override;
 
@@ -73,12 +78,16 @@ private:
 
     bool extracted = false;
     Loader::ResultStatus status;
+    Loader::ResultStatus nca_error;
     std::map<u64, Loader::ResultStatus> program_status;
 
     std::shared_ptr<PartitionFilesystem> pfs;
+    mutable std::mutex resolved_nca_files_mutex;
+    mutable std::map<std::array<u8, 16>, VirtualFile> resolved_nca_files;
     // Map title id -> {map type -> NCA}
     std::map<u64, std::map<std::pair<TitleType, ContentRecordType>, std::shared_ptr<NCA>>> ncas;
     std::set<u64> program_ids;
+    std::set<u64> application_program_ids;
     std::vector<VirtualFile> ticket_files;
 
     Core::Crypto::KeyManager& keys;

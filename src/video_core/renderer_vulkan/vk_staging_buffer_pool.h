@@ -6,9 +6,11 @@
 #pragma once
 
 #include <climits>
+#include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
+#include "video_core/buffer_cache/command_arena.h"
 
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -32,8 +34,12 @@ class StagingBufferPool {
 public:
     static constexpr size_t NUM_SYNCS = 16;
 
+    /// clock: the buffer side's pool (EDEN_NX2_BUFFER_ARENA) tags its memory with the arena's
+    /// stamps instead of scheduler ticks. Two pools share one stream buffer's size (divisor 2).
     explicit StagingBufferPool(const Device& device, MemoryAllocator& memory_allocator,
-                               Scheduler& scheduler);
+                               Scheduler& scheduler,
+                               const VideoCommon::ArenaClock* clock = nullptr,
+                               u32 stream_divisor = 1);
     ~StagingBufferPool();
 
     StagingBufferRef Request(size_t size, MemoryUsage usage, bool deferred = false);
@@ -44,6 +50,10 @@ public:
     }
 
     void TickFrame();
+
+    /// Out of device memory: waits for the submitted work without submitting, then frees every
+    /// staging buffer the GPU is done with. Those handed out since the last submit stay.
+    void ReleaseMemory();
 
     /// Bytes of the cached staging buffers of a kind, idle or in use (EDEN_NX2_MEM_TRACE).
     [[nodiscard]] u64 CachedBytes(MemoryUsage usage);
@@ -62,7 +72,6 @@ private:
         u32 log2_level;
         u64 index;
         u64 tick = 0;
-        bool deferred{};
 
         StagingBufferRef Ref() const noexcept {
             return {
@@ -79,6 +88,10 @@ private:
 
     struct StagingBuffers {
         std::vector<StagingBuffer> entries;
+        /// Handed out deferred, by index, until FreeDeferred: lookups don't scan them. Tens of
+        /// thousands of copies of GPU-written command list pages stay held in Hyrule Warriors:
+        /// Age of Imprisonment fights, which made each dispatch's copies scan them all.
+        std::unordered_map<u64, StagingBuffer> deferred;
         size_t delete_index = 0;
         size_t iterate_index = 0;
     };
@@ -101,7 +114,13 @@ private:
 
     void ReleaseCache(MemoryUsage usage);
 
+    /// Frees every staging buffer the GPU is done with, of every kind (out of memory).
+    void ReleaseIdleBuffers();
+
     void ReleaseLevel(StagingBuffersCache& cache, size_t log2);
+    [[nodiscard]] u64 Now() const noexcept;
+    [[nodiscard]] bool IsFree(u64 tick) const noexcept;
+
     size_t Region(size_t iter) const noexcept {
         return iter / region_size;
     }
@@ -109,6 +128,7 @@ private:
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
+    const VideoCommon::ArenaClock* clock;
 
     vk::Buffer stream_buffer;
     VkDeviceAddress stream_buffer_address{};

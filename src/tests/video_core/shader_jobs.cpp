@@ -3,9 +3,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -253,6 +255,31 @@ TEST_CASE("Shader jobs age Background jobs into Soon order", "[video_core][shade
         REQUIRE(order.Get() ==
                 (aging ? std::vector<int>{4, 1, 2, 3} : std::vector<int>{4, 2, 3, 1}));
     }
+}
+
+TEST_CASE("Shader jobs alternate an aged Background backlog with Soon jobs",
+          "[video_core][shader_jobs]") {
+    auto config = Config(1, 1);
+    config.background_aging = 1ms;
+    ShaderJobScheduler scheduler{config};
+    Gate gate;
+    const auto blocker = Block(scheduler, gate);
+    Order order;
+    std::vector<ShaderJobHandle> handles;
+    for (int id = 0; id < 1000; ++id) {
+        handles.push_back(scheduler.Submit(CpuJob(Background, [&order, id] { order.Add(id); })));
+    }
+    std::this_thread::sleep_for(20ms);
+    handles.push_back(scheduler.Submit(CpuJob(Soon, [&] { order.Add(-1); })));
+    handles.push_back(scheduler.Submit(CpuJob(Soon, [&] { order.Add(-2); })));
+    gate.Open();
+    for (const auto& handle : handles) {
+        handle.Wait();
+    }
+    blocker.Wait();
+    const auto ids = order.Get();
+    REQUIRE(ids.size() == 1002);
+    REQUIRE(std::vector<int>(ids.begin(), ids.begin() + 5) == std::vector<int>{0, -1, 1, -2, 2});
 }
 
 TEST_CASE("Shader job budget admits by in-flight bytes", "[video_core][shader_jobs]") {
@@ -568,6 +595,14 @@ TEST_CASE("Shader job stage exceptions fail only that job", "[video_core][shader
     REQUIRE(stats.in_flight_bytes == 0);
 }
 
+// On macOS a stage RunOrWait takes runs on a thread with a larger stack that the caller joins.
+// The tests below show it ran there by the workers being busy while it finished.
+#ifdef __APPLE__
+constexpr bool StagesRunOnCaller = false;
+#else
+constexpr bool StagesRunOnCaller = true;
+#endif
+
 TEST_CASE("RunOrWait runs a queued job on the waiting thread", "[video_core][shader_jobs]") {
     ShaderJobScheduler scheduler{Config(1, 1)};
     Gate gate;
@@ -585,11 +620,53 @@ TEST_CASE("RunOrWait runs a queued job on the waiting thread", "[video_core][sha
     REQUIRE(timed_out);
     REQUIRE(job.Status() == ShaderJobStatus::Done);
     REQUIRE(job.Priority() == NeedNow);
-    REQUIRE(cpu_thread == std::this_thread::get_id());
-    REQUIRE(driver_thread == std::this_thread::get_id());
+    if constexpr (StagesRunOnCaller) {
+        REQUIRE(cpu_thread == std::this_thread::get_id());
+    }
+    REQUIRE(driver_thread == cpu_thread);
     REQUIRE(stats.priorities[0].done == 1);
     REQUIRE(stats.priorities[0].running == 1);
     REQUIRE(blocker.Status() == ShaderJobStatus::Done);
+}
+
+TEST_CASE("RunOrWait runs the driver stage of a job whose CPU stage it waited out",
+          "[video_core][shader_jobs]") {
+    ShaderJobScheduler scheduler{Config(1, 1)};
+    Gate driver_gate;
+    const auto busy_driver = scheduler.Submit(
+        TwoStageJob(Background, [](ShaderJobContext&) {}, [&driver_gate] { driver_gate.Wait(); }));
+    WaitForStatus(busy_driver, ShaderJobStatus::Driver);
+
+    Gate cpu_gate;
+    std::thread::id driver_thread;
+    const auto job = scheduler.Submit(TwoStageJob(
+        Background, [&cpu_gate](ShaderJobContext&) { cpu_gate.Wait(); },
+        [&driver_thread] { driver_thread = std::this_thread::get_id(); }));
+    WaitForStatus(job, ShaderJobStatus::Cpu);
+
+    std::promise<std::thread::id> waiter_id;
+    auto waited = waiter_id.get_future();
+    std::thread waiter{[&] {
+        scheduler.RunOrWait(job);
+        waiter_id.set_value(std::this_thread::get_id());
+    }};
+    while (job.Priority() != NeedNow) {
+        std::this_thread::sleep_for(1ms);
+    }
+    std::this_thread::sleep_for(20ms);
+    cpu_gate.Open();
+    const bool returned = waited.wait_for(5s) == std::future_status::ready;
+    const bool driver_still_busy = busy_driver.Status() == ShaderJobStatus::Driver;
+    driver_gate.Open();
+    waiter.join();
+    busy_driver.Wait();
+
+    REQUIRE(returned);
+    REQUIRE(driver_still_busy);
+    REQUIRE(job.Status() == ShaderJobStatus::Done);
+    if constexpr (StagesRunOnCaller) {
+        REQUIRE(driver_thread == waited.get());
+    }
 }
 
 #ifdef __linux__
@@ -717,7 +794,7 @@ TEST_CASE("ParallelFor calls every index once, helped by the calling thread",
     const auto self = std::this_thread::get_id();
     std::atomic<int> here{};
     VideoCommon::ParallelFor(scheduler, 50, [&](size_t) {
-        if (std::this_thread::get_id() == self) {
+        if (!StagesRunOnCaller || std::this_thread::get_id() == self) {
             ++here;
         }
     });
@@ -746,45 +823,114 @@ struct TestPipeline {
 using TestPrebuild = Vulkan::ScheduledPrebuild<int, TestPipeline>;
 } // namespace
 
-TEST_CASE("A lookup builds a queued prebuild once, on the looking thread",
+TEST_CASE("A lookup drops a queued prebuild for the caller to build",
           "[video_core][shader_jobs]") {
     ShaderJobScheduler scheduler{Config(1, 1)};
     Gate gate;
     const auto blocker = Block(scheduler, gate);
     std::atomic<int> builds{};
     std::atomic<int> translations{};
-    std::thread::id translated_on;
-    TestPrebuild prebuild{scheduler, 100};
-    REQUIRE(prebuild.Add(1, 60, 0, 0, [&] {
+    TestPrebuild prebuild{scheduler};
+    REQUIRE(prebuild.Add(1, 0, 0, [&] {
         ++translations;
-        translated_on = std::this_thread::get_id();
         return std::make_unique<TestPipeline>(builds);
     }));
-    REQUIRE_FALSE(prebuild.Add(1, 1, 0, 0, [&] { return std::make_unique<TestPipeline>(builds); }));
-    REQUIRE_FALSE(prebuild.Add(2, 41, 0, 0, [&] { return std::make_unique<TestPipeline>(builds); }));
+    REQUIRE_FALSE(prebuild.Add(1, 0, 0, [&] { return std::make_unique<TestPipeline>(builds); }));
 
-    const auto pipeline = prebuild.Take(1);
-    REQUIRE(pipeline != nullptr);
-    REQUIRE(builds == 1);
-    REQUIRE(translations == 1);
-    REQUIRE(translated_on == std::this_thread::get_id());
+    std::optional<std::chrono::steady_clock::duration> waited;
+    REQUIRE(prebuild.Take(1, &waited) == nullptr);
+    REQUIRE_FALSE(waited.has_value());
+    REQUIRE(translations == 0);
+    REQUIRE(builds == 0);
     REQUIRE(prebuild.Take(1) == nullptr);
 
-    // Its capture was let go once translated; one that doesn't translate gives nothing.
-    REQUIRE(prebuild.Add(2, 100, 0, 0, [] { return std::unique_ptr<TestPipeline>{}; }));
+    // One that doesn't translate gives nothing.
+    REQUIRE(prebuild.Add(2, 0, 0, [] { return std::unique_ptr<TestPipeline>{}; }));
     REQUIRE(prebuild.Take(2) == nullptr);
     REQUIRE(prebuild.Take(3) == nullptr);
     gate.Open();
     scheduler.RunOrWait(blocker);
 }
 
+TEST_CASE("A lookup waits for a prebuild a worker is building", "[video_core][shader_jobs]") {
+    ShaderJobScheduler scheduler{Config(1, 1)};
+    Gate translating;
+    Gate release;
+    std::atomic<int> builds{};
+    TestPrebuild prebuild{scheduler};
+    REQUIRE(prebuild.Add(1, 0, 0, [&] {
+        translating.Open();
+        release.Wait();
+        return std::make_unique<TestPipeline>(builds);
+    }));
+    translating.Wait();
+    std::thread opener{[&release] {
+        std::this_thread::sleep_for(50ms);
+        release.Open();
+    }};
+    std::optional<std::chrono::steady_clock::duration> waited;
+    const auto pipeline = prebuild.Take(1, &waited);
+    opener.join();
+    REQUIRE(pipeline != nullptr);
+    REQUIRE(waited.has_value());
+    REQUIRE(builds == 1);
+}
+
+TEST_CASE("A nonwaiting lookup leaves the running prebuild registered until it completes",
+          "[video_core][shader_jobs][prebuild]") {
+    struct BlockingPipeline {
+        Gate& building;
+        Gate& release;
+        int builds{};
+
+        void Build() {
+            ++builds;
+            building.Open();
+            release.Wait();
+        }
+        bool Failed() const {
+            return false;
+        }
+    };
+
+    ShaderJobScheduler scheduler{Config(1, 1)};
+    Gate building;
+    Gate release;
+    Vulkan::ScheduledPrebuild<int, BlockingPipeline> prebuild{scheduler};
+    const auto translate = [&] {
+        return std::make_unique<BlockingPipeline>(building, release);
+    };
+    ShaderJobHandle job;
+    REQUIRE(prebuild.Add(1, 0, 0, translate, &job));
+    building.Wait();
+
+    auto lookup = std::async(std::launch::async, [&] { return prebuild.TryTakeReady(1); });
+    const auto status = lookup.wait_for(2s);
+    const bool still_registered =
+        status == std::future_status::ready && !prebuild.Add(1, 0, 0, translate);
+    release.Open();
+    REQUIRE(status == std::future_status::ready);
+    REQUIRE_FALSE(lookup.get().has_value());
+    REQUIRE(still_registered);
+
+    job.Wait();
+    const auto ready = prebuild.TryTakeReady(1);
+    REQUIRE(ready.has_value());
+    REQUIRE(*ready != nullptr);
+    REQUIRE((*ready)->builds == 1);
+    const auto missing = prebuild.TryTakeReady(1);
+    REQUIRE(missing.has_value());
+    REQUIRE(*missing == nullptr);
+    REQUIRE(prebuild.Finished()->taken_unfinished == 0);
+}
+
 TEST_CASE("Prebuilds built in the background are taken without building again",
           "[video_core][shader_jobs]") {
     ShaderJobScheduler scheduler{Config(2, 2)};
     std::atomic<int> builds{};
-    TestPrebuild prebuild{scheduler, 1 << 20};
+    TestPrebuild prebuild{scheduler};
     for (int key = 0; key < 20; ++key) {
-        REQUIRE(prebuild.Add(key, 10, 0, 0, [&builds, key] {
+        REQUIRE(prebuild.Add(key, 0, 0, [&builds, key] {
             return std::make_unique<TestPipeline>(builds, key % 4 == 0);
         }));
     }
@@ -798,15 +944,98 @@ TEST_CASE("Prebuilds built in the background are taken without building again",
     REQUIRE(builds == 20);
 }
 
+TEST_CASE("A prebuild reports what became of its builds once all have ended",
+          "[video_core][shader_jobs]") {
+    ShaderJobScheduler scheduler{Config(1, 1)};
+    Gate gate;
+    const auto blocker = Block(scheduler, gate);
+    std::atomic<int> builds{};
+    TestPrebuild prebuild{scheduler};
+    REQUIRE(prebuild.Add(0, 0, 0, [&] { return std::make_unique<TestPipeline>(builds); }));
+    REQUIRE(prebuild.Add(1, 0, 0, [] { return std::unique_ptr<TestPipeline>{}; }));
+    REQUIRE(prebuild.Add(2, 0, 0, [&] { return std::make_unique<TestPipeline>(builds, true); }));
+    REQUIRE(prebuild.Add(3, 0, 0, [&] { return std::make_unique<TestPipeline>(builds); }));
+
+    // Taken while queued: dropped, so no wait to report
+    std::optional<std::chrono::steady_clock::duration> waited;
+    REQUIRE(prebuild.Take(3, &waited) == nullptr);
+    REQUIRE_FALSE(waited.has_value());
+    REQUIRE_FALSE(prebuild.Finished().has_value());
+
+    gate.Open();
+    scheduler.RunOrWait(blocker);
+    prebuild.Batch().Wait();
+    const auto outcome = prebuild.Finished();
+    REQUIRE(outcome.has_value());
+    REQUIRE(outcome->built == 1);
+    REQUIRE(outcome->failed == 2);
+    REQUIRE(outcome->taken_unfinished == 1);
+    REQUIRE(outcome->unclaimed == 1);
+    // Pipelines 0 and 2 reached the driver (2 failed there), in whichever range a loaded host
+    // put them
+    size_t fast{}, medium{}, slow{};
+    REQUIRE(std::sscanf(outcome->driver_builds.Summary().c_str(),
+                        "%zu under 10 ms, %zu 10-100 ms, %zu over 100 ms", &fast, &medium,
+                        &slow) == 3);
+    REQUIRE(fast + medium + slow == 2);
+
+    // Taken once built: no wait to report
+    std::optional<std::chrono::steady_clock::duration> no_wait;
+    REQUIRE(prebuild.Take(0, &no_wait) != nullptr);
+    REQUIRE_FALSE(no_wait.has_value());
+    REQUIRE(prebuild.Finished()->unclaimed == 0);
+}
+
+TEST_CASE("Driver build times are counted in the ranges of a cache hit and a compile",
+          "[video_core][shader_jobs]") {
+    Vulkan::DriverBuildTimes times;
+    REQUIRE(times.Summary() ==
+            "0 under 10 ms, 0 10-100 ms, 0 over 100 ms (0.0 s in all, longest 0.0 ms)");
+    for (const auto elapsed : {1ms, 9ms, 10ms, 99ms, 100ms, 1500ms}) {
+        times.Add(elapsed);
+    }
+    REQUIRE(times.Summary() ==
+            "2 under 10 ms, 2 10-100 ms, 2 over 100 ms (1.7 s in all, longest 1500.0 ms)");
+}
+
+TEST_CASE("A prebuild's job ends once its pipeline is built or dropped",
+          "[video_core][shader_jobs]") {
+    ShaderJobScheduler scheduler{Config(1, 1)};
+    Gate gate;
+    const auto blocker = Block(scheduler, gate);
+    std::atomic<int> builds{};
+    TestPrebuild prebuild{scheduler};
+    ShaderJobHandle built_job;
+    ShaderJobHandle dropped_job;
+    REQUIRE(prebuild.Add(1, 0, 0, [&] { return std::make_unique<TestPipeline>(builds); },
+                         &built_job));
+    REQUIRE(prebuild.Add(2, 0, 0, [] { return std::unique_ptr<TestPipeline>{}; }, &dropped_job));
+    ShaderJobHandle repeated_job;
+    REQUIRE_FALSE(prebuild.Add(1, 0, 0, [&] { return std::make_unique<TestPipeline>(builds); },
+                               &repeated_job));
+    REQUIRE_FALSE(repeated_job);
+    REQUIRE(built_job);
+    REQUIRE_FALSE(built_job.Ready());
+    REQUIRE_FALSE(dropped_job.Ready());
+
+    gate.Open();
+    scheduler.RunOrWait(blocker);
+    built_job.Wait();
+    dropped_job.Wait();
+    REQUIRE(builds == 1);
+    REQUIRE(prebuild.Take(1) != nullptr);
+    REQUIRE(prebuild.Take(2) == nullptr);
+}
+
 TEST_CASE("A cancelled prebuild leaves the scheduler usable", "[video_core][shader_jobs]") {
     ShaderJobScheduler scheduler{Config(1, 1)};
     Gate gate;
     const auto blocker = Block(scheduler, gate);
     std::atomic<int> builds{};
     std::atomic<int> translations{};
-    TestPrebuild prebuild{scheduler, 1 << 20};
+    TestPrebuild prebuild{scheduler};
     for (int key = 0; key < 10; ++key) {
-        REQUIRE(prebuild.Add(key, 1, 0, 0, [&] {
+        REQUIRE(prebuild.Add(key, 0, 0, [&] {
             ++translations;
             return std::make_unique<TestPipeline>(builds);
         }));
@@ -819,13 +1048,64 @@ TEST_CASE("A cancelled prebuild leaves the scheduler usable", "[video_core][shad
     REQUIRE(translations == 0);
     REQUIRE(builds == 0);
     REQUIRE(prebuild.Take(5) == nullptr);
-    REQUIRE_FALSE(prebuild.Add(20, 1, 0, 0, [&] { return std::make_unique<TestPipeline>(builds); }));
+    REQUIRE_FALSE(prebuild.Add(20, 0, 0, [&] { return std::make_unique<TestPipeline>(builds); }));
 
     std::atomic<bool> ran{};
     const auto after = scheduler.Submit(CpuJob(Background, [&] { ran = true; }));
     after.Wait();
     REQUIRE(after.Status() == ShaderJobStatus::Done);
     REQUIRE(ran);
+}
+
+TEST_CASE("The prebuild calls back once every build added was translated",
+          "[video_core][shader_jobs]") {
+    ShaderJobScheduler scheduler{Config(1, 1)};
+    Gate gate;
+    const auto blocker = Block(scheduler, gate);
+    std::atomic<int> builds{};
+    TestPrebuild prebuild{scheduler};
+    int now{};
+    prebuild.AfterTranslations([&] { ++now; });
+    REQUIRE(now == 1);
+
+    for (int key = 0; key < 3; ++key) {
+        REQUIRE(prebuild.Add(key, 0, 0, [&] { return std::make_unique<TestPipeline>(builds); }));
+    }
+    std::atomic<int> translated{};
+    prebuild.AfterTranslations([&] { ++translated; });
+    // Dropped while queued: it counts as translated
+    REQUIRE(prebuild.Take(1) == nullptr);
+    REQUIRE(translated == 0);
+    gate.Open();
+    scheduler.RunOrWait(blocker);
+    prebuild.Batch().Wait();
+    REQUIRE(translated == 1);
+    REQUIRE(builds == 2);
+}
+
+TEST_CASE("A stopped prebuild never calls back", "[video_core][shader_jobs]") {
+    ShaderJobScheduler scheduler{Config(1, 1)};
+    Gate gate;
+    const auto blocker = Block(scheduler, gate);
+    std::atomic<int> builds{};
+    TestPrebuild prebuild{scheduler};
+    REQUIRE(prebuild.Add(1, 0, 0, [&] { return std::make_unique<TestPipeline>(builds); }));
+    std::atomic<int> translated{};
+    prebuild.AfterTranslations([&] { ++translated; });
+    prebuild.Stop();
+    gate.Open();
+    scheduler.RunOrWait(blocker);
+    REQUIRE(translated == 0);
+    REQUIRE(builds == 0);
+}
+
+TEST_CASE("The prebuild takes the newest skipped records first, up to its limit",
+          "[video_core][shader_jobs]") {
+    using Vulkan::NewestFirst;
+    REQUIRE(NewestFirst(std::vector<int>{1, 2, 3, 4, 5}, 3) == std::vector<int>{5, 4, 3});
+    REQUIRE(NewestFirst(std::vector<int>{1, 2}, 10) == std::vector<int>{2, 1});
+    REQUIRE(NewestFirst(std::vector<int>{1, 2}, 0).empty());
+    REQUIRE(NewestFirst(std::vector<int>{}, 4).empty());
 }
 
 TEST_CASE("A pipeline build job is dropped while queued and run by a waiting draw",

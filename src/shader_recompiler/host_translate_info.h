@@ -32,6 +32,7 @@ struct HostTranslateInfo {
     u32 max_descriptor_set_sampled_images{};
     u32 max_descriptor_set_storage_images{};
     u32 max_descriptor_set_input_attachements{};
+    u32 max_compute_shared_memory_size{}; ///< Zero when unknown
     bool support_float64{};      ///< True when the device supports 64-bit floats
     bool support_float16{};      ///< True when the device supports 16-bit floats
     bool support_int64{};        ///< True when the device supports 64-bit integers
@@ -49,6 +50,12 @@ struct HostTranslateInfo {
     /// array of the table's entries (not OpenGL: its pipelines bind at most 64 textures; Vulkan
     /// only with nonuniform sampled image array indexing)
     bool support_handle_table_arrays{};
+    /// True when a sampled texture or a storage image whose handle no constant buffer word gives
+    /// is read from the pools by the handle the shader computes, as the console's bindless
+    /// texture and surface instructions do (NVN direct mode's replay, which binds the texture,
+    /// sampler and image pools as descriptor arrays indexed by texture and sampler ID)
+    bool support_pool_textures{};
+    bool needs_lrz_disable{}; ///< True when fragment shaders must write depth to turn off LRZ
 
     /// The properties that change which values translation reads from the environment, a bit
     /// each: those deciding a pass that reads values, or a pass that changes the program before
@@ -63,7 +70,7 @@ struct HostTranslateInfo {
              {support_float64, support_float16, support_int64, support_conditional_barrier,
               needs_demote_reorder, support_geometry_shader_passthrough, support_viewport_mask,
               single_lane_geometry_subgroups, support_snorm_render_buffer,
-              support_handle_table_arrays}) {
+              support_handle_table_arrays, support_pool_textures}) {
             properties |= property ? bit : 0U;
             bit <<= 1;
         }

@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -100,6 +101,20 @@ void StoreBlobs(const std::filesystem::path& file, u64 count) {
     }
 }
 
+/// What Find gives once the writer has put the blob in the file
+std::optional<std::vector<u8>> FindWritten(V2::DriverBlobStore& store, RecordKind kind, u64 key) {
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (true) {
+        if (auto payload = store.Find(kind, key)) {
+            return payload;
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            return std::nullopt;
+        }
+        std::this_thread::sleep_for(1ms);
+    }
+}
+
 /// The offsets in the file where the record of each blob begins and ends
 std::vector<std::pair<u64, u64>> BlobRanges(const std::filesystem::path& file) {
     const V2::LogFile log = V2::ReadLogFile(file);
@@ -158,9 +173,8 @@ TEST_CASE("Shader cache v2 driver blobs: a file round trip", "[video_core][shade
         for (u64 i = 0; i < 12; ++i) {
             store.Store(TestKind(i), 0x100 + i, TestPayload(i));
         }
-        // Written in this session: not stored again, and not read back before the next one
+        // Written in this session: not stored again
         store.Store(TestKind(0), 0x100, TestPayload(99));
-        REQUIRE_FALSE(store.Find(TestKind(0), 0x100).has_value());
         REQUIRE(store.Counts().written == 12);
     }
     V2::DriverBlobStore store{file, TestIdentity(), {.writer = FastWriter}};
@@ -281,7 +295,7 @@ TEST_CASE("Shader cache v2 driver blobs: a file cut off anywhere loses only the 
             REQUIRE(store.Discarded() == V2::DriverBlobDiscard::None);
             // Only padding missing still leaves the record whole
             const u64 framed = V2::RecordHeaderSize + TestPayload(5).size() + V2::RecordHashSize;
-            REQUIRE(store.Counts().loaded == (size - begin >= framed ? 6 : 5));
+            REQUIRE(store.Counts().loaded == (size - begin >= framed ? 6U : 5U));
             for (u64 i = 0; i < 5; ++i) {
                 REQUIRE(store.Find(TestKind(i), 0x100 + i) == TestPayload(i));
             }
@@ -331,6 +345,51 @@ TEST_CASE("Shader cache v2 driver blobs: a damaged blob is dropped alone",
     // Not given again; the next compile replaces it
     REQUIRE_FALSE(store.Find(TestKind(4), 0x104).has_value());
     REQUIRE(store.Find(TestKind(5), 0x105) == TestPayload(5));
+}
+
+TEST_CASE("Shader cache v2 driver blobs: a blob stored in a session is found in it once written",
+          "[video_core][shader_cache_v2]") {
+    TempDir temp;
+    const auto file = temp.path / V2::DriverFileName;
+    for (const bool existing : {false, true}) {
+        INFO((existing ? "a file that held blobs" : "a new file"));
+        if (existing) {
+            std::filesystem::remove(file);
+            StoreBlobs(file, 2);
+        }
+        V2::DriverBlobStore store{file, TestIdentity(), {.writer = FastWriter}};
+        store.Store(TestKind(5), 0x105, TestPayload(5));
+        REQUIRE(FindWritten(store, TestKind(5), 0x105) == TestPayload(5));
+        store.Used(TestKind(5), 0x105);
+        // Found: not stored again
+        store.Store(TestKind(5), 0x105, TestPayload(55));
+        REQUIRE(store.Counts().written == 1);
+        // Refused by the driver: the next build's payload replaces it
+        store.Reject(TestKind(5), 0x105);
+        REQUIRE_FALSE(store.Find(TestKind(5), 0x105).has_value());
+        store.Store(TestKind(5), 0x105, TestPayload(55));
+        REQUIRE(FindWritten(store, TestKind(5), 0x105) == TestPayload(55));
+        if (existing) {
+            REQUIRE(store.Find(TestKind(1), 0x101) == TestPayload(1));
+        }
+        // Written after another emulator let go of the file: the offsets follow the retry
+        {
+            const Common::FS::FileLock lock{VideoCommon::PipelineCacheLockPath(file)};
+            REQUIRE(lock.Held());
+            store.Store(TestKind(6), 0x106, TestPayload(6));
+            std::this_thread::sleep_for(20ms);
+            store.Store(TestKind(7), 0x107, TestPayload(7));
+            REQUIRE_FALSE(store.Find(TestKind(6), 0x106).has_value());
+        }
+        REQUIRE(FindWritten(store, TestKind(7), 0x107) == TestPayload(7));
+        REQUIRE(FindWritten(store, TestKind(6), 0x106) == TestPayload(6));
+        const V2::DriverBlobCounts counts = store.Counts();
+        REQUIRE(counts.used == 1);
+        REQUIRE(counts.rejected == 1);
+        REQUIRE(counts.written == 4);
+    }
+    V2::DriverBlobStore store{file, TestIdentity(), {.writer = FastWriter}};
+    REQUIRE(store.Find(TestKind(5), 0x105) == TestPayload(55));
 }
 
 TEST_CASE("Shader cache v2 driver blobs: a rejected blob is replaced",
@@ -404,6 +463,57 @@ TEST_CASE("Shader cache v2 driver blobs: the file stays under its size cap",
         REQUIRE_FALSE(store.Find(RecordKind::GraphicsBinary, i).has_value());
     }
     REQUIRE(V2::ReadLogFile(file).parsed.stats.dead_bytes == 0);
+}
+
+TEST_CASE("Shader cache v2 driver blobs: a session cap keeps what the session used past the cap",
+          "[video_core][shader_cache_v2]") {
+    TempDir temp;
+    const auto file = temp.path / V2::DriverFileName;
+    const auto payload = [](u64 index) {
+        V2::PipelineBinaries binaries = TestBinaries(index, 4000);
+        binaries.binaries.resize(1);
+        return V2::EncodeBinaries(binaries);
+    };
+    const u64 record = V2::RecordSize(payload(0).size());
+    V2::DriverBlobOptions options{.max_bytes = record * 20,
+                                  .target_bytes = record * 15,
+                                  .min_dead_bytes = ~u64{0},
+                                  .ceiling_bytes = record * 100,
+                                  .session_cap_bytes = record * 60,
+                                  .writer = FastWriter};
+    {
+        V2::DriverBlobStore store{file, TestIdentity(), options};
+        for (u64 i = 0; i < 10; ++i) {
+            store.Store(RecordKind::GraphicsBinary, i, payload(i));
+        }
+    }
+    {
+        // A precache-like session: uses nothing it had and writes 40 more, twice max_bytes
+        V2::DriverBlobStore store{file, TestIdentity(), options};
+        for (u64 i = 10; i < 50; ++i) {
+            store.Store(RecordKind::GraphicsBinary, i, payload(i));
+        }
+    }
+    {
+        V2::DriverBlobStore store{file, TestIdentity(), options};
+        // Every blob the session wrote is kept; the unused older ones go
+        REQUIRE(store.Counts().loaded == 40);
+        for (u64 i = 10; i < 50; ++i) {
+            REQUIRE(store.Find(RecordKind::GraphicsBinary, i).has_value());
+            // Find doesn't mark a blob used; without this the store compacts to its target here
+            store.Used(RecordKind::GraphicsBinary, i);
+        }
+    }
+    // Past the session cap, the cap bounds it
+    options.session_cap_bytes = record * 30;
+    {
+        V2::DriverBlobStore store{file, TestIdentity(), options};
+        REQUIRE(store.Counts().loaded == 40);
+        for (u64 i = 10; i < 50; ++i) {
+            store.Used(RecordKind::GraphicsBinary, i);
+        }
+    }
+    REQUIRE(std::filesystem::file_size(file) <= record * 30 + 4096);
 }
 
 TEST_CASE("Shader cache v2 driver blobs: replaced blobs are compacted away",

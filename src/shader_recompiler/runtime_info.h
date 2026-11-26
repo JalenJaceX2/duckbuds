@@ -87,6 +87,12 @@ struct RuntimeInfo {
     VaryingState previous_stage_stores;
     /// Fragment stage after a mesh program: generic inputs it writes per primitive.
     std::bitset<32> per_primitive_generics{};
+    /// Fragment stage after the mesh emulation's vertex shader: per_primitive_generics arrive
+    /// flat from each primitive's own vertices instead of as PerPrimitiveEXT inputs.
+    bool per_primitive_flat{};
+    /// Fragment stage after the mesh emulation's vertex shader: PrimitiveId is the flat input at
+    /// this generic location, not the built-in. ~0 when the mesh program writes no PrimitiveId.
+    u32 primitive_id_location{~0U};
     /// Last pre-rasterization stage: generic outputs the fragment stage reads screen-linear.
     /// They are written times Position.w and the fragment stage reads them perspective-correct
     /// times FragCoord.w, so clipping a primitive close to the camera interpolates them right.
@@ -97,6 +103,9 @@ struct RuntimeInfo {
 
     bool convert_depth_mode{};
     bool force_early_z{};
+    /// Fragment stage: the guest depth buffer is 24-bit UNORM but the host stores it as a float,
+    /// so FragDepth is rounded to the 24-bit values the guest would store.
+    bool quantize_frag_depth_d24{};
 
     TessPrimitive tess_primitive{};
     TessSpacing tess_spacing{};
@@ -138,6 +147,10 @@ struct RuntimeInfo {
     u32 mesh_task_offsets_binding{~0U};
     u32 mesh_task_args_binding{~0U};
     u32 mesh_task_payload_stride{}; ///< payload buffer words per task workgroup
+
+    /// Storage buffer binding (set 0) whose first word a loop's safety check sets to 1 when it
+    /// ends the loop, ~0 for none: NVN2 direct mode reports such shaders.
+    u32 loop_guard_binding{~0U};
 };
 
 } // namespace Shader

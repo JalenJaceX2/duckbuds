@@ -27,6 +27,7 @@
 #include <fmt/ranges.h>
 
 #include "common/fs/file.h"
+#include "common/fs/file_lock.h"
 #include "common/fs/fs.h"
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
@@ -247,9 +248,10 @@ struct ColorConsoleBackend final : public Backend {
 /// @brief Backend that writes to a file passed into the constructor
 struct FileBackend final : public Backend {
     explicit FileBackend(const std::filesystem::path filename) noexcept {
-        // Move a log over its ".old.txt" copy. The rename replaces the copy atomically, and fails
-        // if the log is still open elsewhere (e.g. in a Lichii process that hasn't exited yet).
-        // A log that can't even be checked counts as a failure, so it is never truncated.
+        // Move a log over its ".old.txt" copy. The rename replaces the copy atomically, and on
+        // Windows fails if the log is still open elsewhere (e.g. in a Lichii process that hasn't
+        // exited yet). A log that can't even be checked counts as a failure, so it is never
+        // truncated.
         const auto rotate = [](const std::filesystem::path& path) {
             std::error_code ec;
             if (!std::filesystem::exists(path, ec))
@@ -259,19 +261,68 @@ struct FileBackend final : public Backend {
             std::filesystem::rename(path, old_path, ec);
             return !ec;
         };
+#ifdef _WIN32
+        const auto claim = [&rotate](const std::filesystem::path& path) { return rotate(path); };
+#else
+        // Outside Windows the rename succeeds on a log another Lichii still writes: that process
+        // would go on writing to the ".old.txt" copy, which the next start overwrites. Each log is
+        // held instead with a lock file beside it for as long as this backend lives, and only a
+        // log nobody holds is moved. A lock file that can't be made leaves it to the rename.
+        // One try, no wait: a log a running Lichii holds stays held.
+        bool held_elsewhere = false;
+        const auto claim = [this, &rotate, &held_elsewhere](const std::filesystem::path& path) {
+            auto lock_path = path;
+            lock_path += ".lock";
+            lock.emplace(lock_path);
+            held_elsewhere = !lock->Held() && lock->Busy();
+            if (!lock->Held()) {
+                lock.reset();
+                if (held_elsewhere)
+                    return false;
+            }
+            return rotate(path);
+        };
+#endif
         // If the log can't be moved, write this session to a second log (eden_log_2.txt) so that
-        // the previous session is kept and this one still gets the full size limit. If that one
-        // can't be moved either, append to it.
+        // the previous session is kept and this one still gets the full size limit. Outside
+        // Windows each further Lichii in the folder takes the next free log (eden_log_3.txt and
+        // on), so every writer holds the lock of the file it writes and none is moved under it.
+        // If none can be moved, append to the last one, unless another Lichii holds it: with
+        // every log held, this session writes no log file at all.
+#ifdef _WIN32
+        constexpr int log_slots = 2;
+#else
+        constexpr int log_slots = 8;
+#endif
+        const auto slot_path = [&filename](int slot) {
+            if (slot == 1)
+                return filename;
+            auto numbered = filename.parent_path() / filename.stem();
+            numbered += fmt::format("_{}", slot);
+            numbered += filename.extension();
+            return numbered;
+        };
         auto path = filename;
-        auto mode = FS::FileAccessMode::Write;
-        if (!rotate(path)) {
-            path = filename.parent_path() / filename.stem();
-            path += "_2";
-            path += filename.extension();
-            if (!rotate(path))
-                mode = FS::FileAccessMode::Append;
+        auto mode = FS::FileAccessMode::Append;
+        for (int slot = 1; slot <= log_slots; ++slot) {
+            path = slot_path(slot);
+            if (claim(path)) {
+                mode = FS::FileAccessMode::Write;
+                break;
+            }
         }
+#ifndef _WIN32
+        if (mode == FS::FileAccessMode::Append && held_elsewhere) {
+            // Too early for the log itself.
+            fmt::print(stderr, "Every log file in {} is held by another Lichii: this one keeps no "
+                               "log file\n",
+                       FS::PathToUTF8String(filename.parent_path()));
+            enabled = false;
+            return;
+        }
+#endif
         file.emplace(path, mode, FS::FileType::TextFile);
+        file_path = path;
         // Count what is already there so the size limit still applies when appending.
         if (mode == FS::FileAccessMode::Append)
             bytes_written = file->GetSize();
@@ -304,7 +355,7 @@ struct FileBackend final : public Backend {
 
         // Option to log each line rather than 4k buffers
         if (Settings::values.log_flush_line.GetValue())
-            file->Flush();
+            Flush();
 
         using namespace Common::Literals;
         // Prevent logs from exceeding a set maximum size in the event that log entries are spammed.
@@ -315,14 +366,28 @@ struct FileBackend final : public Backend {
             // Don't close the file so we can print a stacktrace if necessary
             if (write_limit_exceeded)
                 enabled = false;
-            file->Flush();
+            Flush();
         }
     }
 
     void Flush() noexcept override {
-        file->Flush();
+        // A failed flush logs an Error, whose own flush would fail and log again without end.
+        static thread_local bool flushing = false;
+        if (flushing)
+            return;
+        flushing = true;
+        if (file)
+            file->Flush();
+        flushing = false;
     }
+
+    std::filesystem::path file_path;
+
 private:
+#ifndef _WIN32
+    // Before the file, so the file is closed first.
+    std::optional<FS::FileLock> lock;
+#endif
     std::optional<FS::IOFile> file;
     std::size_t bytes_written = 0;
     bool enabled = true;
@@ -424,6 +489,10 @@ struct Impl {
     LogcatBackend lc_backend{};
 #endif
     std::chrono::steady_clock::time_point time_origin{std::chrono::steady_clock::now()};
+#ifndef __OPENORBIS__
+    // Last, so it stops before the file backend it flushes is destroyed.
+    std::jthread file_flush_thread;
+#endif
 };
 } // Anonymous namespace
 
@@ -456,18 +525,41 @@ void Initialize() {
 #ifndef __OPENORBIS__
         using namespace Common::FS;
         const auto& log_dir = GetEdenPath(EdenPath::LogDir);
-        void(CreateDir(log_dir));
+        void(CreateDirs(log_dir));
         logging_instance->file_backend.emplace(log_dir / LOG_FILE);
 #endif
     }
 }
 
 void Start() {
+#ifndef __OPENORBIS__
+    // Lines below Error wait in the file's buffer until it fills. Flushing it every second keeps a
+    // hang or a kill from losing more than the last second of the log.
+    if (!logging_instance || !logging_instance->file_backend || logging_instance->file_flush_thread.joinable())
+        return;
+    logging_instance->file_flush_thread = std::jthread([&backend = *logging_instance->file_backend](std::stop_token token) {
+        Common::SetCurrentThreadName("LogFlush");
+        while (Common::StoppableTimedWait(token, std::chrono::seconds{1}))
+            backend.Flush();
+    });
+#endif
 }
 
 void Stop() {
+    Flush();
+}
+
+void Flush() {
     if (logging_instance)
         logging_instance->ForEachBackend([](Backend& backend) { backend.Flush(); });
+}
+
+std::filesystem::path FilePath() {
+#ifndef __OPENORBIS__
+    if (logging_instance && logging_instance->file_backend)
+        return logging_instance->file_backend->file_path;
+#endif
+    return {};
 }
 
 void FmtCrashMessageImpl(const char* filename, unsigned int line_num, const char* function, fmt::string_view format, const fmt::format_args& args) noexcept {

@@ -56,6 +56,7 @@ namespace Service {
 
 namespace Account {
 class ProfileManager;
+enum class ProfileStorage;
 } // namespace Account
 
 namespace AM {
@@ -118,12 +119,12 @@ class RenderdocAPI;
 
 namespace Core {
 
-/// Frames the guest has presented (Switch 2 vi2 present calls); input replay is locked to it.
+/// Guest frames (Switch 1 game composites or Switch 2 vi2 presents); input replay is locked to it.
 extern std::atomic<u64> g_nx2_present_count;
-/// Steady-clock time of each guest present, by present count; written only while the debug
-/// server runs (g_nx2_present_time_services: debug services alive), for its frame_times tool.
+/// Steady-clock time of each guest present, by present count, for the debug server's frame_times
+/// tool and bug reports.
 extern std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns;
-extern std::atomic<u32> g_nx2_present_time_services;
+void RecordGuestPresent();
 
 class CpuManager;
 class Debugger;
@@ -161,6 +162,7 @@ public:
     using CurrentBuildProcessID = std::array<u8, 0x20>;
 
     explicit System();
+    explicit System(Service::Account::ProfileStorage profile_storage);
 
     ~System();
 
@@ -228,12 +230,21 @@ public:
                                           const std::string& filepath,
                                           Service::AM::FrontendAppletParameters& params);
 
+    /// Brings up the kernel, Host1x and the GPU without an application process, audio or
+    /// services, for a GPU trace replay (video_core/gpu_trace/replay.h). ShutdownMainProcess
+    /// tears it down.
+    [[nodiscard]] SystemResultStatus InitializeForGpuReplay(Frontend::EmuWindow& emu_window,
+                                                            u64 program_id);
+
     /**
      * Indicates if the emulated system is powered on (all subsystems initialized and able to run an
      * application).
      * @returns True if the emulated system is powered on, otherwise false.
      */
     [[nodiscard]] bool IsPoweredOn() const;
+#ifdef HAS_HYPERVISOR
+    [[nodiscard]] bool IsHypervisorAllowedForLoad() const;
+#endif
 
     /// Prepare the core emulation for a reschedule
     void PrepareReschedule(u32 core_index);
@@ -391,6 +402,7 @@ public:
 
     [[nodiscard]] Service::Account::ProfileManager& GetProfileManager();
     [[nodiscard]] const Service::Account::ProfileManager& GetProfileManager() const;
+    [[nodiscard]] std::shared_ptr<Service::Account::ProfileManager> GetScratchProfileManager() const;
 
     [[nodiscard]] Core::Debugger& GetDebugger();
     [[nodiscard]] const Core::Debugger& GetDebugger() const;
@@ -437,6 +449,15 @@ public:
      * @param program_index Specifies the index within the application of the program to launch.
      */
     void ExecuteProgram(std::size_t program_index);
+
+    /// Type used for the frontend to designate a callback for System to boot an installed
+    /// application in a new session, in place of the running one.
+    using LaunchInNewSessionCallback = std::function<void(u64 program_id)>;
+    void RegisterLaunchInNewSessionCallback(LaunchInNewSessionCallback&& callback);
+
+    /// Asks the frontend to boot the installed application in a new session. False when the
+    /// frontend cannot.
+    bool LaunchInNewSession(u64 program_id);
 
     [[nodiscard]] std::vector<std::vector<u8>>& GetUserChannel();
     [[nodiscard]] std::vector<std::vector<u8>>& GetGeneralChannel();

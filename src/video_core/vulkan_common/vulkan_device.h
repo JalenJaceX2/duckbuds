@@ -20,7 +20,11 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/fsr4_support.h"
+#include "video_core/vulkan_common/descriptor_limits.h"
+#include "video_core/vulkan_common/device_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+
+#include <vulkan/vulkan_beta.h>
 
 VK_DEFINE_HANDLE(VmaAllocator)
 VK_DEFINE_HANDLE(VmaPool)
@@ -47,6 +51,8 @@ VK_DEFINE_HANDLE(VmaPool)
 
 #define FOR_EACH_VK_FEATURE_1_3(FEATURE)                                                           \
     FEATURE(EXT, ImageRobustness, IMAGE_ROBUSTNESS, robust_image_access)                           \
+    FEATURE(EXT, PipelineCreationCacheControl, PIPELINE_CREATION_CACHE_CONTROL,                    \
+            pipeline_creation_cache_control)                                                       \
     FEATURE(EXT, ShaderDemoteToHelperInvocation, SHADER_DEMOTE_TO_HELPER_INVOCATION,               \
             shader_demote_to_helper_invocation)                                                    \
     FEATURE(EXT, SubgroupSizeControl, SUBGROUP_SIZE_CONTROL, subgroup_size_control)                \
@@ -67,6 +73,7 @@ VK_DEFINE_HANDLE(VmaPool)
     FEATURE(EXT, ExtendedDynamicState, EXTENDED_DYNAMIC_STATE, extended_dynamic_state)             \
     FEATURE(EXT, ExtendedDynamicState2, EXTENDED_DYNAMIC_STATE_2, extended_dynamic_state2)         \
     FEATURE(EXT, ExtendedDynamicState3, EXTENDED_DYNAMIC_STATE_3, extended_dynamic_state3)         \
+    FEATURE(EXT, ImageCompressionControl, IMAGE_COMPRESSION_CONTROL, image_compression_control)    \
     FEATURE(EXT, 4444Formats, 4444_FORMATS, format_a4b4g4r4)                                       \
     FEATURE(EXT, IndexTypeUint8, INDEX_TYPE_UINT8, index_type_uint8)                               \
     FEATURE(EXT, LineRasterization, LINE_RASTERIZATION, line_rasterization)                        \
@@ -75,6 +82,7 @@ VK_DEFINE_HANDLE(VmaPool)
             primitive_topology_list_restart)                                                       \
     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
+    FEATURE(EXT, TexelBufferAlignment, TEXEL_BUFFER_ALIGNMENT, texel_buffer_alignment)             \
     FEATURE(EXT, ShaderFloat8, SHADER_FLOAT8, shader_float8)                                       \
     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
@@ -258,8 +266,14 @@ public:
     bool IsFormatSupported(VkFormat wanted_format, VkFormatFeatureFlags wanted_usage,
                            FormatType format_type) const;
 
-    /// Reports a device loss.
-    void ReportLoss() const;
+    /// Logs a device loss and what the driver knows about it, then ends the process. Nothing can
+    /// run on a lost device, and the vk::Exception a caller would throw ends it anyway, as an
+    /// unhandled exception on whichever thread saw the loss (#1934).
+    [[noreturn]] void ReportLoss() const;
+
+    /// Ends the process when submitted GPU work stopped making progress without the driver
+    /// reporting a loss (EDEN_NX2_GPU_WATCHDOG). Makes no Vulkan calls.
+    [[noreturn]] void ReportUnresponsive() const;
 
     /// Logs what VK_EXT_device_fault reports about a device loss.
     void ReportDeviceFault() const;
@@ -286,7 +300,11 @@ public:
         SparsePages,
         DeviceBuffers,
     };
-    static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+    static constexpr VkDeviceSize SeparatePoolBlockSize = DefaultSeparatePoolBlockSize;
+
+    VkDeviceSize GetDeviceBufferPoolBlockSize() const noexcept {
+        return device_buffer_pool_block_size;
+    }
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
@@ -323,6 +341,28 @@ public:
     /// Returns main graphics queue family index.
     u32 GetGraphicsFamily() const {
         return graphics_family;
+    }
+
+    /// NVN2 direct mode: the device enables what the replay needs.
+    bool IsNvnDirect() const {
+        return nvn_direct;
+    }
+
+    /// NVN2 direct mode: the replay could not start on the device, which then serves GPU
+    /// emulation alone (Core::NvnHook::DirectFailed).
+    void EndNvnDirect() {
+        nvn_direct = false;
+    }
+
+    /// NVN2 direct mode: the graphics family's queues made for the replay (index 0 is
+    /// GetGraphicsQueue's).
+    std::span<const VkQueue> GetNvnDirectQueues() const {
+        return {nvn_direct_queues.data(), nvn_direct_queue_count};
+    }
+
+    /// Returns the extensions the device was created with.
+    const std::set<std::string, std::less<>>& GetLoadedExtensions() const {
+        return loaded_extensions;
     }
 
     /// Returns main present queue family index.
@@ -432,6 +472,12 @@ public:
         return properties.properties.limits.maxStorageBufferRange;
     }
 
+    u32 GetMaxTexelBufferElements() const {
+        return properties.properties.limits.maxTexelBufferElements;
+    }
+
+    VkDeviceSize GetTexelBufferOffsetAlignment(VkDeviceSize texel_alignment) const;
+
     std::array<u32, 3> GetMaxComputeWorkGroupCount() const {
         const auto& count = properties.properties.limits.maxComputeWorkGroupCount;
         return {count[0], count[1], count[2]};
@@ -448,6 +494,7 @@ public:
     FN_MAX_LIMIT_ELEM(PerStageDescriptorStorageBuffers) \
     FN_MAX_LIMIT_ELEM(PerStageResources) \
     FN_MAX_LIMIT_ELEM(PerStageDescriptorSamplers) \
+    FN_MAX_LIMIT_ELEM(SamplerAllocationCount) \
     FN_MAX_LIMIT_ELEM(DescriptorSetSamplers) \
     FN_MAX_LIMIT_ELEM(DescriptorSetUniformBuffers) \
     FN_MAX_LIMIT_ELEM(DescriptorSetUniformBuffersDynamic) \
@@ -456,6 +503,7 @@ public:
     FN_MAX_LIMIT_ELEM(DescriptorSetSampledImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetStorageImages) \
     FN_MAX_LIMIT_ELEM(DescriptorSetInputAttachments) \
+    FN_MAX_LIMIT_ELEM(ImageDimension2D) \
     FN_MAX_LIMIT_ELEM(FramebufferWidth) \
     FN_MAX_LIMIT_ELEM(FramebufferHeight) \
     FN_MAX_LIMIT_ELEM(FramebufferLayers)
@@ -508,6 +556,12 @@ FN_MAX_LIMIT_LIST
 
     bool IsStorageTexelBufferArrayNonUniformIndexingSupported() const {
         return features.descriptor_indexing.shaderStorageTexelBufferArrayNonUniformIndexing;
+    }
+
+    /// Returns true if storage buffer pointers can be chosen per invocation and decorated NonUniform.
+    bool IsNonUniformStorageBufferPointerSupported() const {
+        return features.variable_pointer.variablePointersStorageBuffer &&
+               (instance_version >= VK_API_VERSION_1_2 || extensions.descriptor_indexing);
     }
 
     /// Returns true if the device supports float64 natively.
@@ -566,9 +620,12 @@ FN_MAX_LIMIT_LIST
         return is_warp_potentially_bigger;
     }
 
-    /// Returns true if the device can be forced to use the guest warp size.
+    /// Returns true if the device can be forced to use the guest warp size. Lavapipe's
+    /// subgroups are 8 wide and can't be forced to 32.
     bool IsGuestWarpSizeSupported(VkShaderStageFlagBits stage) const {
-        return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
+        const auto& control = properties.subgroup_size_control;
+        return (control.requiredSubgroupSizeStages & stage) != 0 &&
+               control.minSubgroupSize <= GuestWarpSize && GuestWarpSize <= control.maxSubgroupSize;
     }
 
     /// Returns true if the device supports the provided subgroup feature.
@@ -588,6 +645,17 @@ FN_MAX_LIMIT_LIST
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
         return properties.push_descriptor.maxPushDescriptors;
+    }
+
+    SampledDescriptorLimits CoreSampledLimits() const {
+        return CoreSampledDescriptorLimits(properties.properties.limits);
+    }
+
+    /// Returns the sampled descriptor limits of sets from update-after-bind pools, when they are
+    /// larger than the core limits.
+    std::optional<SampledDescriptorLimits> UpdateAfterBindSampledLimits() const {
+        return UpdateAfterBindSampledDescriptorLimits(properties.properties.limits,
+                                                      properties.descriptor_indexing);
     }
 
     /// Returns true if robust buffer access is enabled on the device.
@@ -678,6 +746,23 @@ FN_MAX_LIMIT_LIST
     /// Returns true if VK_KHR_swapchain_mutable_format is enabled.
     bool IsKhrSwapchainMutableFormatEnabled() const {
         return extensions.swapchain_mutable_format;
+    }
+
+    /// Returns true if presents can carry an id and be waited for, through either version of
+    /// the extensions. A swapchain may still have neither (Swapchain::HasPresentIds).
+    bool IsPresentWaitEnabled() const {
+        return IsKhrPresentWaitEnabled() || IsKhrPresentWait2Enabled();
+    }
+
+    /// Returns true if VK_KHR_present_id and VK_KHR_present_wait are enabled.
+    bool IsKhrPresentWaitEnabled() const {
+        return present_id_features.presentId && present_wait_features.presentWait;
+    }
+
+    /// Returns true if VK_KHR_present_id2 and VK_KHR_present_wait2 are enabled. The surface still
+    /// has to support them.
+    bool IsKhrPresentWait2Enabled() const {
+        return present_id2_features.presentId2 && present_wait2_features.presentWait2;
     }
 
     /// Returns true if VK_EXT_hdr_metadata is enabled.
@@ -872,6 +957,13 @@ FN_MAX_LIMIT_LIST
         return extensions.color_write_enable;
     }
 
+    /// Returns true if colour images are created without delta colour compression (RADV before
+    /// GFX10: images in the GENERAL layout are never DCC compressed there, and every transfer
+    /// layout round trip decompresses them in full).
+    bool DisablesColorCompression() const {
+        return extensions.image_compression_control;
+    }
+
     /// Returns true if the device supports VK_EXT_border_color_swizzle.
     bool IsExtBorderColorSwizzleSupported() const {
         return extensions.border_color_swizzle;
@@ -1047,6 +1139,12 @@ FN_MAX_LIMIT_LIST
         return extensions.synchronization2;
     }
 
+    /// Returns true if pipelineCreationCacheControl is enabled (Vulkan 1.3 or
+    /// VK_EXT_pipeline_creation_cache_control).
+    bool IsPipelineCreationCacheControlSupported() const {
+        return extensions.pipeline_creation_cache_control;
+    }
+
     /// Returns the minimum supported version of SPIR-V.
     u32 SupportedSpirvVersion() const {
         if (instance_version >= VK_API_VERSION_1_3) {
@@ -1068,6 +1166,18 @@ FN_MAX_LIMIT_LIST
         return has_renderdoc || has_nsight_graphics || has_radeon_gpu_profiler;
     }
 
+    /// Whether resources get debug names: for an attached tool, or for the device address map
+    /// (EDEN_NX2_FAULT_MAP) to name what a fault hit.
+    bool NamesObjects() const {
+        return HasDebuggingToolAttached() || address_binding_report;
+    }
+
+    /// Returns true when RADV saves a GPU hang report (RADV_DEBUG=hang), which keeps the SPIR-V of
+    /// the pipelines bound at the hang.
+    bool HasRadvHangReport() const {
+        return radv_hang_report;
+    }
+
     /// @returns True if compute pipelines can cause crashing.
     bool HasBrokenCompute() const {
         return has_broken_compute;
@@ -1076,6 +1186,13 @@ FN_MAX_LIMIT_LIST
     /// Returns true when the device does not properly support cube compatibility.
     bool HasBrokenCubeImageCompatibility() const {
         return has_broken_cube_compatibility;
+    }
+
+    /// Returns true for AMD GCN4 and older (Polaris and earlier, found by device ID or by the
+    /// lack of float16) on AMD's own drivers (CheezyEmu 132cc46c9e). Their driver uses a lot of
+    /// RAM per compile of a large Switch 2 shader, so pipelines build on fewer threads there.
+    bool IsAmdLegacyGcn() const {
+        return is_amd_legacy_gcn;
     }
 
     /// Returns true if parallel shader compiling has issues with the current driver.
@@ -1097,6 +1214,12 @@ FN_MAX_LIMIT_LIST
         return device_access_memory;
     }
 
+    /// Size of the largest device-local heap (with EDEN_NX2_VRAM_LIMIT_MIB applied). Unlike
+    /// GetDeviceLocalMemory() this is the card's memory, not a budget with a reserve taken off.
+    u64 GetDeviceLocalHeapSize() const {
+        return main_heap_size;
+    }
+
     bool CanReportMemoryUsage() const {
         return extensions.memory_budget;
     }
@@ -1108,6 +1231,9 @@ FN_MAX_LIMIT_LIST
     /// budget. 0 without the extension. The unused part of the allocator's blocks is not
     /// subtracted: see GetDeviceMemorySlack().
     u64 GetDeviceMemoryBudget() const;
+
+    /// GetDeviceMemoryBudget() before the cap an integrated GPU gets: the heap's own budget.
+    u64 GetDeviceHeapMemoryBudget() const;
 
     /// Memory the allocator holds from the driver in the main device-local heap but has no
     /// allocation in (the unused part of its blocks). GetDeviceMemoryUsage() does not count it,
@@ -1255,14 +1381,18 @@ FN_MAX_LIMIT_LIST
     /// NVIDIA's and AMD's drivers keep a disk cache of built pipelines of their own, so the
     /// emulator keeps none on top: a VkPipelineCache only kept every pipeline the title ever built
     /// in host memory (title 1: a 245 MB file, ~0.35 GB of RAM for the session) and copied it whole
-    /// at each save, which stalled frames, and pipelines built no slower without it.
-    bool DriverCachesPipelines() const noexcept {
-        return properties.driver.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
-               properties.driver.driverID == VK_DRIVER_ID_AMD_PROPRIETARY;
-    }
+    /// at each save, which stalled frames, and pipelines built no slower without it. RADV keeps
+    /// one too through Mesa's shader cache, unless it is disabled.
+    bool DriverCachesPipelines() const noexcept;
 
     bool IsMoltenVK() const noexcept {
         return properties.driver.driverID == VK_DRIVER_ID_MOLTENVK;
+    }
+
+    /// Samplers may use a nonzero mipLodBias (false on portability subset devices without it).
+    bool SupportsSamplerMipLodBias() const {
+        return !loaded_extensions.contains(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME) ||
+               portability_subset_features.samplerMipLodBias == VK_TRUE;
     }
 
     /// The multiple vertex input binding strides must be. Metal needs 4 bytes, which MoltenVK
@@ -1327,6 +1457,10 @@ private:
     vk::PhysicalDevice physical; ///< Physical device.
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
+    static constexpr u32 NvnDirectMaxQueues = 16; ///< NVN_DIRECT_MAX_QUEUES (nvn_direct.h)
+    bool nvn_direct{};                                        ///< NVN2 direct mode
+    std::array<VkQueue, NvnDirectMaxQueues> nvn_direct_queues{}; ///< NVN2 direct mode
+    u32 nvn_direct_queue_count{};                             ///< NVN2 direct mode
     vk::Queue present_queue;     ///< Main present queue.
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
@@ -1373,8 +1507,10 @@ private:
         VkPhysicalDeviceSubgroupProperties subgroup_properties{};
         VkPhysicalDeviceFloatControlsProperties float_controls{};
         VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor{};
+        VkPhysicalDeviceDescriptorIndexingProperties descriptor_indexing{};
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer{};
         VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_control{};
+        VkPhysicalDeviceTexelBufferAlignmentProperties texel_buffer_alignment{};
         VkPhysicalDeviceTransformFeedbackPropertiesEXT transform_feedback{};
         VkPhysicalDeviceMaintenance5PropertiesKHR maintenance5{};
         VkPhysicalDevicePipelineBinaryPropertiesKHR pipeline_binary{};
@@ -1392,6 +1528,14 @@ private:
 
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT address_binding_report_features{};
+    bool address_binding_report{};
+    VkPhysicalDevicePresentIdFeaturesKHR present_id_features{};
+    VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features{};
+    VkPhysicalDevicePresentId2FeaturesKHR present_id2_features{};
+    VkPhysicalDevicePresentWait2FeaturesKHR present_wait2_features{};
+    /// Enabled as the driver reports them (VK_KHR_portability_subset devices only).
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR portability_subset_features{};
     VkPhysicalDeviceProperties2 properties2{};
 
     // Misc features
@@ -1411,9 +1555,11 @@ private:
     bool host_float16_supported{};             ///< shaderFloat16 for host-only shaders
     bool has_broken_descriptor_aliasing{};     ///< Miscompiles descriptors aliased on one binding
     bool has_broken_parallel_compiling{};      ///< Has broken parallel shader compiling.
+    bool is_amd_legacy_gcn{};                  ///< AMD GCN4 or older on an AMD driver.
     bool has_renderdoc{};                      ///< Has RenderDoc attached
     bool has_nsight_graphics{};                ///< Has Nsight Graphics attached
     bool has_radeon_gpu_profiler{};            ///< Has Radeon GPU Profiler attached.
+    bool radv_hang_report{};                   ///< RADV_DEBUG=hang is set.
     bool supports_d24_depth{};                 ///< Supports D24 depth buffers.
     bool must_emulate_scaled_formats{};        ///< Requires scaled vertex format emulation
     bool dynamic_state3_blending{};            ///< Has blending features of dynamic_state3.
@@ -1439,6 +1585,8 @@ private:
     std::vector<size_t> valid_heap_memory;                   ///< Heaps used.
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
+    u64 main_heap_size{};     ///< Size of main_heap, with heap_size_limit applied.
+    VkDeviceSize device_buffer_pool_block_size{SeparatePoolBlockSize};
 
     /// Format properties dictionary.
     ::Common::unordered_map<VkFormat, VkFormatProperties> format_properties;

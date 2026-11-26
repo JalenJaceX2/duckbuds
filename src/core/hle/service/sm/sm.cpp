@@ -39,6 +39,35 @@ ServiceManager::ServiceManager(Kernel::KernelCore& kernel_) : kernel{kernel_} {
     controller_interface = std::make_unique<Controller>(kernel.System());
 }
 
+bool ServiceManager::WaitForService(const std::string& name) {
+    // Only for services on host threads (audio, vi). They wait on the host, not with SleepThread:
+    // that sleep ends on the emulated timer, which stops once emulation is suspended at shutdown.
+    // A guest thread must not wait here, it would block its emulated core.
+    DEBUG_ASSERT(Kernel::GetCurrentThread(kernel).IsDummyThread());
+    std::unique_lock l{lock};
+    ++service_waiters;
+    SCOPE_EXIT {
+        --service_waiters;
+        waiters_changed.notify_all();
+    };
+    while (registered_services.find(name) == registered_services.end()) {
+        if (closing) {
+            LOG_INFO(Service_SM, "Gave up waiting for {}: the services are closing", name);
+            return false;
+        }
+        waiters_changed.wait(l);
+    }
+    return true;
+}
+
+void ServiceManager::Close() {
+    std::unique_lock l{lock};
+    closing = true;
+    // Waiters wake on the host at once, see closing and leave: no waiter outlives the manager.
+    waiters_changed.notify_all();
+    waiters_changed.wait(l, [this] { return service_waiters == 0; });
+}
+
 ServiceManager::~ServiceManager() {
     for (auto& [name, port] : service_ports) {
         port->Close(kernel);
@@ -78,6 +107,9 @@ Result ServiceManager::RegisterService(Kernel::KServerPort** out_server_port, st
 
     service_ports.emplace(name, std::addressof(port->GetClientPort()));
     registered_services.emplace(name, handler);
+    if (service_waiters != 0) {
+        waiters_changed.notify_all();
+    }
     if (deferral_event) {
         deferral_event->Signal(kernel);
     }

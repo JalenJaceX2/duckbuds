@@ -16,6 +16,9 @@
 #include "common/assert.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
+#ifdef HAS_NCE
+#include "common/settings.h"
+#endif
 #include "common/thread.h"
 #include "common/thread_worker.h"
 #include "core/arm/arm_interface.h"
@@ -145,15 +148,25 @@ struct KernelCore::Impl {
             // finalize can't unmap the next game's memory, and clear the arena.
             const u32 references = application_process->GetReferenceCount();
             application_process->GetPageTable().GetImpl().fastmem_arena = nullptr;
+#ifdef HAS_HYPERVISOR
+            application_process->ReleaseHypervisor();
+#endif
             application_process->Close(system.Kernel());
             application_process = nullptr;
             if (references > 1) {
                 LOG_WARNING(Kernel, "Application process still had {} references at shutdown",
                             references);
             }
-            auto& arena = system.DeviceMemory().buffer;
-            arena.Unmap(0, arena.VirtualSize(), false);
+            system.DeviceMemory().buffer.ResetVirtualMappings();
+#ifdef HAS_NCE
+        } else if (system.DeviceMemory().buffer.IsDirectMapped()) {
+            system.DeviceMemory().buffer.ResetVirtualMappings();
+#endif
         }
+
+#ifdef HAS_NCE
+        Settings::SetNceEnabled(false);
+#endif
 
         next_object_id = 0;
         next_kernel_process_id = KProcess::InitialProcessIdMin;
@@ -216,12 +229,32 @@ struct KernelCore::Impl {
 
         hardware_timer->Finalize();
         hardware_timer.reset();
+
+        // Servers may run again, for the next process.
+        std::scoped_lock lk{server_lock};
+        services_closed = false;
     }
 
     void CloseServices() {
-        // Ensures all servers gracefully shutdown.
-        std::scoped_lock lk{server_lock};
-        server_managers.clear();
+        // Ensures all servers gracefully shutdown. They are stopped without the server lock held:
+        // the services on guest cores all run on core 3, so one still starting would block that
+        // core on the lock in RunServer, and the servers waited on here could never stop (a close
+        // while the boot shader cache loads starts the guest cores just then). Servers that start
+        // from now on are refused, and kept until the kernel shuts down (the call from Shutdown).
+        std::vector<std::unique_ptr<Service::ServerManager>> managers;
+        {
+            std::scoped_lock lk{server_lock};
+            services_closed = true;
+            managers = std::move(server_managers);
+            server_managers.clear();
+            for (auto& refused : refused_servers) {
+                managers.push_back(std::move(refused));
+            }
+            refused_servers.clear();
+        }
+        for (auto& manager : managers) {
+            manager.reset();
+        }
     }
 
     void InitializePhysicalCores() {
@@ -811,6 +844,11 @@ struct KernelCore::Impl {
 
     std::mutex server_lock;
     std::vector<std::unique_ptr<Service::ServerManager>> server_managers;
+    bool services_closed{}; ///< Set once CloseServices ran, guarded by server_lock
+    /// Servers refused while services close, kept until the kernel shuts down: their handlers stay
+    /// reachable through sm (glue's time manager calls psc's time:m, which registers services on
+    /// its server). Guarded by server_lock.
+    std::vector<std::unique_ptr<Service::ServerManager>> refused_servers;
 
     std::array<std::optional<Kernel::PhysicalCore>, Core::Hardware::NUM_CPU_CORES> cores;
 
@@ -1017,13 +1055,24 @@ void KernelCore::UnregisterInUseObject(KAutoObject* object) {
 void KernelCore::RunServer(std::unique_ptr<Service::ServerManager>&& server_manager) {
     auto* manager = server_manager.get();
 
+    bool refused = false;
     {
         std::scoped_lock lk{impl->server_lock};
-        if (impl->is_shutting_down) {
-            return;
+        if (impl->is_shutting_down || impl->services_closed) {
+            refused = true;
+        } else {
+            impl->server_managers.emplace_back(std::move(server_manager));
         }
+    }
 
-        impl->server_managers.emplace_back(std::move(server_manager));
+    if (refused) {
+        // Services are closing: this server never runs. It stays ours until SkipLoop is done, so a
+        // CloseServices running meanwhile can't destroy it under us. Then the kernel keeps it until
+        // it shuts down.
+        manager->SkipLoop();
+        std::scoped_lock lk{impl->server_lock};
+        impl->refused_servers.emplace_back(std::move(server_manager));
+        return;
     }
 
     manager->LoopProcess();

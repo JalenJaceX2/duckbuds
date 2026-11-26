@@ -218,6 +218,14 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
 
                 const Id safety_cond{
                     ctx.OpSGreaterThanEqual(ctx.U1, new_counter, ctx.u32_zero_value)};
+                if (Sirit::ValidId(ctx.loop_guard_flag)) {
+                    // The check ends a loop that would go on: noted in a private flag (no block
+                    // of its own here: the loop header's phis name this one), stored at return
+                    const Id fired{ctx.OpLogicalAnd(ctx.U1, cond, ctx.OpLogicalNot(ctx.U1, safety_cond))};
+                    ctx.OpStore(ctx.loop_guard_flag,
+                                ctx.OpBitwiseOr(ctx.U32[1], ctx.OpLoad(ctx.U32[1], ctx.loop_guard_flag),
+                                                ctx.OpSelect(ctx.U32[1], fired, ctx.Const(1u), ctx.u32_zero_value)));
+                }
                 cond = ctx.OpLogicalAnd(ctx.U1, cond, safety_cond);
             }
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
@@ -226,6 +234,21 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             break;
         }
         case IR::AbstractSyntaxNode::Type::Return:
+            if (Sirit::ValidId(ctx.loop_guard_flag)) {
+                // RuntimeInfo::loop_guard_binding: set when a loop's safety check ended a loop
+                const Id fired{ctx.OpINotEqual(ctx.U1, ctx.OpLoad(ctx.U32[1], ctx.loop_guard_flag),
+                                               ctx.u32_zero_value)};
+                const Id note_label{ctx.OpLabel()};
+                const Id noted_label{ctx.OpLabel()};
+                ctx.OpSelectionMerge(noted_label, spv::SelectionControlMask::MaskNone);
+                ctx.OpBranchConditional(fired, note_label, noted_label);
+                ctx.AddLabel(note_label);
+                ctx.OpStore(ctx.OpAccessChain(ctx.loop_guard_word_pointer, ctx.loop_guard_buffer,
+                                              ctx.u32_zero_value, ctx.u32_zero_value),
+                            ctx.Const(1u));
+                ctx.OpBranch(noted_label);
+                ctx.AddLabel(noted_label);
+            }
             ctx.OpReturn();
             break;
         case IR::AbstractSyntaxNode::Type::Unreachable:
@@ -419,6 +442,18 @@ void SetupDenormControl(const Profile& profile, const IR::Program& program, Emit
             LOG_DEBUG(Shader_SPIRV, "Fp32 denorm preserve used in shader without host support");
         }
     }
+    if (ctx.native_half_rounding) {
+        // The software matrix functions convert to fp16 natively (emit_spirv_tensor.cpp).
+        ctx.AddCapability(spv::Capability::DenormPreserve);
+        ctx.AddCapability(spv::Capability::RoundingModeRTE);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 16U);
+        ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTE, 16U);
+        if (!profile.support_separate_denorm_behavior || !profile.support_separate_rounding_mode) {
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 64U);
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::RoundingModeRTE, 64U);
+        }
+        return;
+    }
     if (!profile.support_separate_denorm_behavior || profile.has_broken_fp16_float_controls) {
         // No separate denorm behavior
         return;
@@ -485,14 +520,18 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
         }
         ctx.AddCapability(spv::Capability::DemoteToHelperInvocation);
     }
-    if (info.stores[IR::Attribute::ViewportIndex] && profile.support_multi_viewport) {
+    // A mesh program emulated as compute stores its Layer and ViewportIndex in its output buffer.
+    const bool stores_viewport_layer{!ctx.runtime_info.mesh_as_compute};
+    if (info.stores[IR::Attribute::ViewportIndex] && profile.support_multi_viewport &&
+        stores_viewport_layer) {
         ctx.AddCapability(spv::Capability::MultiViewport);
     }
     if (info.stores[IR::Attribute::ViewportMask] && profile.support_viewport_mask) {
         ctx.AddExtension("SPV_NV_viewport_array2");
         ctx.AddCapability(spv::Capability::ShaderViewportMaskNV);
     }
-    if (info.stores[IR::Attribute::Layer] || info.stores[IR::Attribute::ViewportIndex]) {
+    if ((info.stores[IR::Attribute::Layer] || info.stores[IR::Attribute::ViewportIndex]) &&
+        stores_viewport_layer) {
         if (profile.support_viewport_index_layer_non_geometry && ctx.stage != Stage::Geometry) {
             ctx.AddExtension("SPV_EXT_shader_viewport_index_layer");
             ctx.AddCapability(spv::Capability::ShaderViewportIndexLayerEXT);
@@ -656,7 +695,9 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
     const std::optional<u32> tensor_scratch_word{ReserveCooperativeHmmaScratch(profile, program)};
-    EmitContext ctx{profile, runtime_info, program, bindings};
+    const bool cooperative_hmma{tensor_scratch_word.has_value() ||
+                                UsesCooperativeHmma(profile, program)};
+    EmitContext ctx{profile, runtime_info, program, bindings, cooperative_hmma};
     ctx.tensor_scratch_word = tensor_scratch_word;
     DefineSoftwareMatrixFunctions(ctx, program);
     const Id main{DefineMain(ctx, program)};

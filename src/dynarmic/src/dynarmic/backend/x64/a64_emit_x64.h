@@ -73,6 +73,7 @@ public:
     void ClearFastDispatchTable();
     void GenMemory128Accessors();
     void GenFastmemFallbacks();
+    void GenCntpctFallback();
     void GenTerminalHandlers();
 
     // Microinstruction emitters
@@ -101,7 +102,7 @@ public:
     };
     std::optional<DoNotFastmemMarker> ShouldFastmem(A64EmitContext& ctx, IR::Inst* inst) const;
     void AddFastmemPatch(CodePtr location, CodePtr resume_location, void (*callback)(), const DoNotFastmemMarker& marker, bool recompile);
-    FakeCall FastmemCallback(u64 rip);
+    std::optional<FakeCall> FastmemCallback(u64 rip);
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
@@ -164,6 +165,7 @@ public:
     boost::container::stable_vector<Xbyak::Label> shared_labels;
     const void* terminal_handler_pop_rsb_hint = nullptr;
     const void* terminal_handler_fast_dispatch_hint = nullptr;
+    const void* cntpct_fallback = nullptr;
     FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
     A64::Jit* jit_interface = nullptr;
     void (*memory_read_128)() = nullptr;

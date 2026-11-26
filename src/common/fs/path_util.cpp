@@ -178,6 +178,7 @@ public:
         GenerateEdenPath(EdenPath::IconsDir, eden_path / ICONS_DIR);
         GenerateEdenPath(EdenPath::StreamlineDir, eden_path / STREAMLINE_DIR);
         GenerateEdenPath(EdenPath::FidelityFxDir, eden_path / FIDELITYFX_DIR);
+        GenerateEdenPath(EdenPath::FlyHighDir, eden_path / FLYHIGH_DIR);
         // config
         GenerateEdenPath(EdenPath::ConfigDir, eden_path_config);
         // cache
@@ -362,7 +363,7 @@ fs::path GetAppDataRoamingDirectory() {
 fs::path GetHomeDirectory() {
     const char* home_env_var = getenv("HOME");
 
-    if (home_env_var) {
+    if (home_env_var && *home_env_var != '\0') {
         return fs::path{home_env_var};
     }
 
@@ -383,7 +384,9 @@ fs::path GetHomeDirectory() {
 fs::path GetDataDirectory(const std::string& env_name) {
     const char* data_env_var = getenv(env_name.c_str());
 
-    if (data_env_var) {
+    // The XDG spec says to ignore an empty or relative value, which would otherwise put the
+    // data directory under the current working directory.
+    if (data_env_var && fs::path{data_env_var}.is_absolute()) {
         return fs::path{data_env_var};
     }
 

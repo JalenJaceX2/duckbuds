@@ -23,7 +23,6 @@
 #include <nlohmann/json.hpp>
 
 #include <QAbstractButton>
-#include <QBuffer>
 #include <QByteArray>
 #include <QCheckBox>
 #include <QEventLoop>
@@ -31,7 +30,6 @@
 #include <QFileInfo>
 #include <QIcon>
 #include <QImage>
-#include <QImageReader>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QNetworkAccessManager>
@@ -55,7 +53,6 @@
 #include "core/core.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nup_container.h"
-#include "core/file_sys/nup_writer.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/xts_archive.h"
 #include "core/loader/loader.h"
@@ -63,6 +60,7 @@
 #include "qt_common/abstract/frontend.h"
 #include "qt_common/config/uisettings.h"
 #include "qt_common/qt_common.h"
+#include "qt_common/util/game.h"
 #include "qt_common/util/vk.h"
 #include "ui_configure_per_game.h"
 #include "lichii/configuration/configuration_shared.h"
@@ -77,34 +75,14 @@
 #include "lichii/configuration/configure_per_game.h"
 #include "lichii/configuration/configure_per_game_addons.h"
 #include "lichii/configuration/configure_system.h"
+#include "lichii/configuration/iidb_artwork_dialog.h"
+#include "lichii/configuration/iidb_key_dialog.h"
+#include "lichii/game/artwork_image.h"
 #include "lichii/util/util.h"
 
 namespace {
 
-constexpr int IconTargetSize = 256;
-constexpr qint64 MaxIconBytes = 8 * 1024 * 1024;
-constexpr int MaxImageDimension = 8192;
-constexpr qint64 MaxImagePixels = 16 * 1024 * 1024;
-
-QImage DecodeIcon(QByteArray bytes) {
-    if (bytes.isEmpty() || bytes.size() > MaxIconBytes) {
-        return {};
-    }
-    QBuffer buffer(&bytes);
-    buffer.open(QIODevice::ReadOnly);
-    QImageReader reader(&buffer);
-    const auto format = reader.format();
-    if (format != "png" && format != "jpeg" && format != "bmp" && format != "webp") {
-        return {};
-    }
-    const auto size = reader.size();
-    if (!size.isValid() || size.width() > MaxImageDimension ||
-        size.height() > MaxImageDimension ||
-        qint64{size.width()} * size.height() > MaxImagePixels) {
-        return {};
-    }
-    return reader.read();
-}
+constexpr auto MaxIconBytes = ArtworkImage::MaxBytes;
 
 QImage ReadIconFile(const QString& path) {
     const QFileInfo info(path);
@@ -115,7 +93,7 @@ QImage ReadIconFile(const QString& path) {
     if (!image_file.open(QIODevice::ReadOnly)) {
         return {};
     }
-    return DecodeIcon(image_file.read(MaxIconBytes + 1));
+    return ArtworkImage::Decode(image_file.read(MaxIconBytes + 1));
 }
 
 struct DetectionBudget {
@@ -128,25 +106,6 @@ struct DetectionBudget {
         return cancel->load() || std::chrono::steady_clock::now() >= deadline;
     }
 };
-
-std::vector<u8> EncodeSquareIcon(const QImage& source) {
-    if (source.isNull()) {
-        return {};
-    }
-    const int side = std::min(source.width(), source.height());
-    const int x = (source.width() - side) / 2;
-    const int y = (source.height() - side) / (source.height() > source.width() ? 3 : 2);
-    QImage img = source.copy(x, y, side, side).convertToFormat(QImage::Format_RGBA8888);
-    if (img.width() != IconTargetSize || img.height() != IconTargetSize) {
-        img = img.scaled(IconTargetSize, IconTargetSize, Qt::IgnoreAspectRatio,
-                         Qt::SmoothTransformation);
-    }
-    QByteArray encoded;
-    QBuffer buffer(&encoded);
-    buffer.open(QIODevice::WriteOnly);
-    img.save(&buffer, "PNG");
-    return std::vector<u8>(encoded.begin(), encoded.end());
-}
 
 std::string NormalizeGameSlug(std::string title) {
     title = Common::ToLower(title);
@@ -377,6 +336,8 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
                                                 : fmt::format("{:016X}", title_id);
     game_config = std::make_unique<QtConfig>(config_file_name, Config::ConfigType::PerGameConfig);
     addons_tab = std::make_unique<ConfigurePerGameAddons>(system_, this);
+    connect(addons_tab.get(), &ConfigurePerGameAddons::BrowseModsRequested, this,
+            &ConfigurePerGame::BrowseModsRequested);
     audio_tab = std::make_unique<ConfigureAudio>(system_, tab_group, *builder, this);
     cpu_tab = std::make_unique<ConfigureCpu>(system_, tab_group, *builder, this);
     graphics_advanced_tab =
@@ -437,6 +398,12 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
             &ConfigurePerGame::OnUploadNupIcon);
     connect(ui->button_detect_icon, &QPushButton::clicked, this,
             &ConfigurePerGame::OnDetectNupIcon);
+    ui->button_remove_icon->setIcon(QIcon::fromTheme(QStringLiteral("edit-clear")));
+    ui->button_remove_icon->setEnabled(false);
+    connect(ui->button_remove_icon, &QPushButton::clicked, this,
+            &ConfigurePerGame::OnRemoveCustomIcon);
+    connect(ui->button_browse_iidb, &QPushButton::clicked, this,
+            &ConfigurePerGame::OnBrowseIiDB);
     connect(&detect_watcher, &QFutureWatcher<DetectIconResult>::finished, this, [this] {
         if (!detect_cancel || detect_cancel->load()) {
             return;
@@ -444,26 +411,23 @@ ConfigurePerGame::ConfigurePerGame(QWidget* parent, u64 title_id_, const std::st
         ui->button_detect_icon->setEnabled(true);
         ui->button_detect_icon->setText(tr("Detect Icon"));
         ui->button_upload_icon->setEnabled(true);
+        ui->button_browse_iidb->setEnabled(true);
         ui->display_name->setEnabled(true);
         ui->allow_online_detection->setEnabled(true);
         ui->buttonBox->button(QDialogButtonBox::Ok)->setEnabled(true);
         if (auto* apply = ui->buttonBox->button(QDialogButtonBox::Apply)) {
             apply->setEnabled(true);
         }
-        const auto out = detect_watcher.result();
-        if (out.icon_bytes.empty()) {
+        auto out = detect_watcher.result();
+        if (out.icon.isNull()) {
+            UpdateRemoveIconButton();
             QMessageBox::information(this, tr("Detect Icon"), QString::fromStdString(out.error));
             return;
         }
         if (!out.resolved_title.empty()) {
             ui->display_name->setText(QString::fromStdString(out.resolved_title));
         }
-        QPixmap map;
-        if (map.loadFromData(out.icon_bytes.data(), static_cast<u32>(out.icon_bytes.size()))) {
-            UpdateIconPreview(map);
-        }
-        pending_nup_icon = out.icon_bytes;
-        nup_icon_modified = true;
+        StageCustomIcon(std::move(out.icon));
     });
 
     if (system.IsPoweredOn()) {
@@ -485,7 +449,7 @@ ConfigurePerGame::~ConfigurePerGame() {
 }
 
 void ConfigurePerGame::done(int result) {
-    if (result == QDialog::Accepted && (detect_watcher.isRunning() || !SaveNupMetadata(true))) {
+    if (result == QDialog::Accepted && (detect_watcher.isRunning() || !SaveCustomMetadata(true))) {
         return;
     }
     if (detect_cancel) {
@@ -527,7 +491,7 @@ void ConfigurePerGame::RetranslateUI() {
 }
 
 void ConfigurePerGame::HandleApplyButtonClicked() {
-    if (detect_watcher.isRunning() || !SaveNupMetadata(true)) {
+    if (detect_watcher.isRunning() || !SaveCustomMetadata(true)) {
         return;
     }
     UISettings::values.configuration_applied = true;
@@ -537,6 +501,10 @@ void ConfigurePerGame::HandleApplyButtonClicked() {
 void ConfigurePerGame::LoadFromFile(FileSys::VirtualFile file_) {
     file = std::move(file_);
     LoadConfiguration();
+}
+
+void ConfigurePerGame::ReloadAddonsAfterModStore(const QSet<QString>& store_toggled) {
+    addons_tab->ReloadAfterModStore(store_toggled);
 }
 
 void ConfigurePerGame::LoadConfiguration() {
@@ -552,7 +520,7 @@ void ConfigurePerGame::LoadConfiguration() {
     const FileSys::PatchManager pm{title_id, system.GetFileSystemController(),
                                    system.GetContentProvider()};
     const auto control = pm.GetControlMetadata();
-    const auto loader = Loader::GetLoader(system, file);
+    const auto loader = Loader::GetLoader(system, file, title_id);
 
     is_nup_file = loader != nullptr && loader->GetFileType() == Loader::FileType::NUP;
     if (is_nup_file && !ui->buttonBox->button(QDialogButtonBox::Apply)) {
@@ -560,13 +528,16 @@ void ConfigurePerGame::LoadConfiguration() {
         connect(apply_button, &QAbstractButton::clicked, this,
                 &ConfigurePerGame::HandleApplyButtonClicked);
     }
-    ui->nup_icon_widget->setVisible(is_nup_file);
-    ui->nup_icon_widget->setEnabled(!system.IsPoweredOn());
-    ui->display_name->setReadOnly(!is_nup_file || system.IsPoweredOn());
-    ui->display_name->setClearButtonEnabled(is_nup_file && !system.IsPoweredOn());
-    ui->display_name->setPlaceholderText(is_nup_file ? tr("Enter game name...") : QString{});
+    // Custom artwork is stored per program ID, outside the game file, so it works for every
+    // format and while a game runs.
+    ui->nup_icon_widget->setVisible(title_id != 0);
+    ui->nup_icon_widget->setEnabled(true);
+    // The name is stored per program ID too: a rename never touches the game file.
+    ui->display_name->setReadOnly(title_id == 0);
+    ui->display_name->setClearButtonEnabled(title_id != 0);
     ui->display_name->setToolTip(
-        is_nup_file ? tr("Edit the game name stored in the NUP metadata") : QString{});
+        title_id != 0 ? tr("Name shown in the library. Clear it to use the game's own name.")
+                      : QString{});
 
     if (!is_nup_file && control.first != nullptr) {
         ui->display_version->setText(QString::fromStdString(control.first->GetVersionString()));
@@ -581,36 +552,44 @@ void ConfigurePerGame::LoadConfiguration() {
                 QFileInfo(QString::fromStdString(file->GetName())).completeBaseName());
         }
 
-        FileSys::NACP nacp;
-        if (loader->ReadControlData(nacp) == Loader::ResultStatus::Success) {
-            ui->display_developer->setText(QString::fromStdString(nacp.GetDeveloperName()));
-            const auto ver = nacp.GetVersionString();
-            ui->display_version->setText(ver.empty() ? QStringLiteral("1.0.0")
-                                                     : QString::fromStdString(ver));
+        std::string developer;
+        if (loader->ReadDeveloper(developer) == Loader::ResultStatus::Success) {
+            ui->display_developer->setText(QString::fromStdString(developer));
+        }
+        std::string version;
+        if (loader->ReadDisplayVersion(version) == Loader::ResultStatus::Success &&
+            !version.empty()) {
+            ui->display_version->setText(QString::fromStdString(version));
         } else {
             ui->display_version->setText(QStringLiteral("1.0.0"));
         }
     }
-    initial_nup_title = ui->display_name->text().trimmed().toStdString();
-    nup_icon_modified = false;
-    pending_nup_icon.clear();
+    original_title = ui->display_name->text().simplified().toStdString();
+    ui->display_name->setPlaceholderText(QString::fromStdString(original_title));
+    if (const auto custom = QtCommon::Game::ReadCustomTitle(title_id); !custom.empty()) {
+        ui->display_name->setText(QString::fromStdString(custom));
+    }
+    initial_title = ui->display_name->text().simplified().toStdString();
+    pending_custom_icon = {};
+    remove_custom_icon = false;
 
-    scene->clear();
+    file_icon = QPixmap{};
     if (!is_nup_file && control.second != nullptr) {
-        QPixmap map;
         const auto bytes = control.second->ReadAllBytes();
-        if (map.loadFromData(bytes.data(), static_cast<u32>(bytes.size()))) {
-            UpdateIconPreview(map);
-        }
+        file_icon.loadFromData(bytes.data(), static_cast<u32>(bytes.size()));
     } else if (loader != nullptr) {
         std::vector<u8> bytes;
         if (loader->ReadIcon(bytes) == Loader::ResultStatus::Success) {
-            QPixmap map;
-            if (map.loadFromData(bytes.data(), static_cast<u32>(bytes.size()))) {
-                UpdateIconPreview(map);
-            }
+            file_icon.loadFromData(bytes.data(), static_cast<u32>(bytes.size()));
         }
     }
+    QPixmap custom_icon;
+    if (const auto custom = QtCommon::Game::ReadCustomArtwork(title_id); !custom.empty()) {
+        custom_icon.loadFromData(custom.data(), static_cast<u32>(custom.size()));
+    }
+    has_custom_icon = !custom_icon.isNull();
+    UpdateIconPreview(has_custom_icon ? custom_icon : file_icon);
+    UpdateRemoveIconButton();
 
     ui->display_filename->setText(QString::fromStdString(file->GetName()));
 
@@ -632,8 +611,33 @@ void ConfigurePerGame::UpdateIconPreview(const QPixmap& map) {
                                 Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
 }
 
+void ConfigurePerGame::StageCustomIcon(QImage icon) {
+    if (icon.isNull()) {
+        return;
+    }
+    pending_custom_icon = std::move(icon);
+    remove_custom_icon = false;
+    UpdateIconPreview(QPixmap::fromImage(pending_custom_icon));
+    UpdateRemoveIconButton();
+}
+
+void ConfigurePerGame::OnBrowseIiDB() {
+    if (!file || title_id == 0 || detect_watcher.isRunning()) {
+        return;
+    }
+    auto title = ui->display_name->text().simplified();
+    if (title.isEmpty()) {
+        title = QString::fromStdString(original_title);
+    }
+    IiDB::Client client{IiDB::SessionRateLimits()};
+    IiDB::ArtworkDialog dialog(this, title, IiDB::SessionKey(), client);
+    if (dialog.exec() == QDialog::Accepted) {
+        StageCustomIcon(dialog.TakeIcon());
+    }
+}
+
 void ConfigurePerGame::OnUploadNupIcon() {
-    if (!is_nup_file || system.IsPoweredOn() || detect_watcher.isRunning()) {
+    if (title_id == 0 || detect_watcher.isRunning()) {
         return;
     }
     const QString default_dir =
@@ -653,19 +657,27 @@ void ConfigurePerGame::OnUploadNupIcon() {
                                 "8192 pixels per side and 16 megapixels."));
         return;
     }
-    pending_nup_icon = EncodeSquareIcon(img);
-    if (pending_nup_icon.empty()) {
+    StageCustomIcon(ArtworkImage::SquareIcon(img));
+}
+
+void ConfigurePerGame::OnRemoveCustomIcon() {
+    if (title_id == 0 || detect_watcher.isRunning()) {
         return;
     }
-    QPixmap map;
-    if (map.loadFromData(pending_nup_icon.data(), static_cast<u32>(pending_nup_icon.size()))) {
-        UpdateIconPreview(map);
-    }
-    nup_icon_modified = true;
+    // Drops a picked image that is not saved yet, and the saved artwork on Apply or OK.
+    pending_custom_icon = {};
+    remove_custom_icon = has_custom_icon;
+    UpdateIconPreview(file_icon);
+    UpdateRemoveIconButton();
+}
+
+void ConfigurePerGame::UpdateRemoveIconButton() {
+    ui->button_remove_icon->setEnabled(!pending_custom_icon.isNull() ||
+                                       (has_custom_icon && !remove_custom_icon));
 }
 
 void ConfigurePerGame::OnDetectNupIcon() {
-    if (!is_nup_file || system.IsPoweredOn() || detect_watcher.isRunning()) {
+    if (title_id == 0 || detect_watcher.isRunning()) {
         return;
     }
     QString query_qstr = ui->display_name->text().trimmed();
@@ -688,6 +700,8 @@ void ConfigurePerGame::OnDetectNupIcon() {
     ui->button_detect_icon->setEnabled(false);
     ui->button_detect_icon->setText(tr("Detecting..."));
     ui->button_upload_icon->setEnabled(false);
+    ui->button_browse_iidb->setEnabled(false);
+    ui->button_remove_icon->setEnabled(false);
     ui->display_name->setEnabled(false);
     ui->allow_online_detection->setEnabled(false);
     ui->buttonBox->button(QDialogButtonBox::Ok)->setEnabled(false);
@@ -712,9 +726,9 @@ void ConfigurePerGame::OnDetectNupIcon() {
                     if (budget.Stopped() || bytes.size() > MaxIconBytes) {
                         return false;
                     }
-                    out.icon_bytes = EncodeSquareIcon(
-                        DecodeIcon(QByteArray(bytes.data(), static_cast<int>(bytes.size()))));
-                    return !out.icon_bytes.empty();
+                    out.icon = ArtworkImage::SquareIcon(
+                        ArtworkImage::Decode(QByteArray(bytes.data(), static_cast<int>(bytes.size()))));
+                    return !out.icon.isNull();
                 };
 
                 // 1. Check local image files next to the NUP archive
@@ -730,9 +744,9 @@ void ConfigurePerGame::OnDetectNupIcon() {
                                 return out;
                             }
                             const auto candidate = dir / Common::FS::ToU8String(base + ext);
-                            out.icon_bytes = EncodeSquareIcon(ReadIconFile(
+                            out.icon = ArtworkImage::SquareIcon(ReadIconFile(
                                 QString::fromStdString(Common::FS::PathToUTF8String(candidate))));
-                            if (!out.icon_bytes.empty()) {
+                            if (!out.icon.isNull()) {
                                 return out;
                             }
                         }
@@ -883,49 +897,59 @@ void ConfigurePerGame::OnDetectNupIcon() {
         }));
 }
 
-bool ConfigurePerGame::SaveNupMetadata(bool show_error) {
-    if (!is_nup_file) {
+bool ConfigurePerGame::SaveCustomMetadata(bool show_error) {
+    if (remove_custom_icon) {
+        if (!QtCommon::Game::RemoveCustomArtwork(title_id)) {
+            if (show_error) {
+                QMessageBox::warning(this, tr("Game Artwork"),
+                                     tr("The artwork could not be removed."));
+            }
+            return false;
+        }
+        remove_custom_icon = false;
+        has_custom_icon = false;
+        UpdateRemoveIconButton();
+        UISettings::values.is_game_list_reload_pending.exchange(true);
+        emit CustomArtworkChanged(title_id);
+    }
+    if (!pending_custom_icon.isNull()) {
+        // Saved as the game's custom artwork: rewriting the whole archive to embed it took a full
+        // copy of the game on the UI thread (25 GB for some NUPs) and failed when the game file
+        // was in use.
+        if (!QtCommon::Game::SaveCustomArtwork(title_id, pending_custom_icon)) {
+            if (show_error) {
+                QMessageBox::warning(this, tr("Game Artwork"),
+                                     tr("The artwork could not be saved."));
+            }
+            return false;
+        }
+        pending_custom_icon = {};
+        has_custom_icon = true;
+        UpdateRemoveIconButton();
+        UISettings::values.is_game_list_reload_pending.exchange(true);
+        emit CustomArtworkChanged(title_id);
+    }
+    const std::string new_title = ui->display_name->text().simplified().toStdString();
+    if (title_id == 0 || new_title == initial_title) {
         return true;
     }
-    const std::string new_title = ui->display_name->text().trimmed().toStdString();
-    const bool title_changed = new_title != initial_nup_title;
-    if (!title_changed && !nup_icon_modified) {
-        return true;
-    }
-    if (system.IsPoweredOn()) {
+    // Stored next to the custom artwork; the game file is never rewritten for a rename. The game's
+    // own name, or an empty field, removes the custom name.
+    const std::string custom_title = new_title == original_title ? std::string{} : new_title;
+    if (!QtCommon::Game::SaveCustomTitle(title_id, custom_title)) {
         if (show_error) {
-            QMessageBox::warning(this, tr("Update NUP Metadata"),
-                                 tr("Stop emulation before changing NUP metadata."));
+            QMessageBox::warning(this, tr("Game Name"), tr("The game name could not be saved."));
         }
         return false;
     }
-    FileSys::Nup::MetadataUpdate update;
-    if (title_changed) {
-        update.title_name = new_title;
+    initial_title = new_title;
+    title_changed = true;
+    const std::string shown = custom_title.empty() ? original_title : custom_title;
+    if (shown.empty()) {
+        // No name to show in place: let the library read it again.
+        UISettings::values.is_game_list_reload_pending.exchange(true);
+    } else {
+        renamed_title = QString::fromStdString(shown);
     }
-    if (nup_icon_modified) {
-        update.icon = pending_nup_icon;
-    }
-    std::string error;
-    addons_tab->SetFile(nullptr);
-    file.reset();
-    const auto res = FileSys::Nup::UpdateMetadata(file_path, update, &error);
-    file = Core::GetGameFileFromPath(system.GetFilesystem(),
-                                   Common::FS::PathToUTF8String(file_path));
-    addons_tab->SetFile(file);
-    if (res != FileSys::Nup::PackResult::Success) {
-        if (show_error) {
-            QMessageBox::warning(
-                this, tr("Update NUP Metadata"),
-                tr("Failed to update NUP metadata:\n%1").arg(QString::fromStdString(error)));
-        }
-        return false;
-    }
-    initial_nup_title = new_title;
-    nup_icon_modified = false;
-    if (file) {
-        ui->display_size->setText(QtCommon::ReadableByteSize(file->GetSize()));
-    }
-    UISettings::values.is_game_list_reload_pending.exchange(true);
     return true;
 }

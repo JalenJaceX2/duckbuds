@@ -141,7 +141,8 @@ DriverBlobStore::DriverBlobStore(std::filesystem::path file_, const DeviceIdenti
                         Common::FS::FileShareFlag::ShareReadWrite);
         }
     }
-    writer.emplace(file, options.writer);
+    writer.emplace(file, options.writer,
+                   [this](std::span<const WrittenRecord> records) { OnWritten(records); });
     if (discarded != DriverBlobDiscard::None || loaded_bytes == 0) {
         const std::vector<u8> payload = EncodeIdentity(identity);
         writer->Append(RecordKind::DeviceIdentity, 0, payload);
@@ -160,6 +161,11 @@ std::optional<std::vector<u8>> DriverBlobStore::Find(RecordKind kind, u64 key) {
         return std::nullopt;
     }
     Entry& entry = it->second;
+    if (!reader.IsOpen()) {
+        // A new file: opened once it holds a blob of this session
+        reader.Open(file, Common::FS::FileAccessMode::Read, Common::FS::FileType::BinaryFile,
+                    Common::FS::FileShareFlag::ShareReadWrite);
+    }
     std::vector<u8> bytes(RecordHeaderSize + entry.payload_size + RecordHashSize);
     std::optional<LogRecord> record;
     if (reader.Seek(static_cast<s64>(entry.offset)) &&
@@ -196,19 +202,38 @@ void DriverBlobStore::Store(RecordKind kind, u64 key, std::span<const u8> payloa
         return;
     }
     const auto [it, inserted] = index.try_emplace({kind, key});
+    Entry& entry = it->second;
     if (!inserted) {
-        if (it->second.state == State::Written) {
+        if (entry.written && entry.state != State::Rejected) {
             return;
         }
-        dead_bytes += RecordSize(it->second.payload_size);
+        dead_bytes += RecordSize(entry.payload_size);
     }
-    it->second = {
-        .payload_size = static_cast<u32>(payload.size()), .state = State::Written, .used = true};
+    entry.payload_size = static_cast<u32>(payload.size());
+    entry.state = State::Written;
+    entry.used = true;
+    entry.written = true;
+    ++entry.queued;
     file_bytes += RecordSize(payload.size());
     written.fetch_add(1, std::memory_order_relaxed);
     written_bytes.fetch_add(RecordSize(payload.size()), std::memory_order_relaxed);
     // Under the lock, so that Close never ends the writer under it
     writer->Append(kind, key, payload);
+}
+
+void DriverBlobStore::OnWritten(std::span<const WrittenRecord> records) {
+    std::scoped_lock lock{mutex};
+    for (const WrittenRecord& record : records) {
+        const auto it = index.find({record.kind, record.key});
+        if (it == index.end() || it->second.queued == 0) {
+            continue;
+        }
+        Entry& entry = it->second;
+        if (--entry.queued == 0 && entry.state == State::Written) {
+            entry.offset = record.offset;
+            entry.state = State::Stored;
+        }
+    }
 }
 
 bool DriverBlobStore::Full() const {
@@ -236,7 +261,20 @@ void DriverBlobStore::Close() {
     closed = true;
     // Before the compaction: Windows doesn't rename over a file that is open.
     reader.Close();
-    if (file_bytes > options.max_bytes ||
+    u64 max_bytes = options.max_bytes;
+    u64 target_bytes = options.target_bytes;
+    if (options.session_cap_bytes > max_bytes) {
+        // The device identity record is kept first
+        u64 session_bytes = RecordSize(EncodeIdentity(DeviceIdentity{}).size());
+        for (const auto& [entry_key, entry] : index) {
+            if (entry.used) {
+                session_bytes += RecordSize(entry.payload_size);
+            }
+        }
+        target_bytes = std::max(target_bytes, std::min(session_bytes, options.session_cap_bytes));
+        max_bytes = std::max(max_bytes, target_bytes);
+    }
+    if (file_bytes > max_bytes ||
         (dead_bytes >= options.min_dead_bytes && dead_bytes * 4 >= file_bytes)) {
         std::unordered_set<u64> first;
         for (const auto& [entry_key, entry] : index) {
@@ -247,8 +285,8 @@ void DriverBlobStore::Close() {
         LOG_INFO(Render_Vulkan, "Driver blobs: compacting {} ({} bytes, {} of them dead)",
                  Common::FS::PathToUTF8String(file), file_bytes, dead_bytes);
         writer->Compact({
-            .max_bytes = options.max_bytes,
-            .target_bytes = options.target_bytes,
+            .max_bytes = max_bytes,
+            .target_bytes = target_bytes,
             .rank = [first = std::move(first)](const LogRecord& record) -> u32 {
                 if (record.kind == RecordKind::DeviceIdentity) {
                     return 0;

@@ -160,25 +160,6 @@ static std::shared_ptr<NSP> OpenContainerAsNsp(const VirtualFile& file, Loader::
     return nullptr;
 }
 
-// Checks that every .ncz entry in the container is NCZBLOCK. Solid NCZ has no random access,
-// and the whole point of this build is to reject it at scan time so such files never appear
-// in the game list. Containers without any .ncz (plain NSP/XCI) pass through.
-static bool ContainerIsFullyBlockCompressed(const std::shared_ptr<NSP>& nsp) {
-    if (!nsp) {
-        return false;
-    }
-    for (const auto& entry : nsp->GetFiles()) {
-        const auto name = entry->GetName();
-        if (name.size() < 4 || name.substr(name.size() - 4) != ".ncz") {
-            continue;
-        }
-        if (!Core::Crypto::IsBlockCompressedNCZ(entry)) {
-            return false; // solid NCZ -> reject the whole container
-        }
-    }
-    return true; // no .ncz at all, or all block-compressed
-}
-
 template <typename Callback>
 bool ForEachContainerEntry(const std::shared_ptr<NSP>& nsp, bool only_content,
                            std::optional<u64> base_program_id, Callback&& on_entry) {
@@ -832,14 +813,7 @@ std::vector<ContentProviderEntry> RegisteredCache::ListEntriesFilter(
 }
 
 static std::shared_ptr<NCA> GetNCAFromNSPForID(const NSP& nsp, const NcaID& id) {
-    const auto id_string = Common::HexToString(id, false);
-    auto file = nsp.GetFile(fmt::format("{}.nca", id_string));
-    if (file == nullptr) {
-        if (auto ncz_file = nsp.GetFile(fmt::format("{}.ncz", id_string))) {
-            file = Core::Crypto::DecompressNCZForInstall(
-                ncz_file, fmt::format("{}.nca", id_string));
-        }
-    }
+    auto file = nsp.GetNCAFileById(id);
     if (file == nullptr) {
         return nullptr;
     }
@@ -1112,8 +1086,16 @@ InstallResult RegisteredCache::RawInstallNCA(const NCA& nca, const VfsCopyFuncti
     if (out == nullptr) {
         return InstallResult::ErrorCopyFailed;
     }
-    return copy(in, out, VFS_RC_LARGE_COPY_BLOCK) ? InstallResult::Success
-                                                  : InstallResult::ErrorCopyFailed;
+    if (!copy(in, out, VFS_RC_LARGE_COPY_BLOCK)) {
+        const auto parent = out->GetContainingDirectory();
+        out->Resize(0);
+        out.reset();
+        if (parent) {
+            parent->DeleteFile(Common::FS::GetFilename(path));
+        }
+        return InstallResult::ErrorCopyFailed;
+    }
+    return InstallResult::Success;
 }
 
 bool RegisteredCache::RawInstallMeta(const CNMT& cnmt) {
@@ -1247,6 +1229,10 @@ const ExternalContentProvider* ContentProviderUnion::GetExternalProvider() const
     return static_cast<const ExternalContentProvider*>(providers[size_t(ContentProviderUnionSlot::External)]);
 }
 
+ManualContentProvider::ManualContentProvider(
+    std::function<std::vector<u8>(u64)> read_application_icon_)
+    : read_application_icon(std::move(read_application_icon_)) {}
+
 ManualContentProvider::~ManualContentProvider() = default;
 
 void ManualContentProvider::AddEntry(TitleType title_type, ContentRecordType content_type, u64 title_id, VirtualFile file) {
@@ -1299,7 +1285,8 @@ bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_
     if (NupContainer::IsNupFile(file)) {
         // A NUP holds loose trees: its add-ons are served as decrypted add-on NCAs, newest
         // version per title (as in Eglantine-Community/Eglantine#724). Its updates are left to
-        // the NUP loader, which merges them into the program's RomFS.
+        // the NUP loader, which merges them into the program's RomFS. A Switch 2 Edition's
+        // add-ons can keep the Switch 1 application's ID (as in jpasqui/Eglantine#1).
         NupContainer nup{file};
         if (nup.GetStatus() != Loader::ResultStatus::Success) {
             return false;
@@ -1308,8 +1295,10 @@ bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_
         std::map<u64, std::size_t> newest;
         for (std::size_t i = 0; i < packages.size(); ++i) {
             const auto& package = packages[i];
+            const u64 base = GetBaseTitleID(package.title_id);
             if (package.kind != NupContainer::PackageKind::Addon ||
-                (base_program_id && GetBaseTitleID(package.title_id) != *base_program_id)) {
+                (base_program_id && base != GetBaseTitleID(*base_program_id) &&
+                 base != GetSwitch1ApplicationID(GetBaseTitleID(*base_program_id)))) {
                 continue;
             }
             const auto [it, inserted] = newest.try_emplace(package.title_id, i);
@@ -1337,12 +1326,6 @@ bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_
         return false;
     }
 
-    // Reject solid NCZ (.nsz without -B): only block-compressed NCZ is supported.
-    if (!ContainerIsFullyBlockCompressed(nsp)) {
-        LOG_DEBUG(Service_FS, "Skipping solid-compressed container: {}", file->GetName());
-        return false;
-    }
-
     return ForEachContainerEntry(
         nsp, only_content, base_program_id,
         [this](TitleType title_type, ContentRecordType content_type, u64 title_id,
@@ -1359,6 +1342,28 @@ bool ManualContentProvider::AddEntriesFromContainer(VirtualFile file, bool only_
 void ManualContentProvider::ClearAllEntries() {
     entries.clear();
     multi_version_entries.clear();
+}
+
+void ManualContentProvider::ReplaceApplicationPaths(GameListApplicationPaths paths) {
+    application_paths = std::move(paths);
+}
+
+std::optional<std::string> ManualContentProvider::GetApplicationPath(u64 program_id) const {
+    const auto it = application_paths.find(program_id);
+    return it != application_paths.end() ? std::optional{it->second} : std::nullopt;
+}
+
+std::vector<u8> ManualContentProvider::ReadApplicationIcon(u64 program_id) const {
+    return read_application_icon ? read_application_icon(program_id) : std::vector<u8>{};
+}
+
+std::vector<u64> ManualContentProvider::ListApplicationFiles() const {
+    std::vector<u64> program_ids;
+    program_ids.reserve(application_paths.size());
+    for (const auto& [program_id, path] : application_paths) {
+        program_ids.push_back(program_id);
+    }
+    return program_ids;
 }
 
 void ManualContentProvider::Refresh() {}
@@ -1502,12 +1507,6 @@ void ExternalContentProvider::ScanDirectory(const VirtualDir& dir) {
 void ExternalContentProvider::ProcessNSP(const VirtualFile& file) {
     const auto nsp = OpenContainerAsNsp(file, Loader::FileType::NSP);
     if (!nsp) {
-        return;
-    }
-
-    // Reject solid NCZ (.nsz without -B): Eden only supports block-compressed NCZ.
-    if (!ContainerIsFullyBlockCompressed(nsp)) {
-        LOG_DEBUG(Service_FS, "Skipping solid-compressed container: {}", file->GetName());
         return;
     }
 
